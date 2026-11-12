@@ -181,6 +181,7 @@ rate-limit:
 - **Mux connections fail**: turn mux off in Settings when the server runs with `mux: false`, or when a middlebox drops long-lived tunnels.
 - **Update check fails**: the client needs access to `https://hk.dishuyl.cn/ssl-proxy/version.json`.
 - **Settings not applied**: settings take effect after the automatic restart; if the restart fails, start the client again manually.
+- **UDP forwarding not working**: UDP forwarding is disabled by default. The client's "UDP forwarding" setting has three modes: `off` disables UDP relay entirely (SOCKS5 UDP ASSOCIATE replies "command not supported"); `direct` forwards all UDP locally (proxy-rule hits are forced to direct); `proxy` follows the rule chain to decide direct vs. relayed through the server. The `proxy` mode requires the server to run with `udp.enabled: true` (default `false`) and matching versions on both ends (the client negotiates via a capability byte and automatically falls back to direct — with a log warning — against old servers or when UDP is disabled server-side).
 
 ## Versioning and updates
 

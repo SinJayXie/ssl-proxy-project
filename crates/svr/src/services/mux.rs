@@ -17,6 +17,8 @@
 //! | 3 | RST：中止流 |
 //! | 4 | PING：保活 |
 //! | 5 | PONG：保活应答 |
+//! | 6 | UDP：UDP 数据报（payload 见 `services/udp_relay_service.rs`） |
+//! | 7 | UDP_CLOSE：客户端回收 UDP 会话（payload 为空，服务端按 sid 摘除 NAT 表项） |
 //!
 //! `sid = 0` 保留给连接级控制帧。
 
@@ -31,6 +33,13 @@ pub const FLAG_FIN: u8 = 2;
 pub const FLAG_RST: u8 = 3;
 pub const FLAG_PING: u8 = 4;
 pub const FLAG_PONG: u8 = 5;
+/// UDP 数据报流：payload 与非 mux 的 FLAG_UDP 帧完全一致
+/// （`stream_id u32 BE || atyp || addr || port u16 BE || dgram_len u16 BE || dgram`）；
+/// NAT 会话以 payload 中的 `stream_id` 为键，`sid` 在回包帧中原样回显。
+pub const FLAG_UDP: u8 = 6;
+/// 关闭 UDP 会话（客户端 → 服务端，payload 为空）：服务端按 `sid` 回收
+/// 对应的 NAT 会话（`sid` 与 payload 中的 `stream_id` 为同一会话 ID）
+pub const FLAG_UDP_CLOSE: u8 = 7;
 
 /// 帧头：flag(1) + sid(4) + len(2) + padLen(1)
 pub const MUX_HEADER: usize = 8;

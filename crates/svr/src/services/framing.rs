@@ -12,7 +12,9 @@
 //! ```
 //!
 //! - `flag = 0`：普通数据帧；
-//! - `flag = 1`：本帧之后切换为裸字节流（不再解帧），payload 仍有效。
+//! - `flag = 1`：本帧之后切换为裸字节流（不再解帧），payload 仍有效；
+//! - `flag = 2`：UDP 数据报帧（payload 见 [`crate::services::udp_relay_service`]，
+//!   仅用于 UDP 隧道，一条隧道连接独占一个 UDP 会话）。
 //!
 //! ## padding 策略（速度优先）
 //!
@@ -29,6 +31,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 pub const FLAG_PAD: u8 = 0;
 /// 本帧后切换为裸字节流
 pub const FLAG_RAW: u8 = 1;
+/// UDP 数据报帧（payload = `stream_id u32 BE || atyp || addr || port u16 BE || dgram_len u16 BE || dgram`）
+pub const FLAG_UDP: u8 = 2;
 
 /// 帧头长度：flag(1) + len(2) + padLen(1)
 pub const FRAME_HEADER: usize = 4;

@@ -1,4 +1,4 @@
-use crate::core::types::AppConfig;
+use crate::core::types::{AppConfig, UdpMode};
 use crate::core::Core;
 use crate::ui::assets::mdi;
 use crate::ui::prefs::Prefs;
@@ -8,6 +8,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::combobox::{Combobox, ComboboxState};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::searchable_list::SearchableVec;
+use gpui_kit::component::select::{Select, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::WindowExt as _;
@@ -19,9 +20,34 @@ use regex::Regex;
 use std::sync::Arc;
 
 type GeoCombo = Entity<ComboboxState<SearchableVec<SharedString>>>;
+type UdpModeSelect = Entity<SelectState<SearchableVec<SharedString>>>;
 
 static IP_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^(\d{1,3}\.){3}\d{1,3}$").expect("valid ip regex"));
+
+fn udp_mode_labels() -> Vec<SharedString> {
+    vec![
+        i18n::t("UDP_MODE_OFF").into(),
+        i18n::t("UDP_MODE_DIRECT").into(),
+        i18n::t("UDP_MODE_PROXY").into(),
+    ]
+}
+
+fn udp_mode_index(mode: UdpMode) -> usize {
+    match mode {
+        UdpMode::Off => 0,
+        UdpMode::Direct => 1,
+        UdpMode::Proxy => 2,
+    }
+}
+
+fn udp_mode_from_index(index: usize) -> UdpMode {
+    match index {
+        1 => UdpMode::Direct,
+        2 => UdpMode::Proxy,
+        _ => UdpMode::Off,
+    }
+}
 
 struct SettingsInputs {
     socks_port: Entity<InputState>,
@@ -32,6 +58,7 @@ struct SettingsInputs {
     bind_ips: Vec<Entity<InputState>>,
     dns_servers: Vec<Entity<InputState>>,
     directs: GeoCombo,
+    udp_mode: UdpModeSelect,
 }
 
 impl SettingsInputs {
@@ -118,6 +145,12 @@ impl SettingsInputs {
                 .searchable(true)
         });
 
+        let udp_labels = udp_mode_labels();
+        let udp_selected = IndexPath::new(udp_mode_index(config.udp_mode));
+        let udp_mode = cx.new(|cx| {
+            SelectState::new(SearchableVec::new(udp_labels), Some(udp_selected), window, cx)
+        });
+
         Self {
             socks_port,
             proxy_server,
@@ -127,6 +160,7 @@ impl SettingsInputs {
             bind_ips,
             dns_servers,
             directs,
+            udp_mode,
         }
     }
 }
@@ -240,6 +274,19 @@ impl SettingsPage {
             })
             .collect();
 
+        let udp_mode = {
+            let labels = udp_mode_labels();
+            let selected = self.inputs.udp_mode.read(cx).selected_value();
+            selected
+                .and_then(|label| {
+                    labels
+                        .iter()
+                        .position(|l| l.as_ref() == label.as_ref())
+                })
+                .map(udp_mode_from_index)
+                .unwrap_or(UdpMode::Off)
+        };
+
         Ok(AppConfig {
             socks_port,
             proxy_server,
@@ -251,6 +298,7 @@ impl SettingsPage {
             danger_accept_invalid_certs: self.tls_skip,
             sni_name,
             mux_enabled: self.mux_enabled,
+            udp_mode,
         })
     }
 
@@ -641,16 +689,31 @@ impl Render for SettingsPage {
                 .into_any_element(),
         );
 
-        // 路由：直连地区
+        // 路由：UDP 模式 + 直连地区
         let routing_card = section(
             i18n::t("SETTINGS_ROUTING"),
             i18n::t("SETTINGS_ROUTING_DESC"),
             cx,
-            div()
+            v_flex()
                 .w_full()
+                .gap_3()
+                .child(field(
+                    i18n::t("UDP_MODE"),
+                    Some(i18n::t("UDP_MODE_HINT")),
+                    cx,
+                    div()
+                        .w_full()
+                        .child(Select::new(&self.inputs.udp_mode))
+                        .into_any_element(),
+                ))
                 .child(
-                    Combobox::new(&self.inputs.directs)
-                        .placeholder(i18n::t("SELECT_COUNTRIES")),
+                    div()
+                        .w_full()
+                        .child(
+                            Combobox::new(&self.inputs.directs)
+                                .placeholder(i18n::t("SELECT_COUNTRIES")),
+                        )
+                        .into_any_element(),
                 )
                 .into_any_element(),
         );

@@ -23,6 +23,12 @@ pub struct StatsStore {
     pub total_up: u64,
     #[serde(default)]
     pub total_down: u64,
+    /// Cumulative UDP payload bytes (SOCKS5 UDP relay); optional for
+    /// deserialization so pre-UDP `stats.json` files keep loading.
+    #[serde(default)]
+    pub total_up_udp: u64,
+    #[serde(default)]
+    pub total_down_udp: u64,
     #[serde(default)]
     pub peak_connections: usize,
     #[serde(default)]
@@ -61,7 +67,22 @@ impl StatsStore {
 
         self.total_up = self.total_up.saturating_add(up);
         self.total_down = self.total_down.saturating_add(down);
+        self.add_to_day(date, up, down);
+    }
 
+    /// Accumulate UDP relay bytes into the UDP totals and the given day bucket
+    /// (so the dashboard chart includes UDP traffic).
+    pub fn record_udp(&mut self, date: &str, up: u64, down: u64) {
+        if up == 0 && down == 0 {
+            return;
+        }
+
+        self.total_up_udp = self.total_up_udp.saturating_add(up);
+        self.total_down_udp = self.total_down_udp.saturating_add(down);
+        self.add_to_day(date, up, down);
+    }
+
+    fn add_to_day(&mut self, date: &str, up: u64, down: u64) {
         if let Some(day) = self.days.iter_mut().find(|day| day.date == date) {
             day.up = day.up.saturating_add(up);
             day.down = day.down.saturating_add(down);
@@ -224,5 +245,30 @@ mod tests {
         assert_eq!(store.total_down, 225);
         assert_eq!(store.days.len(), 1);
         assert_eq!((store.days[0].up, store.days[0].down), (150, 225));
+    }
+
+    #[test]
+    fn record_udp_updates_udp_totals_and_bucket() {
+        let mut store = StatsStore::default();
+        store.record("2026-11-12", 100, 200);
+        store.record_udp("2026-11-12", 30, 40);
+
+        // TCP 与 UDP 计数分开，日桶合并
+        assert_eq!(store.total_up, 100);
+        assert_eq!(store.total_down, 200);
+        assert_eq!(store.total_up_udp, 30);
+        assert_eq!(store.total_down_udp, 40);
+        assert_eq!(store.days.len(), 1);
+        assert_eq!((store.days[0].up, store.days[0].down), (130, 240));
+    }
+
+    /// 旧版 stats.json（无 UDP 字段）必须能正常加载
+    #[test]
+    fn stats_json_without_udp_fields_is_backward_compatible() {
+        let legacy = r#"{"total_up":1,"total_down":2,"peak_connections":3,"days":[]}"#;
+        let store: StatsStore = serde_json::from_str(legacy).unwrap();
+        assert_eq!(store.total_up, 1);
+        assert_eq!(store.total_up_udp, 0);
+        assert_eq!(store.total_down_udp, 0);
     }
 }

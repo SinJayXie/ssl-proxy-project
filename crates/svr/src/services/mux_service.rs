@@ -3,9 +3,14 @@
 //! 与 trojan-go 的做法一致：连接级认证只做一次，之后每个目标连接对应一个
 //! `sid`，所有流共享同一条 TLS 隧道，省掉反复的 TCP + TLS 握手。
 //!
+//! UDP：`FLAG_UDP`（=6）帧承载 UDP 数据报（payload 与非 mux 隧道一致，见
+//! `udp_relay_service.rs`），按 payload 中的 `stream_id` 维护 NAT 会话；服务端
+//! 未启用 UDP 时收到该帧将安全拒绝（关闭整条连接）。
+//!
 //! 流控采用连接级背压：某个流的命令缓冲区满时暂停整条连接的读取。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -18,8 +23,9 @@ use tokio::time::timeout;
 use crate::config::UPSTREAM_CONNECT_TIMEOUT_SECS;
 use crate::services::mux::{
     encode_ctl, encode_data, parse_open, read_frame, FLAG_DATA, FLAG_FIN, FLAG_OPEN, FLAG_PING,
-    FLAG_PONG, FLAG_RST, MAX_STREAMS,
+    FLAG_PONG, FLAG_RST, FLAG_UDP, FLAG_UDP_CLOSE, MAX_STREAMS,
 };
+use crate::services::udp_relay_service::{parse_udp_packet, UdpRelay, UdpSettings};
 
 /// 每流命令缓冲（帧数）
 const STREAM_CMD_BUFFER: usize = 64;
@@ -32,7 +38,13 @@ enum StreamCmd {
 }
 
 /// 处理一条 mux 连接，直到对端关闭或出错
-pub async fn serve<S>(client: S, peer_ip: &str) -> Result<()>
+///
+/// `udp` 为 `None`（`udp.enabled=false`）时，收到 UDP 流帧将关闭整条连接。
+pub async fn serve<S>(
+    client: S,
+    peer_ip: &str,
+    udp: Option<Arc<UdpSettings>>,
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -48,6 +60,8 @@ where
         }
         let _ = writer.shutdown().await;
     });
+
+    let udp_relay = udp.map(|settings| UdpRelay::new(settings, frame_tx.clone(), true));
 
     let mut streams: HashMap<u32, mpsc::Sender<StreamCmd>> = HashMap::new();
     let mut payload = Vec::with_capacity(8 * 1024);
@@ -89,6 +103,26 @@ where
                     }
                 }
             }
+            FLAG_UDP => {
+                let Some(relay) = &udp_relay else {
+                    // 安全拒绝：UDP 未启用，关闭整条连接
+                    tracing::warn!("[Mux] udp disabled, close mux connection (peer={})", peer_ip);
+                    break;
+                };
+                match parse_udp_packet(&payload) {
+                    Some((stream_id, host, port, dgram)) => {
+                        relay.relay(stream_id, sid, &host, port, dgram).await;
+                    }
+                    None => tracing::debug!("[Mux] malformed udp frame (sid={})", sid),
+                }
+            }
+            FLAG_UDP_CLOSE => {
+                // 客户端回收 UDP 会话：按帧 sid（= payload stream_id）摘除 NAT 表项；
+                // 未启用 UDP 时无会话可回收，忽略即可
+                if let Some(relay) = &udp_relay {
+                    relay.close_session(sid);
+                }
+            }
             FLAG_FIN => {
                 if let Some(tx) = streams.remove(&sid) {
                     let _ = tx.send(StreamCmd::Fin).await;
@@ -107,7 +141,8 @@ where
         }
     }
 
-    // 连接结束：丢弃所有流命令发送端，让流任务自然退出
+    // 连接结束：丢弃所有流命令发送端，让流任务自然退出；中止 UDP 会话
+    drop(udp_relay);
     streams.clear();
     drop(frame_tx);
     let _ = writer_task.await;

@@ -913,6 +913,7 @@ struct DashboardPage {
     checking_update: bool,
     stats: StatsStore,
     last_flow: DataFlow,
+    last_udp_flow: DataFlow,
     last_saved: Instant,
     _poll: Task<()>,
 }
@@ -922,6 +923,7 @@ impl DashboardPage {
         let info = core.snapshot_app_info().unwrap_or_default();
         let stats = StatsStore::load(&core.state.config_dir);
         let last_flow = info.dataflow.clone();
+        let last_udp_flow = core.snapshot_udp_dataflow().unwrap_or_default();
 
         let poll_core = core.clone();
         let config_dir = core.state.config_dir.clone();
@@ -929,6 +931,7 @@ impl DashboardPage {
             smol::Timer::after(Duration::from_secs(2)).await;
 
             let snapshot = poll_core.snapshot_app_info();
+            let udp_flow = poll_core.snapshot_udp_dataflow();
             let updated = this.update(cx, |page, cx| {
                 let Some(info) = snapshot else {
                     return;
@@ -943,6 +946,18 @@ impl DashboardPage {
                 page.stats.observe_connections(info.connections);
                 page.stats.record(&stats::today_key(), up, down);
 
+                // UDP relay traffic feeds its own counters (and the day chart).
+                let mut udp_notify = false;
+                if let Some(udp) = udp_flow {
+                    let up_udp = udp.up.saturating_sub(page.last_udp_flow.up);
+                    let down_udp = udp.down.saturating_sub(page.last_udp_flow.down);
+                    page.last_udp_flow = udp;
+                    if up_udp > 0 || down_udp > 0 {
+                        page.stats.record_udp(&stats::today_key(), up_udp, down_udp);
+                        udp_notify = true;
+                    }
+                }
+
                 let changed = page.info != info;
                 page.info = info;
 
@@ -951,7 +966,7 @@ impl DashboardPage {
                     page.last_saved = Instant::now();
                 }
 
-                if changed || up > 0 || down > 0 {
+                if changed || udp_notify || up > 0 || down > 0 {
                     cx.notify();
                 }
             });
@@ -966,6 +981,7 @@ impl DashboardPage {
             checking_update: false,
             stats,
             last_flow,
+            last_udp_flow,
             last_saved: Instant::now(),
             _poll: poll,
         }
@@ -992,7 +1008,12 @@ impl Render for DashboardPage {
         let purple = Hsla::from(rgb(0xaf52de));
         let success = cx.theme().success;
         let warning = cx.theme().warning;
-        let total_traffic = self.stats.total_up.saturating_add(self.stats.total_down);
+        let total_traffic = self
+            .stats
+            .total_up
+            .saturating_add(self.stats.total_down)
+            .saturating_add(self.stats.total_up_udp)
+            .saturating_add(self.stats.total_down_udp);
         let days = self.stats.recent(&stats::today_key(), 7);
         let today = days.last().cloned().unwrap_or_default();
 

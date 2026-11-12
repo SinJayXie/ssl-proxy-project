@@ -72,6 +72,20 @@ pub struct CountryCodeItem {
     pub numeric: u32,
 }
 
+/// UDP relay mode for SOCKS5 UDP ASSOCIATE (`udpMode` in setting.yaml).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UdpMode {
+    /// Reject cmd=0x03 with reply 0x07 (default; identical to the old behavior).
+    #[default]
+    Off,
+    /// UDP traffic always goes out through the local socket (proxy rules ignored).
+    Direct,
+    /// UDP traffic follows the routing rules; proxy-hit targets go through the
+    /// TLS tunnel (falls back to direct when the server lacks UDP support).
+    Proxy,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -93,6 +107,9 @@ pub struct AppConfig {
     /// Enabled by default; falls back to one TLS connection per target when disabled.
     #[serde(default = "default_true")]
     pub mux_enabled: bool,
+    /// SOCKS5 UDP ASSOCIATE relay mode: `off` (default) | `direct` | `proxy`.
+    #[serde(default)]
+    pub udp_mode: UdpMode,
 }
 
 fn default_true() -> bool {
@@ -112,6 +129,7 @@ impl Default for AppConfig {
             danger_accept_invalid_certs: false,
             sni_name: String::new(),
             mux_enabled: true,
+            udp_mode: UdpMode::Off,
         }
     }
 }

@@ -128,6 +128,15 @@ impl Core {
             .map(|flow| flow.clone())
     }
 
+    /// Aggregate UDP relay traffic (kept separate from `snapshot_dataflow`)
+    pub fn snapshot_udp_dataflow(&self) -> Option<DataFlow> {
+        self.state
+            .udp_dataflow
+            .try_read()
+            .ok()
+            .map(|flow| flow.clone())
+    }
+
     pub fn snapshot_app_info(&self) -> Option<ApiAppInfo> {
         let config = self.snapshot_config()?;
         let connections = self.snapshot_connections()?;

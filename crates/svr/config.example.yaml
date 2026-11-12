@@ -38,3 +38,14 @@ rate-limit:
   max-requests: 300
   rate-time-secs: 60
   black-time-secs: 600
+
+# ---- udp ----
+# UDP relay（UDP over TLS 转发），默认关闭；开启后客户端可经隧道承载 UDP 数据报。
+# 服务端内置防滥用：每会话令牌桶限速（超限丢包）、SSRF 拦截（禁止目标为
+# 回环 / 内网 / 链路本地 / 本机地址，域名解析后同样检查）。
+udp:
+  enabled: false
+  # 会话空闲超时（秒）：超时无上下行报文则回收 socket，后续同流 ID 报文触发新建
+  timeout-secs: 60
+  # 每会话每秒报文数上限（令牌桶，容量 = 速率）
+  rate-limit: 100

@@ -32,6 +32,10 @@ pub const DEFAULT_MAX_REQUESTS: u32 = 300;
 pub const FIRST_PACKET_TIMEOUT_SECS: u64 = 5;
 /// 上游 TCP 连接超时（秒）
 pub const UPSTREAM_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// UDP 会话空闲超时（秒）
+pub const DEFAULT_UDP_TIMEOUT_SECS: u64 = 60;
+/// 每会话每秒 UDP 报文数上限
+pub const DEFAULT_UDP_RATE_LIMIT: u32 = 100;
 
 // -----------------------------------------------------------------------------
 // YAML 结构定义
@@ -82,12 +86,24 @@ pub struct RateLimitConfigYaml {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
+pub struct UdpConfigYaml {
+    /// 是否启用 UDP relay，默认 false
+    pub enabled: Option<bool>,
+    /// 会话空闲超时（秒），默认 60
+    pub timeout_secs: Option<u64>,
+    /// 每会话每秒报文数上限，默认 100
+    pub rate_limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct AppConfigYaml {
     pub server: ServerConfigYaml,
     pub tls: TlsConfigYaml,
     pub static_sources: StaticSourcesConfigYaml,
     pub log: LogConfigYaml,
     pub rate_limit: RateLimitConfigYaml,
+    pub udp: UdpConfigYaml,
 }
 
 // -----------------------------------------------------------------------------
@@ -198,6 +214,17 @@ pub struct RateLimitOptions {
     pub black_time: Duration,
 }
 
+/// UDP relay 配置（`udp` 配置块）
+#[derive(Debug, Clone, Copy)]
+pub struct UdpConfig {
+    /// 是否启用 UDP relay（默认关闭；关闭时 UDP 帧/流被安全拒绝）
+    pub enabled: bool,
+    /// 会话空闲超时：超时无上下行报文则回收 socket
+    pub timeout: Duration,
+    /// 每会话每秒报文数上限（令牌桶）
+    pub rate_limit: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub server: ServerConfig,
@@ -205,6 +232,7 @@ pub struct AppConfig {
     pub static_sources: StaticSourcesConfig,
     pub log: LogConfig,
     pub rate_limit: RateLimitOptions,
+    pub udp: UdpConfig,
 }
 
 impl AppConfig {
@@ -277,6 +305,15 @@ impl AppConfig {
                 .unwrap_or(DEFAULT_BLACK_TIME_SECS),
         );
 
+        // ---- udp ----
+        let udp = UdpConfig {
+            enabled: yaml.udp.enabled.unwrap_or(false),
+            timeout: Duration::from_secs(
+                yaml.udp.timeout_secs.unwrap_or(DEFAULT_UDP_TIMEOUT_SECS),
+            ),
+            rate_limit: yaml.udp.rate_limit.unwrap_or(DEFAULT_UDP_RATE_LIMIT),
+        };
+
         Ok(Self {
             server: ServerConfig {
                 listen,
@@ -300,6 +337,7 @@ impl AppConfig {
                 rate_time,
                 black_time,
             },
+            udp,
         })
     }
 }
@@ -350,6 +388,11 @@ mod tests {
         assert_eq!(cfg.rate_limit.max_requests, DEFAULT_MAX_REQUESTS);
         assert_eq!(cfg.rate_limit.rate_time, Duration::from_secs(DEFAULT_RATE_TIME_SECS));
         assert_eq!(cfg.rate_limit.black_time, Duration::from_secs(DEFAULT_BLACK_TIME_SECS));
+
+        // UDP 默认关闭
+        assert!(!cfg.udp.enabled);
+        assert_eq!(cfg.udp.timeout, Duration::from_secs(DEFAULT_UDP_TIMEOUT_SECS));
+        assert_eq!(cfg.udp.rate_limit, DEFAULT_UDP_RATE_LIMIT);
     }
 
     #[test]
@@ -380,6 +423,11 @@ mod tests {
                 rate_time_secs: Some(5),
                 black_time_secs: Some(30),
             },
+            udp: UdpConfigYaml {
+                enabled: Some(true),
+                timeout_secs: Some(90),
+                rate_limit: Some(50),
+            },
         };
 
         let cfg = AppConfig::merge(yaml, Cli::default()).unwrap();
@@ -397,6 +445,9 @@ mod tests {
         assert_eq!(cfg.rate_limit.max_requests, 10);
         assert_eq!(cfg.rate_limit.rate_time, Duration::from_secs(5));
         assert_eq!(cfg.rate_limit.black_time, Duration::from_secs(30));
+        assert!(cfg.udp.enabled);
+        assert_eq!(cfg.udp.timeout, Duration::from_secs(90));
+        assert_eq!(cfg.udp.rate_limit, 50);
     }
 
     #[test]

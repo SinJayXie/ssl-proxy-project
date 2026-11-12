@@ -1,12 +1,20 @@
 use crate::state::AppState;
+use crate::types::UdpMode;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use super::connect::resolve_and_connect;
 use super::tunnel::forward_target_stream;
+use super::udp_relay;
 
 pub const AUTH_NO_PASS: u8 = 0x00;
+
+// SOCKS5 命令码
+const CMD_CONNECT: u8 = 0x01;
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
+// SOCKS5 应答码
+const REPLY_CMD_NOT_SUPPORTED: u8 = 0x07;
 
 /// Create a SOCKS5 connection task: resolve, connect, respond, pipe
 pub async fn create_connection_task(
@@ -54,13 +62,25 @@ pub async fn handle_socks5_client(mut client: TcpStream, state: Arc<AppState>) {
 
     // Step 3: Read SOCKS5 request
     let n = match client.read(&mut buf).await {
-        Ok(n) if n >= 7 && buf[0] == 5 && buf[1] == 1 => n,
+        Ok(n) if n >= 7 && buf[0] == 5 => n,
         Ok(n) => {
             log::error!("Invalid SOCKS5 request: {:02x?}", &buf[..n.min(10)]);
             return;
         }
         _ => return,
     };
+
+    match buf[1] {
+        CMD_CONNECT => {}
+        CMD_UDP_ASSOCIATE => {
+            handle_udp_associate(client, state).await;
+            return;
+        }
+        cmd => {
+            log::error!("Unsupported SOCKS5 command: 0x{cmd:02x}");
+            return;
+        }
+    }
 
     // Step 4: Parse address
     let addr_type = buf[3];
@@ -86,4 +106,22 @@ pub async fn handle_socks5_client(mut client: TcpStream, state: Arc<AppState>) {
     };
 
     create_connection_task(client, &host, port, is_domain, state).await;
+}
+
+/// 处理 SOCKS5 UDP ASSOCIATE（cmd=0x03）
+///
+/// - `udpMode=off`：回复 reply=0x07（Command not supported）并关闭连接；
+/// - 其余模式：绑定本地 UDP 中继、回复 BND.ADDR/BND.PORT，维持控制连接
+///   直到客户端断开（期间回收该 ASSOCIATE 的全部 UDP 会话）。
+async fn handle_udp_associate(mut client: TcpStream, state: Arc<AppState>) {
+    let udp_mode = state.config.read().await.udp_mode;
+    if udp_mode == UdpMode::Off {
+        // 与旧版行为一致：拒绝并关闭
+        let _ = client
+            .write_all(&[5, REPLY_CMD_NOT_SUPPORTED, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await;
+        log::debug!("SOCKS5 UDP ASSOCIATE rejected (udpMode=off)");
+        return;
+    }
+    udp_relay::start_associate(client, state, udp_mode).await;
 }

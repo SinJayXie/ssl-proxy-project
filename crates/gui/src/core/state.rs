@@ -1,5 +1,5 @@
 use crate::geo::GeoManager;
-use crate::types::{AppConfig, AppError, ConnectionInfo, DataFlow, RuleConfig};
+use crate::types::{AppConfig, AppError, ConnectionInfo, DataFlow, RuleConfig, UdpMode};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -17,6 +17,9 @@ pub struct AppState {
     pub dns_cache: Arc<RwLock<DnsCache>>,
     pub rules: Arc<RwLock<Vec<RuleConfig>>>,
     pub total_dataflow: Arc<RwLock<DataFlow>>,
+    /// Aggregate UDP session traffic (kept separate so `total_dataflow`
+    /// keeps meaning exactly what it meant before UDP support).
+    pub udp_dataflow: Arc<RwLock<DataFlow>>,
     pub config: Arc<RwLock<AppConfig>>,
     pub connection_id: Arc<RwLock<u32>>,
     pub error_pool: Arc<RwLock<Vec<AppError>>>,
@@ -75,6 +78,7 @@ impl AppState {
             dns_cache: Arc::new(RwLock::new(HashMap::new())),
             rules: Arc::new(RwLock::new(Self::load_rules(&config_dir))),
             total_dataflow: Arc::new(RwLock::new(DataFlow::new())),
+            udp_dataflow: Arc::new(RwLock::new(DataFlow::new())),
             config: Arc::new(RwLock::new(config)),
             connection_id: Arc::new(RwLock::new(0)),
             error_pool: Arc::new(RwLock::new(Vec::new())),
@@ -163,6 +167,13 @@ impl AppState {
                     if let Some(v) = yaml.get("muxEnabled").and_then(|v| v.as_bool()) {
                         config.mux_enabled = v;
                     }
+                    if let Some(v) = yaml.get("udpMode").and_then(|v| v.as_str()) {
+                        config.udp_mode = match v.trim() {
+                            "direct" => UdpMode::Direct,
+                            "proxy" => UdpMode::Proxy,
+                            _ => UdpMode::Off,
+                        };
+                    }
                     return config;
                 }
             }
@@ -230,6 +241,30 @@ mod tests {
         // Missing key keeps the default (enabled).
         fs::write(&path, "socksPort: 1080\n").unwrap();
         assert!(AppState::load_config(&dir).mux_enabled);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `udpMode` must round-trip through `setting.yaml`; unknown values fall
+    /// back to `off` (which keeps old configs — without the key — working).
+    #[test]
+    fn load_config_reads_udp_mode() {
+        let dir = std::env::temp_dir().join(format!("ssl-proxy-udp-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("setting.yaml");
+
+        fs::write(&path, "udpMode: proxy\n").unwrap();
+        assert_eq!(AppState::load_config(&dir).udp_mode, UdpMode::Proxy);
+
+        fs::write(&path, "udpMode: direct\n").unwrap();
+        assert_eq!(AppState::load_config(&dir).udp_mode, UdpMode::Direct);
+
+        fs::write(&path, "udpMode: nonsense\n").unwrap();
+        assert_eq!(AppState::load_config(&dir).udp_mode, UdpMode::Off);
+
+        // Missing key keeps the default (off).
+        fs::write(&path, "socksPort: 1080\n").unwrap();
+        assert_eq!(AppState::load_config(&dir).udp_mode, UdpMode::Off);
 
         let _ = fs::remove_dir_all(&dir);
     }

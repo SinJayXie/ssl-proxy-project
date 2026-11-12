@@ -23,8 +23,10 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_native_tls::TlsStream;
 
 use super::connect::{
-    compute_mac, create_protocol_header, tls_handshake, ACK_PREFIX, MAC_LEN, MAGIC,
+    compute_mac, create_protocol_header, probe_udp_capability, tls_handshake, ACK_PREFIX,
+    MAC_LEN, MAGIC,
 };
+use super::framing::{encode_udp_packet, parse_udp_packet};
 
 pub const FLAG_DATA: u8 = 0;
 pub const FLAG_OPEN: u8 = 1;
@@ -34,6 +36,11 @@ pub const FLAG_PING: u8 = 4;
 /// 服务端回应的保活帧（客户端读循环忽略）
 #[allow(dead_code)]
 pub const FLAG_PONG: u8 = 5;
+/// UDP 数据帧：payload 为 UDP 包编码（见 framing.rs；payload 内
+/// `stream_id` 与帧头 `sid` 为同一会话 ID，服务端按其做 NAT）
+pub const FLAG_UDP: u8 = 6;
+/// 关闭 UDP 会话（客户端 → 服务端，payload 为空）
+pub const FLAG_UDP_CLOSE: u8 = 7;
 
 pub const MUX_HEADER: usize = 8;
 pub const MAX_STREAMS: usize = 256;
@@ -85,6 +92,17 @@ fn encode_ctl(flag: u8, sid: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(MUX_HEADER);
     append_frame(&mut out, flag, sid, &[], 0);
     out
+}
+
+/// 编码一个 UDP 数据帧（FLAG_UDP）：payload 为 UDP 包编码
+///
+/// 返回 `None` 表示报文超限被丢弃。
+fn encode_udp_frame(sid: u32, host: &str, port: u16, dgram: &[u8]) -> Option<Vec<u8>> {
+    let pkt = encode_udp_packet(sid, host, port, dgram)?;
+    let pad_len = rand::thread_rng().gen_range(0..=32);
+    let mut out = Vec::with_capacity(MUX_HEADER + pkt.len() + pad_len);
+    append_frame(&mut out, FLAG_UDP, sid, &pkt, pad_len);
+    Some(out)
 }
 
 async fn read_frame<R>(reader: &mut R, payload: &mut Vec<u8>) -> io::Result<(u8, u32)>
@@ -147,6 +165,8 @@ struct MuxClient {
     next_sid: AtomicU32,
     active: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
+    /// 服务端是否支持 UDP 转发（能力协商结果，供 UDP over mux 使用）
+    pub(crate) udp_supported: bool,
 }
 
 impl MuxClient {
@@ -156,7 +176,7 @@ impl MuxClient {
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
 
-        // v2 mux 首包（hostLen = 0）
+        // v2 mux 首包（hostLen = 0，末尾带 UDP 扩展位）
         let header = create_protocol_header("", 0, &cfg.password);
         tls.write_all(&header.bytes).await?;
 
@@ -175,6 +195,9 @@ impl MuxClient {
                 "mux server auth failed",
             ));
         }
+
+        // UDP 能力探测：旧服务端不会发能力字节（短超时视为不支持）
+        let udp_supported = probe_udp_capability(&mut tls).await;
 
         let (mut reader, mut writer) = tokio::io::split(tls);
         let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE);
@@ -225,7 +248,12 @@ impl MuxClient {
                             reader_streams.lock().await.remove(&sid);
                         }
                     }
-                    FLAG_FIN => {
+                    FLAG_UDP => {
+                        if sender.send(InEvent::Data(payload.clone())).await.is_err() {
+                            reader_streams.lock().await.remove(&sid);
+                        }
+                    }
+                    FLAG_FIN | FLAG_UDP_CLOSE => {
                         let _ = sender.send(InEvent::Fin).await;
                         reader_streams.lock().await.remove(&sid);
                     }
@@ -251,6 +279,7 @@ impl MuxClient {
             next_sid: AtomicU32::new(1),
             active: Arc::new(AtomicUsize::new(0)),
             closed,
+            udp_supported,
         }))
     }
 
@@ -282,6 +311,31 @@ impl MuxClient {
             rx,
             frame_tx: self.frame_tx.clone(),
             guard,
+        })
+    }
+
+    /// 打开一条 UDP 会话流
+    ///
+    /// 与 TCP 流不同：不发 FLAG_OPEN，服务端在收到该 sid 的首帧
+    /// [`FLAG_UDP`] 时惰性建立 NAT 会话（首包建会话）。
+    async fn open_udp_stream(self: &Arc<Self>) -> io::Result<MuxUdpStream> {
+        if self.is_closed() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "mux closed"));
+        }
+        let sid = self.next_sid.fetch_add(1, Ordering::Relaxed).max(1);
+        let (tx, rx) = mpsc::channel(STREAM_BUFFER);
+        self.streams.lock().await.insert(sid, tx);
+        self.active.fetch_add(1, Ordering::Relaxed);
+
+        let guard = Arc::new(StreamGuard {
+            active: self.active.clone(),
+        });
+
+        Ok(MuxUdpStream {
+            sid,
+            rx,
+            frame_tx: self.frame_tx.clone(),
+            _guard: guard,
         })
     }
 }
@@ -391,6 +445,59 @@ impl MuxStreamWriter {
     }
 }
 
+/// 一条 UDP 会话流（mux 模式下的 UDP over TLS）
+pub struct MuxUdpStream {
+    sid: u32,
+    rx: mpsc::Receiver<InEvent>,
+    frame_tx: mpsc::Sender<Vec<u8>>,
+    /// 生命周期守卫：持有期间该流计入连接活跃数
+    _guard: Arc<StreamGuard>,
+}
+
+impl MuxUdpStream {
+    /// 发送一个 UDP 报文（单个 FLAG_UDP 帧，payload 为 UDP 包编码）
+    ///
+    /// 返回 `Ok(false)` 表示报文超限被丢弃（调用方不应计入流量）。
+    pub async fn send_dgram(&self, host: &str, port: u16, dgram: &[u8]) -> io::Result<bool> {
+        let Some(frame) = encode_udp_frame(self.sid, host, port, dgram) else {
+            return Ok(false);
+        };
+        self.frame_tx
+            .send(frame)
+            .await
+            .map(|_| true)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "mux closed"))
+    }
+
+    /// 接收服务端下发的 UDP 报文，返回 `(源地址, 端口, 报文)`
+    ///
+    /// `Ok(None)` 表示会话已被服务端关闭（FIN / FLAG_UDP_CLOSE）或隧道断开。
+    pub async fn recv_dgram(&mut self) -> io::Result<Option<(String, u16, Vec<u8>)>> {
+        loop {
+            match self.rx.recv().await {
+                Some(InEvent::Data(payload)) => {
+                    if let Some(pkt) = parse_udp_packet(&payload) {
+                        return Ok(Some((pkt.host, pkt.port, pkt.dgram.to_vec())));
+                    }
+                    // 畸形帧：跳过，继续等待后续报文
+                }
+                Some(InEvent::Fin) | None => return Ok(None),
+                Some(InEvent::Reset) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "udp stream reset",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// 关闭会话：发送 FLAG_UDP_CLOSE 让服务端回收 NAT 表项（尽力而为）
+    pub async fn close(&self) {
+        let _ = self.frame_tx.send(encode_ctl(FLAG_UDP_CLOSE, self.sid)).await;
+    }
+}
+
 /// 连接池：同一代理服务器最多复用 `MAX_CONNS` 条 mux 连接
 pub struct MuxManager {
     conns: Mutex<Vec<Arc<MuxClient>>>,
@@ -436,6 +543,52 @@ impl MuxManager {
         );
         client.open_stream(host, port).await
     }
+
+    /// 打开一条 UDP 会话流，必要时新建底层 mux 连接
+    ///
+    /// 服务端不支持 UDP（能力协商 `udp_supported = false`）时返回
+    /// `ErrorKind::Unsupported`，调用方应降级为 direct。
+    pub async fn open_udp(&self, cfg: &MuxConfig) -> io::Result<MuxUdpStream> {
+        let key = cfg.key();
+        let mut cur_key = self.key.lock().await;
+        let mut conns = self.conns.lock().await;
+
+        if *cur_key != key {
+            conns.clear();
+            *cur_key = key;
+        }
+        conns.retain(|c| !c.is_closed());
+
+        for conn in conns.iter() {
+            if conn.active.load(Ordering::Relaxed) < MAX_STREAMS {
+                return open_udp_on(conn).await;
+            }
+        }
+
+        if conns.len() >= MAX_CONNS {
+            conns.remove(0);
+        }
+        let client = MuxClient::connect(cfg).await?;
+        conns.push(client.clone());
+        log::info!(
+            "Mux connection established to {}:{} (pool={})",
+            cfg.server,
+            cfg.port,
+            conns.len()
+        );
+        open_udp_on(&client).await
+    }
+}
+
+/// 在一条 mux 连接上打开 UDP 会话流；不支持 UDP 时报错
+async fn open_udp_on(client: &Arc<MuxClient>) -> io::Result<MuxUdpStream> {
+    if !client.udp_supported {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "server does not support UDP relay",
+        ));
+    }
+    client.open_udp_stream().await
 }
 
 impl Default for MuxManager {

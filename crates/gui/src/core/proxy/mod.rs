@@ -4,6 +4,7 @@ mod http;
 mod mux;
 mod socks5;
 mod tunnel;
+mod udp_relay;
 
 use crate::state::AppState;
 use std::net::SocketAddr;

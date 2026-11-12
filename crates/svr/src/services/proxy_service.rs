@@ -1,9 +1,14 @@
-//! 代理服务：私有协议 v2 认证 + 透明 TCP 隧道。
+//! 代理服务：私有协议 v2 认证 + 透明 TCP 隧道 / UDP relay。
 //!
-//! 1. 用 [`authenticate_protocol`] 校验首包（HMAC-SHA256 + 时间戳）；
+//! 1. 用 [`authenticate_protocol_ext`] 校验首包（HMAC-SHA256 + 时间戳）；
 //! 2. 认证失败 / 非协议流量 → 回落为伪装 HTTP 响应；
 //! 3. 认证成功 → 连接目标 `host:port`，回写 `[0x10, 0xff] || ack_mac`，
-//!    然后用 `copy_bidirectional` 做零解析双向管道。
+//!    然后用 `copy_bidirectional` 做零解析双向管道；
+//! 4. UDP：认证首包 `port = 0` 标记 UDP 隧道（host 非空、仅参与 MAC），开启
+//!    `udp.enabled` 后进入 UDP relay（详见 [`udp_relay_service`]）。
+//!
+//! UDP 能力协商：客户端首包 MAC 后携带扩展位时，ACK 末尾追加 1 字节能力位
+//! （bit0 = [`CAP_UDP`]，`udp.enabled` 时置位）。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,20 +28,31 @@ use crate::services::framing::{
 };
 use crate::services::initial_stream::InitialThenStream;
 use crate::services::mux_service;
-use crate::utils::protocol::{ack_mac, authenticate_protocol, AuthInfo, TUNNEL_ACK};
+use crate::services::udp_relay_service::{self, UdpSettings};
+use crate::utils::protocol::{
+    ack_mac, authenticate_protocol_ext, AuthInfo, CAP_UDP, HEADER_LEN, MAC_LEN, TUNNEL_ACK,
+};
 
 pub struct ProxyService {
     password: String,
     forward: Arc<ForwardService>,
     mux_enabled: bool,
+    /// UDP relay 配置；`None` = 未启用（`udp.enabled=false`，默认）
+    udp: Option<Arc<UdpSettings>>,
 }
 
 impl ProxyService {
-    pub fn new(password: String, forward: Arc<ForwardService>, mux_enabled: bool) -> Self {
+    pub fn new(
+        password: String,
+        forward: Arc<ForwardService>,
+        mux_enabled: bool,
+        udp: Option<Arc<UdpSettings>>,
+    ) -> Self {
         Self {
             password,
             forward,
             mux_enabled,
+            udp,
         }
     }
 
@@ -44,27 +60,35 @@ impl ProxyService {
     ///
     /// - `tls_stream`：已 TLS 握手的客户端连接（不含已读首包）；
     /// - `initial`：先前已从 `tls_stream` 读出的首包字节。
-    pub async fn authenticate(&self, mut tls_stream: TlsStream, initial: Bytes, peer_ip: &str) {
+    pub async fn authenticate(&self, tls_stream: TlsStream, initial: Bytes, peer_ip: &str) {
         let now = unix_now();
-        match authenticate_protocol(&initial, &self.password, now) {
-            Some(auth) => {
+        match authenticate_protocol_ext(&initial, &self.password, now) {
+            Some((auth, ext)) => {
+                // 首包实际长度：HEADER(14) + hostLen + MAC(32) [+ 扩展位 1]。
+                // 客户端可能在收到 ACK 前就管线发送帧数据（UDP 隧道即如此），
+                // 这些字节已在首包读取时进入缓冲，必须回注到流首，否则会被吞掉。
+                let packet_len =
+                    HEADER_LEN + auth.host.len() + MAC_LEN + usize::from(ext.is_some());
+                let leftover = initial.slice(packet_len.min(initial.len())..);
+                let mut tls_stream = InitialThenStream::new(leftover, tls_stream);
+
                 // hostLen = 0：mux 连接，一条 TLS 承载多条逻辑流
                 if auth.host.is_empty() {
                     if !self.mux_enabled {
                         tracing::warn!("[Proxy] mux disabled, reject session from {}", peer_ip);
                         return;
                     }
-                    if self.write_ack(&mut tls_stream, &auth).await.is_err() {
+                    if self.write_ack(&mut tls_stream, &auth, ext).await.is_err() {
                         return;
                     }
                     tracing::info!("[Proxy] mux session up (peer_ip={})", peer_ip);
-                    if let Err(e) = mux_service::serve(tls_stream, peer_ip).await {
+                    if let Err(e) = mux_service::serve(tls_stream, peer_ip, self.udp.clone()).await {
                         tracing::debug!("[Mux] session end: {}", e);
                     }
                     return;
                 }
 
-                match self.open_tunnel(tls_stream, &auth).await {
+                match self.open_tunnel(tls_stream, &auth, ext).await {
                     Ok(_) => {}
                     Err(e) => tracing::warn!(
                         "[Proxy] tunnel open failed -> {}:{} : {}",
@@ -88,9 +112,19 @@ impl ProxyService {
         self.forward.handle(wrapped, Bytes::new(), peer_ip).await;
     }
 
-    /// 回写 `[0x10, 0xff] || ACK MAC`（证明服务端持有密码）
-    async fn write_ack(&self, tls_stream: &mut TlsStream, auth: &AuthInfo) -> Result<()> {
-        let mut ack = Vec::with_capacity(TUNNEL_ACK.len() + 32);
+    /// 回写 `[0x10, 0xff] || ACK MAC [|| 能力位]`（证明服务端持有密码）
+    ///
+    /// 仅当客户端首包携带扩展位（`ext` 为 `Some`）时，才在 MAC 之后追加 1 字节
+    /// 服务端能力位；旧客户端（无扩展位）不得多发，否则能力字节会被其当作
+    /// 隧道数据污染数据流。能力位 bit0 = `CAP_UDP`：`udp.enabled` 且客户端
+    /// 请求 UDP 能力时置位，否则为 0x00。
+    async fn write_ack<S: AsyncWrite + Unpin>(
+        &self,
+        tls_stream: &mut S,
+        auth: &AuthInfo,
+        ext: Option<u8>,
+    ) -> Result<()> {
+        let mut ack = Vec::with_capacity(TUNNEL_ACK.len() + 32 + 1);
         ack.extend_from_slice(&TUNNEL_ACK);
         ack.extend_from_slice(&ack_mac(
             &self.password,
@@ -98,11 +132,31 @@ impl ProxyService {
             auth.port,
             &auth.host,
         ));
+        if ext.is_some() {
+            let cap = if self.udp.is_some() { CAP_UDP } else { 0x00 };
+            ack.push(cap);
+        }
         tls_stream.write_all(&ack).await?;
         Ok(())
     }
 
-    async fn open_tunnel(&self, mut tls_stream: TlsStream, auth: &AuthInfo) -> Result<()> {
+    async fn open_tunnel(
+        &self,
+        mut tls_stream: TunnelStream,
+        auth: &AuthInfo,
+        ext: Option<u8>,
+    ) -> Result<()> {
+        // port = 0 标记非 mux UDP 隧道：每报文目标取自帧 payload，host 仅参与 MAC
+        if auth.port == 0 {
+            let Some(settings) = self.udp.clone() else {
+                tracing::warn!("[Proxy] udp disabled, reject udp tunnel (host={})", auth.host);
+                return Ok(()); // 安全拒绝：不回 ACK，直接关闭连接
+            };
+            self.write_ack(&mut tls_stream, auth, ext).await?;
+            tracing::info!("[Proxy] udp tunnel up (host={})", auth.host);
+            return udp_relay_service::serve_tunnel(tls_stream, settings).await;
+        }
+
         // 1. 上游连接（带超时）
         let upstream = timeout(
             Duration::from_secs(UPSTREAM_CONNECT_TIMEOUT_SECS),
@@ -114,7 +168,7 @@ impl ProxyService {
         upstream.set_nodelay(true)?;
 
         // 2. 应答：[0x10, 0xff] + ACK MAC（证明服务端同样持有密码）
-        self.write_ack(&mut tls_stream, auth).await?;
+        self.write_ack(&mut tls_stream, auth, ext).await?;
 
         tracing::info!("[Proxy] tunnel up -> {}:{} (peer_ip={})", auth.host, auth.port, "");
 
@@ -208,6 +262,8 @@ fn unix_now() -> u64 {
 
 /// 简化的 TLS 流别名
 type TlsStream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+/// 认证后移交通道的流类型（首包之后的缓冲字节优先吐出）
+type TunnelStream = InitialThenStream<TlsStream>;
 
 #[async_trait]
 impl Service for ProxyService {
@@ -216,7 +272,11 @@ impl Service for ProxyService {
     }
     async fn start(&self) -> Result<()> {
         let masked = mask_password(&self.password);
-        tracing::info!("[Proxy] ready (password={})", masked);
+        tracing::info!(
+            "[Proxy] ready (password={}, udp={})",
+            masked,
+            if self.udp.is_some() { "enabled" } else { "disabled" }
+        );
         Ok(())
     }
 }

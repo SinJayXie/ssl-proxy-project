@@ -4,7 +4,14 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
 
 /// PROXY / DIRECT badge matching the Vue `.badge` styles.
+///
+/// UDP sessions (`UDP` direct / `UDP-PROXY` via tunnel) get a dedicated badge
+/// so the protocol stays visible in the connection list.
 pub fn mode_badge(mode: &str, cx: &App) -> AnyElement {
+    let upper = mode.to_ascii_uppercase();
+    if upper == "UDP" || upper == "UDP-PROXY" {
+        return badge(i18n::t("UDP_BADGE"), upper == "UDP-PROXY", cx);
+    }
     let is_proxy = mode.eq_ignore_ascii_case("PROXY");
     let label = i18n::t(if is_proxy { "PROXY" } else { "DIRECT" });
     badge(label, is_proxy, cx)

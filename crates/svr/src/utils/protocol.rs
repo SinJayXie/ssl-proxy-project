@@ -18,6 +18,15 @@
 //! 认证成功后服务端回写 `[0x10, 0xff] || ack_mac(32B)`，其中
 //! `ack_mac = HMAC-SHA256(password, "ssl-proxy-v2-ack" || timestamp || port || host)`。
 //! 客户端校验通过才能确认对端确实持有密码（双向认证）。
+//!
+//! ## UDP 能力协商
+//!
+//! - 客户端可在首包 MAC 之后追加 1 字节扩展位（bit0 = [`EXT_UDP`]，声明请求 UDP 能力）；
+//! - 服务端**仅当**首包携带扩展位时，在 TUNNEL_ACK 的 MAC 之后追加 1 字节能力位
+//!   （bit0 = [`CAP_UDP`]，表示支持 UDP 转发）；旧客户端未携带扩展位时不得多发，
+//!   否则能力字节会被旧客户端当作隧道数据污染数据流；
+//! - 旧版本互操作：旧服务端把扩展位当多余字节忽略（其解析只校验 HEADER + MAC
+//!   长度下限），握手不受影响；旧客户端遇到新版服务端时，ACK 后不会有能力位。
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -37,6 +46,13 @@ pub const MAC_LEN: usize = 32;
 pub const HEADER_LEN: usize = 14;
 /// 允许的双端时钟偏差（秒）
 pub const MAX_CLOCK_SKEW_SECS: u64 = 120;
+
+/// 客户端首包扩展位（MAC 之后追加 1 字节）：bit0 = 请求 UDP 能力
+#[allow(dead_code)]
+pub const EXT_UDP: u8 = 0x01;
+/// 服务端 ACK 能力位（ACK MAC 之后追加 1 字节）：bit0 = 支持 UDP 转发
+#[allow(dead_code)]
+pub const CAP_UDP: u8 = 0x01;
 
 const REQ_PREFIX: &[u8] = b"ssl-proxy-v2";
 const ACK_PREFIX: &[u8] = b"ssl-proxy-v2-ack";
@@ -111,11 +127,35 @@ pub fn encode_packet(host: &str, port: u16, password: &str, timestamp: u64) -> V
     buf
 }
 
+/// 编码 v2 首包（扩展版）：MAC 之后追加 1 字节扩展位 `ext`
+///
+/// 旧版服务端把这 1 字节当多余数据忽略；新版服务端据此进行 UDP 能力协商。
+#[allow(dead_code)]
+pub fn encode_packet_ext(host: &str, port: u16, password: &str, timestamp: u64, ext: u8) -> Vec<u8> {
+    let mut buf = encode_packet(host, port, password, timestamp);
+    buf.push(ext);
+    buf
+}
+
 /// 解析并校验 v2 首包
 ///
 /// `password` 为服务端本地密码，`now` 为当前 Unix 时间戳（秒）。
 /// 任何一项校验失败都返回 `None`（调用方据此回落到 HTTP 伪装）。
+#[allow(dead_code)]
 pub fn authenticate_protocol(data: &[u8], password: &str, now: u64) -> Option<AuthInfo> {
+    authenticate_protocol_ext(data, password, now).map(|(info, _)| info)
+}
+
+/// 解析并校验 v2 首包（扩展版），返回认证信息与可选的客户端扩展位
+///
+/// - `data` 为整块读出的首包 buffer，可能包含首包之后的多余字节（一律忽略）；
+/// - 旧格式（HEADER + host + MAC 后无数据）→ 扩展位为 `None`；
+/// - 新格式（MAC 后紧跟 1 字节扩展位）→ 扩展位为 `Some(b)`。
+pub fn authenticate_protocol_ext(
+    data: &[u8],
+    password: &str,
+    now: u64,
+) -> Option<(AuthInfo, Option<u8>)> {
     if data.len() < HEADER_LEN + MAC_LEN {
         return None;
     }
@@ -148,11 +188,17 @@ pub fn authenticate_protocol(data: &[u8], password: &str, now: u64) -> Option<Au
     mac.update(host.as_bytes());
     mac.verify_slice(&data[host_end..host_end + MAC_LEN]).ok()?;
 
-    Some(AuthInfo {
-        host: host.to_string(),
-        port,
-        timestamp,
-    })
+    // 扩展位：MAC 之后紧跟的 1 字节（旧格式客户端不发，此处为 None）
+    let ext = data.get(host_end + MAC_LEN).copied();
+
+    Some((
+        AuthInfo {
+            host: host.to_string(),
+            port,
+            timestamp,
+        },
+        ext,
+    ))
 }
 
 #[cfg(test)]
@@ -177,6 +223,56 @@ mod tests {
         assert_eq!(info.host, "example.com");
         assert_eq!(info.port, 8443);
         assert_eq!(info.timestamp, NOW);
+    }
+
+    #[test]
+    fn v2_old_packet_parses_without_ext() {
+        // 旧 14B + host + MAC 格式：新函数解析不受影响，扩展位为 None
+        let pkt = encode_packet("example.com", 443, PWD, NOW);
+        let (info, ext) = authenticate_protocol_ext(&pkt, PWD, NOW).expect("旧格式应通过");
+        assert_eq!(info.host, "example.com");
+        assert_eq!(info.port, 443);
+        assert_eq!(info.timestamp, NOW);
+        assert!(ext.is_none(), "旧格式不应解析出扩展位");
+    }
+
+    #[test]
+    fn v2_ext_packet_roundtrip() {
+        // 新格式：MAC 之后追加 1 字节扩展位
+        let pkt = encode_packet_ext("example.com", 8443, PWD, NOW, EXT_UDP);
+        let (info, ext) = authenticate_protocol_ext(&pkt, PWD, NOW).expect("扩展首包应通过");
+        assert_eq!(info.host, "example.com");
+        assert_eq!(info.port, 8443);
+        assert_eq!(info.timestamp, NOW);
+        assert_eq!(ext, Some(EXT_UDP));
+    }
+
+    #[test]
+    fn v2_ext_mux_packet_roundtrip() {
+        // mux 首包（hostLen = 0）同样可携带扩展位
+        let pkt = encode_packet_ext("", 0, PWD, NOW, EXT_UDP);
+        let (info, ext) = authenticate_protocol_ext(&pkt, PWD, NOW).expect("mux 扩展首包应通过");
+        assert!(info.host.is_empty());
+        assert_eq!(info.port, 0);
+        assert_eq!(ext, Some(EXT_UDP));
+    }
+
+    #[test]
+    fn v2_old_authenticate_still_accepts_ext_packet() {
+        // 旧函数语义：首包之后的多余字节（含扩展位）被忽略，认证仍成功
+        let pkt = encode_packet_ext("example.com", 443, PWD, NOW, EXT_UDP);
+        let info = authenticate_protocol(&pkt, PWD, NOW).expect("旧函数应容忍扩展字节");
+        assert_eq!(info.port, 443);
+    }
+
+    #[test]
+    fn v2_ext_packet_tolerates_trailing_bytes() {
+        // 调用方传整块 buffer：扩展位之后再有多余字节，也只解析 1 字节扩展位
+        let mut pkt = encode_packet_ext("example.com", 443, PWD, NOW, EXT_UDP);
+        pkt.extend_from_slice(b"trailing-junk");
+        let (info, ext) = authenticate_protocol_ext(&pkt, PWD, NOW).expect("应通过");
+        assert_eq!(info.port, 443);
+        assert_eq!(ext, Some(EXT_UDP));
     }
 
     #[test]

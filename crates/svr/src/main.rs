@@ -37,6 +37,7 @@ use crate::services::forward_service::ForwardService;
 use crate::services::proxy_service::ProxyService;
 use crate::services::socket_service::{load_tls_config, SocketService};
 use crate::services::static_sources_service::StaticSourcesService;
+use crate::services::udp_relay_service::UdpSettings;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
@@ -90,10 +91,21 @@ async fn main() -> Result<()> {
         },
     ));
 
+    // UDP relay：`udp.enabled=false`（默认）时为 None，UDP 帧/流被安全拒绝
+    let udp = if app_cfg.udp.enabled {
+        Some(Arc::new(UdpSettings {
+            timeout: app_cfg.udp.timeout,
+            rate_limit: app_cfg.udp.rate_limit,
+        }))
+    } else {
+        None
+    };
+
     let proxy = Arc::new(ProxyService::new(
         app_cfg.server.password.clone(),
         forward.clone(),
         app_cfg.server.mux,
+        udp,
     ));
 
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
