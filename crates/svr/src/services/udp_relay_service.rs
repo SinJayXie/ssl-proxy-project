@@ -66,6 +66,8 @@ pub struct UdpSettings {
     pub timeout: Duration,
     /// 每会话每秒报文数上限（令牌桶，容量 = 速率）
     pub rate_limit: u32,
+    /// 允许回环/内网/链路本地目标（**仅供测试**；生产配置不暴露，默认 false）
+    pub allow_private: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -220,9 +222,10 @@ fn local_addresses() -> &'static HashSet<IpAddr> {
 
 /// 判断目标 IP 是否禁止转发（SSRF 防护）
 ///
-/// 覆盖：127.0.0.0/8、10/8、172.16/12、192.168/16、169.254/16、0.0.0.0/8、
-/// ::1、fe80::/10、fc00::/7、IPv4 映射 IPv6（::ffff:x.y.z.w 按内网规则复查）
-/// 以及本机地址。
+/// 覆盖：127.0.0.0/8、10/8、100.64/10（CGNAT，含云厂商 metadata）、172.16/12、
+/// 192.168/16、169.254/16、192.0.0/24、198.18/15、0.0.0.0/8、组播 224/4、
+/// 保留 240/4（含广播 255.255.255.255）、::1、::、fe80::/10、fc00::/7、
+/// 组播 ff00::/8、IPv4 映射 IPv6（::ffff:x.y.z.w 按 IPv4 规则复查）以及本机地址。
 pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     let forbidden = match ip {
         IpAddr::V4(v4) => {
@@ -233,12 +236,18 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
                 || (o[0] == 172 && o[1] & 0xf0 == 16)      // 172.16/12
                 || (o[0] == 192 && o[1] == 168)            // 192.168/16
                 || (o[0] == 169 && o[1] == 254)            // 169.254/16
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)    // 100.64/10（阿里云 100.100.100.200 等）
+                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
+                || (o[0] == 198 && (o[1] & 0xfe) == 18)    // 198.18/15
+                || o[0] >= 224                             // 组播 224/4 + 保留 240/4（含广播）
         }
         IpAddr::V6(v6) => {
             let s = v6.segments();
             v6.is_loopback()                               // ::1
+                || v6.is_unspecified()                     // ::
                 || (s[0] & 0xffc0) == 0xfe80               // fe80::/10
                 || (s[0] & 0xfe00) == 0xfc00               // fc00::/7
+                || (s[0] & 0xff00) == 0xff00               // ff00::/8 组播
                 || (s[0] == 0
                     && s[1] == 0
                     && s[2] == 0
@@ -318,6 +327,8 @@ pub struct UdpRelay {
     frame_tx: mpsc::Sender<Vec<u8>>,
     /// true = mux 模式（回包为 `mux::FLAG_UDP` 帧），false = 非 mux 隧道
     mux: bool,
+    /// 会话创建串行化：并发同名流只建一次 NAT 会话（创建可能涉及 DNS）
+    creation_lock: tokio::sync::Mutex<()>,
 }
 
 impl UdpRelay {
@@ -327,7 +338,13 @@ impl UdpRelay {
             sessions: Arc::new(DashMap::new()),
             frame_tx,
             mux,
+            creation_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// 该流是否已有 NAT 会话（用于决定是否可同步转发）
+    pub fn has_session(&self, stream_id: u32) -> bool {
+        self.sessions.contains_key(&stream_id)
     }
 
     /// 转发一个来自隧道的 UDP 数据报（按需建会话；限速 / SSRF 不通过则丢包）
@@ -365,6 +382,12 @@ impl UdpRelay {
         if let Some(session) = self.sessions.get(&stream_id) {
             return Some(session.inner.clone());
         }
+
+        // 串行化创建：并发到达的同一条流只建一次会话（创建可能涉及 DNS）
+        let _creating = self.creation_lock.lock().await;
+        if let Some(session) = self.sessions.get(&stream_id) {
+            return Some(session.inner.clone());
+        }
         if self.sessions.len() >= MAX_SESSIONS {
             tracing::warn!("[Udp] session table full, drop stream {}", stream_id);
             return None;
@@ -385,8 +408,8 @@ impl UdpRelay {
             }
         };
 
-        // SSRF：解析后的地址同样检查（含本机地址）
-        if is_forbidden_ip(target.ip()) {
+        // SSRF：解析后的地址同样检查（含本机地址）；测试可通过 allow_private 放行
+        if !self.settings.allow_private && is_forbidden_ip(target.ip()) {
             tracing::warn!("[Udp] blocked forbidden target {} (stream {})", target, stream_id);
             return None;
         }
@@ -610,6 +633,10 @@ mod tests {
             "127.0.0.1", "127.8.8.8", "10.0.0.1", "10.255.1.1", "172.16.0.1", "172.31.255.255",
             "192.168.1.1", "169.254.10.10", "0.0.0.0", "0.1.2.3", "::1", "fe80::1", "febf::1",
             "fc00::1", "fd12:3455:1234::1", "::ffff:127.0.0.1", "::ffff:10.0.0.2",
+            // CGNAT / 云厂商 metadata、保留段、组播与广播
+            "100.64.0.1", "100.100.100.200", "100.127.255.254", "192.0.0.8", "198.18.0.1",
+            "198.19.255.255", "224.0.0.1", "239.255.255.250", "240.0.0.1", "255.255.255.255",
+            "::", "ff02::1",
         ] {
             assert!(
                 is_forbidden_ip(ip.parse().unwrap()),
@@ -621,7 +648,15 @@ mod tests {
 
     #[test]
     fn public_ip_is_allowed() {
-        for ip in ["8.8.8.8", "1.1.1.1", "172.32.0.1", "172.15.255.255", "2001:4860:4860::8888"] {
+        for ip in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.32.0.1",
+            "172.15.255.255",
+            "100.63.255.255",
+            "198.20.0.1",
+            "2001:4860:4860::8888",
+        ] {
             assert!(
                 !is_forbidden_ip(ip.parse().unwrap()),
                 "{} 不应被判为禁止目标",

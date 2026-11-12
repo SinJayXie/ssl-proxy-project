@@ -96,6 +96,8 @@ async fn main() -> Result<()> {
         Some(Arc::new(UdpSettings {
             timeout: app_cfg.udp.timeout,
             rate_limit: app_cfg.udp.rate_limit,
+            // 生产环境不允许回环/内网目标（SSRF 防护）
+            allow_private: false,
         }))
     } else {
         None

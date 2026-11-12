@@ -61,7 +61,7 @@ where
         let _ = writer.shutdown().await;
     });
 
-    let udp_relay = udp.map(|settings| UdpRelay::new(settings, frame_tx.clone(), true));
+    let udp_relay = udp.map(|settings| Arc::new(UdpRelay::new(settings, frame_tx.clone(), true)));
 
     let mut streams: HashMap<u32, mpsc::Sender<StreamCmd>> = HashMap::new();
     let mut payload = Vec::with_capacity(8 * 1024);
@@ -111,7 +111,18 @@ where
                 };
                 match parse_udp_packet(&payload) {
                     Some((stream_id, host, port, dgram)) => {
-                        relay.relay(stream_id, sid, &host, port, dgram).await;
+                        if relay.has_session(stream_id) {
+                            // 已建会话：同步转发（快路径）
+                            relay.relay(stream_id, sid, &host, port, dgram).await;
+                        } else {
+                            // 首包建会话可能涉及 DNS/绑定：异步执行，避免阻塞
+                            // 整条 mux 连接（否则同连接上的 TCP 流会一起卡住）
+                            let relay = relay.clone();
+                            let dgram = dgram.to_vec();
+                            tokio::spawn(async move {
+                                relay.relay(stream_id, sid, &host, port, &dgram).await;
+                            });
+                        }
                     }
                     None => tracing::debug!("[Mux] malformed udp frame (sid={})", sid),
                 }

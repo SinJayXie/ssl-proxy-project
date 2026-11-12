@@ -23,7 +23,7 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio_native_tls::TlsStream;
 
-use super::connect::{connect_proxy, match_rules};
+use super::connect::{connect_udp_tunnel, match_rules, UdpTunnelError};
 use super::framing::{append_udp_frame, parse_udp_packet, read_frame, FLAG_UDP};
 use super::mux::{MuxConfig, MuxUdpStream, MUX};
 
@@ -35,6 +35,30 @@ const SESSION_QUEUE: usize = 128;
 const DGRAM_BUF: usize = 65536;
 /// 非 mux 模式下每条隧道只承载一个 UDP 会话，stream_id 固定为 1
 const NON_MUX_STREAM_ID: u32 = 1;
+/// 服务端不支持 UDP 后的熔断时长（秒）：期间直接降级，不再逐包重试握手
+const TUNNEL_RETRY_COOLDOWN_SECS: u64 = 60;
+
+/// 非 mux UDP 隧道熔断截止时间（Unix 秒）；0 = 未熔断
+static TUNNEL_RETRY_AT: AtomicU64 = AtomicU64::new(0);
+/// 会话代号：用于安全地按 key 摘除自己创建的会话条目
+static SESSION_GEN: AtomicU64 = AtomicU64::new(1);
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 由主机字符串 + 端口构造 `SocketAddr`
+///
+/// 回包/直连路径上的主机都是 IP 字面量；用 `SocketAddr::new` 而不是字符串
+/// 拼接，否则 IPv6 会被拼成非法地址（`2001:db8::1:53` 不是 `SocketAddr`）。
+fn parse_peer(host: &str, port: u16) -> Option<SocketAddr> {
+    host.parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| SocketAddr::new(ip, port))
+}
 
 // ==================== SOCKS5 UDP 请求头解析 ====================
 
@@ -254,8 +278,11 @@ struct UdpIn {
     data: Vec<u8>,
 }
 
+/// 会话表条目：`tx` 在会话创建前就已注册，创建期间到达的报文先排队
 struct SessionHandle {
     tx: mpsc::Sender<UdpIn>,
+    /// 会话代号：创建失败 / 退出时只摘除自己这一条
+    generation: u64,
 }
 
 type SessionMap = Arc<Mutex<HashMap<(String, u16), SessionHandle>>>;
@@ -343,6 +370,9 @@ pub async fn start_associate(mut control: TcpStream, state: Arc<AppState>, udp_m
 }
 
 /// 处理一个应用发来的 SOCKS5 UDP 数据报
+///
+/// 会话未命中时先注册占位（含入站队列）再异步建会话：DNS + TLS 握手不再
+/// 阻塞整个 ASSOCIATE 收包循环，创建期间到达的报文先排队，不丢首包。
 async fn handle_datagram(
     relay: &Arc<UdpSocket>,
     origin: SocketAddr,
@@ -360,28 +390,40 @@ async fn handle_datagram(
         }
     };
     let dgram = &buf[req.header_len..];
-
-    // 按目标查/建会话（不能持锁跨 await，先查后建、建后复查）
     let key = (req.host.clone(), req.port);
-    let existing = {
+
+    // 查/建占位（不持锁跨 await）
+    let (tx, creation) = {
         let mut map = sessions.lock().await;
         match map.get(&key) {
-            Some(h) if !h.tx.is_closed() => Some(h.tx.clone()),
-            Some(_) => {
+            Some(h) if !h.tx.is_closed() => (h.tx.clone(), None),
+            _ => {
                 map.remove(&key);
-                None
+                let (tx, rx) = mpsc::channel(SESSION_QUEUE);
+                let generation = SESSION_GEN.fetch_add(1, Ordering::Relaxed);
+                map.insert(
+                    key.clone(),
+                    SessionHandle {
+                        tx: tx.clone(),
+                        generation,
+                    },
+                );
+                (tx, Some((rx, generation)))
             }
-            None => None,
         }
     };
 
-    let tx = match existing {
-        Some(tx) => tx,
-        None => match create_session(state, relay, sessions, udp_mode, key.clone()).await {
-            Some(tx) => tx,
-            None => return, // 路由解析/建会话失败：丢弃报文
-        },
-    };
+    if let Some((rx, generation)) = creation {
+        tokio::spawn(create_session(
+            state.clone(),
+            relay.clone(),
+            sessions.clone(),
+            udp_mode,
+            key,
+            generation,
+            rx,
+        ));
+    }
 
     // 队列打满时丢弃（UDP 语义，不阻塞主循环）
     let _ = tx.try_send(UdpIn {
@@ -390,98 +432,36 @@ async fn handle_datagram(
     });
 }
 
-/// 为目标 (host, port) 创建 UDP 会话并注册到会话表
+/// 会话隧道形态
+enum Tunnel {
+    Direct,
+    Tls(TlsStream<TcpStream>),
+    Mux(MuxUdpStream),
+}
+
+/// 会话创建任务：路由决策 → 建隧道 → 注册连接条目并启动转发任务
 async fn create_session(
-    state: &Arc<AppState>,
-    relay: &Arc<UdpSocket>,
-    sessions: &SessionMap,
+    state: Arc<AppState>,
+    relay: Arc<UdpSocket>,
+    sessions: SessionMap,
     udp_mode: UdpMode,
     key: (String, u16),
-) -> Option<mpsc::Sender<UdpIn>> {
+    generation: u64,
+    rx: mpsc::Receiver<UdpIn>,
+) {
     let (host, port) = (key.0.clone(), key.1);
-    let decision = resolve_udp_route(state, &host, udp_mode).await?;
 
-    // 代理路径准备（失败/降级时回退 direct）
-    enum Tunnel {
-        Direct,
-        Tls(TlsStream<TcpStream>),
-        Mux(MuxUdpStream),
-    }
-    let tunnel = if decision.is_direct {
-        Tunnel::Direct
-    } else {
-        let (mux_enabled, proxy_server, proxy_port, proxy_password, skip_verify, sni_name) = {
-            let config = state.config.read().await;
-            let sni = if config.sni_name.is_empty() {
-                config
-                    .proxy_server
-                    .split(':')
-                    .next()
-                    .unwrap_or(&config.proxy_server)
-                    .to_string()
-            } else {
-                config.sni_name.clone()
-            };
-            (
-                config.mux_enabled,
-                config.proxy_server.clone(),
-                config.proxy_port,
-                config.proxy_password.clone(),
-                config.danger_accept_invalid_certs,
-                sni,
-            )
-        };
-
-        if mux_enabled {
-            let mux_cfg = MuxConfig {
-                server: proxy_server,
-                port: proxy_port,
-                password: proxy_password,
-                skip_verify,
-                sni: sni_name,
-            };
-            match MUX.open_udp(&mux_cfg).await {
-                Ok(stream) => Tunnel::Mux(stream),
-                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                    warn_udp_degraded_once();
-                    Tunnel::Direct
-                }
-                Err(e) => {
-                    log::error!("UDP mux session failed for {}:{}: {}", host, port, e);
-                    return None;
-                }
-            }
-        } else {
-            // 非 mux UDP 隧道契约：认证首包 port=0 标记 UDP 隧道（host 填目标、
-            // 仅参与 MAC），每个数据报的真实目标取自 FLAG_UDP 帧 payload；
-            // ACK MAC 校验同样按 port=0 + 目标 host 计算，两端必须一致。
-            match connect_proxy(
-                &proxy_server,
-                proxy_port,
-                &host,
-                0,
-                &proxy_password,
-                skip_verify,
-                &sni_name,
-            )
-            .await
-            {
-                Ok(conn) if conn.udp_supported => Tunnel::Tls(conn.stream),
-                Ok(_) => {
-                    // 服务端不支持 UDP：降级为 direct（每进程一条告警日志）
-                    warn_udp_degraded_once();
-                    Tunnel::Direct
-                }
-                Err(e) => {
-                    log::error!("UDP proxy tunnel failed for {}:{}: {}", host, port, e);
-                    return None;
-                }
-            }
-        }
+    let Some(decision) = resolve_udp_route(&state, &host, udp_mode).await else {
+        unregister_session(&sessions, &key, generation).await;
+        return;
+    };
+    let Some(tunnel) = build_tunnel(&state, &decision, &host, port).await else {
+        unregister_session(&sessions, &key, generation).await;
+        return;
     };
 
     // 注册连接条目（协议标识 UDP）
-    let proxied = !matches!(tunnel, Tunnel::Direct);
+    let proxied = !matches!(&tunnel, Tunnel::Direct);
     let id = {
         let mut cid = state.connection_id.write().await;
         *cid += 1;
@@ -503,25 +483,21 @@ async fn create_session(
     };
     state.connections.write().await.insert(id, conn_info);
 
-    let (tx, rx) = mpsc::channel(SESSION_QUEUE);
-    let up = Arc::new(AtomicU64::new(0));
-    let down = Arc::new(AtomicU64::new(0));
-    let flush = spawn_flush(state.clone(), id, up.clone(), down.clone());
+    let stats = SessionStats::default();
+    let flush = stats.clone().spawn_flush(state.clone(), id);
 
-    let (up2, down2) = (up.clone(), down.clone());
     let runner = match tunnel {
         Tunnel::Direct => tokio::spawn(run_direct_session(
             relay.clone(),
             rx,
-            up2,
-            down2,
-            format!("{}:{}", decision.ip, port),
+            stats.clone(),
+            decision.ip.clone(),
+            port,
         )),
         Tunnel::Tls(tls) => tokio::spawn(run_proxy_tls_session(
             relay.clone(),
             rx,
-            up2,
-            down2,
+            stats.clone(),
             tls,
             NON_MUX_STREAM_ID,
             host.clone(),
@@ -530,99 +506,194 @@ async fn create_session(
         Tunnel::Mux(stream) => tokio::spawn(run_proxy_mux_session(
             relay.clone(),
             rx,
-            up2,
-            down2,
+            stats.clone(),
             stream,
             host.clone(),
             port,
         )),
     };
 
-    // 会话退出后自清理（空闲超时 / 隧道断开 / 竞态落败）
+    // 会话退出后自清理（空闲超时 / 隧道断开）
     let state2 = state.clone();
     let sessions2 = sessions.clone();
-    let key2 = key.clone();
     tokio::spawn(async move {
         let _ = runner.await;
         flush.abort();
-        finalize_session(&state2, id, &up, &down, &sessions2, &key2).await;
+        finalize_session(&state2, id, &stats, &sessions2, &key, generation).await;
     });
+}
 
-    // 建后复查：并发建会话时保留先到者
-    let (registered, tx) = {
-        let mut map = sessions.lock().await;
-        if let Some(h) = map.get(&key) {
-            if !h.tx.is_closed() {
-                (false, h.tx.clone())
-            } else {
-                map.remove(&key);
-                map.insert(key.clone(), SessionHandle { tx: tx.clone() });
-                (true, tx)
-            }
-        } else {
-            map.insert(key.clone(), SessionHandle { tx: tx.clone() });
-            (true, tx)
-        }
-    };
-    if !registered {
-        // 已有会话接管：丢弃本会话（drop tx → 任务立即退出并自清理）
-        drop(tx);
-        return None;
+/// 按路由决策建立会话隧道
+async fn build_tunnel(
+    state: &Arc<AppState>,
+    decision: &UdpRouteDecision,
+    host: &str,
+    port: u16,
+) -> Option<Tunnel> {
+    if decision.is_direct {
+        return Some(Tunnel::Direct);
     }
 
-    Some(tx)
+    let (mux_enabled, proxy_server, proxy_port, proxy_password, skip_verify, sni_name) = {
+        let config = state.config.read().await;
+        let sni = if config.sni_name.is_empty() {
+            config
+                .proxy_server
+                .split(':')
+                .next()
+                .unwrap_or(&config.proxy_server)
+                .to_string()
+        } else {
+            config.sni_name.clone()
+        };
+        (
+            config.mux_enabled,
+            config.proxy_server.clone(),
+            config.proxy_port,
+            config.proxy_password.clone(),
+            config.danger_accept_invalid_certs,
+            sni,
+        )
+    };
+
+    if mux_enabled {
+        let mux_cfg = MuxConfig {
+            server: proxy_server,
+            port: proxy_port,
+            password: proxy_password,
+            skip_verify,
+            sni: sni_name,
+        };
+        return match MUX.open_udp(&mux_cfg).await {
+            Ok(stream) => Some(Tunnel::Mux(stream)),
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                warn_udp_degraded_once();
+                Some(Tunnel::Direct)
+            }
+            Err(e) => {
+                log::error!("UDP mux session failed for {}:{}: {}", host, port, e);
+                None
+            }
+        };
+    }
+
+    // 非 mux UDP 隧道契约：认证首包 port=0 标记 UDP 隧道（host 填目标、仅参与
+    // MAC），每个数据报的真实目标取自 FLAG_UDP 帧 payload；ACK MAC 校验同样按
+    // port=0 + 目标 host 计算，两端必须一致。
+    let now = unix_now();
+    if now < TUNNEL_RETRY_AT.load(Ordering::Relaxed) {
+        // 熔断期内：已知服务端不支持 UDP，直接走直连，不再逐包重试握手
+        return Some(Tunnel::Direct);
+    }
+    match connect_udp_tunnel(
+        &proxy_server,
+        proxy_port,
+        host,
+        &proxy_password,
+        skip_verify,
+        &sni_name,
+    )
+    .await
+    {
+        Ok(tls) => {
+            TUNNEL_RETRY_AT.store(0, Ordering::Relaxed);
+            Some(Tunnel::Tls(tls))
+        }
+        Err(UdpTunnelError::Unsupported(reason)) => {
+            TUNNEL_RETRY_AT.store(now + TUNNEL_RETRY_COOLDOWN_SECS, Ordering::Relaxed);
+            warn_udp_degraded_once();
+            log::warn!(
+                "UDP proxy unsupported for {}:{} ({}), falling back to DIRECT",
+                host,
+                port,
+                reason
+            );
+            Some(Tunnel::Direct)
+        }
+        Err(UdpTunnelError::Transport(e)) => {
+            log::error!("UDP proxy tunnel failed for {}:{}: {}", host, port, e);
+            None
+        }
+    }
+}
+
+/// 摘除会话条目（仅当条目仍属于本次创建）
+async fn unregister_session(sessions: &SessionMap, key: &(String, u16), generation: u64) {
+    let mut map = sessions.lock().await;
+    if map.get(key).map(|h| h.generation) == Some(generation) {
+        map.remove(key);
+    }
 }
 
 /// 会话收尾：写入最终流量、移除连接条目、从会话表摘除自己
 async fn finalize_session(
     state: &Arc<AppState>,
     id: u32,
-    up: &AtomicU64,
-    down: &AtomicU64,
+    stats: &SessionStats,
     sessions: &SessionMap,
     key: &(String, u16),
+    generation: u64,
 ) {
-    flush_once(state, id, up, down).await;
+    stats.flush(state, id).await;
     state.connections.write().await.remove(&id);
-    let mut map = sessions.lock().await;
-    if let Some(h) = map.get(key) {
-        if h.tx.is_closed() {
-            map.remove(key);
-        }
-    }
+    unregister_session(sessions, key, generation).await;
 }
 
 // ==================== 流量统计 ====================
 
-/// 周期性把会话流量刷入连接列表与全局 UDP 计数
-fn spawn_flush(
-    state: Arc<AppState>,
-    id: u32,
+/// 单个 UDP 会话的流量计数
+///
+/// `up`/`down` 是会话累计值（写入连接列表）；`reported_*` 是已并入全局计数
+/// 的水位，`flush` 只累加增量，多会话并发时全局 UDP 计数才不会少报。
+#[derive(Clone, Default)]
+struct SessionStats {
     up: Arc<AtomicU64>,
     down: Arc<AtomicU64>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            flush_once(&state, id, &up, &down).await;
-        }
-    })
+    reported_up: Arc<AtomicU64>,
+    reported_down: Arc<AtomicU64>,
 }
 
-async fn flush_once(state: &Arc<AppState>, id: u32, up: &AtomicU64, down: &AtomicU64) {
-    let u = up.load(Ordering::Relaxed);
-    let d = down.load(Ordering::Relaxed);
-    {
-        let mut conns = state.connections.write().await;
-        if let Some(info) = conns.get_mut(&id) {
-            info.data.up = u;
-            info.data.down = d;
-        }
+impl SessionStats {
+    fn add_up(&self, n: usize) {
+        self.up.fetch_add(n as u64, Ordering::Relaxed);
     }
-    let mut df = state.udp_dataflow.write().await;
-    df.up = df.up.max(u);
-    df.down = df.down.max(d);
-    df.total = df.up + df.down;
+
+    fn add_down(&self, n: usize) {
+        self.down.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    /// 周期性把会话流量刷入连接列表与全局 UDP 计数
+    fn spawn_flush(self, state: Arc<AppState>, id: u32) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                self.flush(&state, id).await;
+            }
+        })
+    }
+
+    async fn flush(&self, state: &Arc<AppState>, id: u32) {
+        let u = self.up.load(Ordering::Relaxed);
+        let d = self.down.load(Ordering::Relaxed);
+        {
+            let mut conns = state.connections.write().await;
+            if let Some(info) = conns.get_mut(&id) {
+                info.data.up = u;
+                info.data.down = d;
+            }
+        }
+
+        let du = u.saturating_sub(self.reported_up.swap(u, Ordering::Relaxed));
+        let dd = d.saturating_sub(self.reported_down.swap(d, Ordering::Relaxed));
+        if du == 0 && dd == 0 {
+            return;
+        }
+
+        let mut df = state.udp_dataflow.write().await;
+        df.up = df.up.saturating_add(du);
+        df.down = df.down.saturating_add(dd);
+        df.total = df.up.saturating_add(df.down);
+    }
 }
 
 // ==================== 会话任务 ====================
@@ -631,18 +702,29 @@ async fn flush_once(state: &Arc<AppState>, id: u32, up: &AtomicU64, down: &Atomi
 async fn run_direct_session(
     relay: Arc<UdpSocket>,
     mut rx: mpsc::Receiver<UdpIn>,
-    up: Arc<AtomicU64>,
-    down: Arc<AtomicU64>,
-    target: String,
+    stats: SessionStats,
+    target_ip: String,
+    target_port: u16,
 ) {
-    let sock = match UdpSocket::bind("0.0.0.0:0").await {
+    let Some(target) = parse_peer(&target_ip, target_port) else {
+        log::error!(
+            "UDP direct session has invalid target {}:{}",
+            target_ip,
+            target_port
+        );
+        return;
+    };
+
+    // 按目标地址族绑定：IPv6 目标不能用 0.0.0.0
+    let bind = if target.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+    let sock = match UdpSocket::bind(bind).await {
         Ok(s) => s,
         Err(e) => {
             log::error!("UDP direct session socket bind failed: {}", e);
             return;
         }
     };
-    if let Err(e) = sock.connect(&target).await {
+    if let Err(e) = sock.connect(target).await {
         log::error!("UDP direct session connect to {} failed: {}", target, e);
         return;
     }
@@ -656,9 +738,7 @@ async fn run_direct_session(
                 Some(m) => {
                     last_origin = Some(m.origin);
                     match sock.send(&m.data).await {
-                        Ok(_) => {
-                            up.fetch_add(m.data.len() as u64, Ordering::Relaxed);
-                        }
+                        Ok(_) => stats.add_up(m.data.len()),
                         Err(e) => {
                             log::debug!("UDP direct send to {} failed: {}", target, e);
                         }
@@ -671,7 +751,7 @@ async fn run_direct_session(
                     if let Some(origin) = last_origin {
                         if let Some(reply) = wrap_socks5_udp_reply(peer, &rbuf[..n]) {
                             if relay.send_to(&reply, origin).await.is_ok() {
-                                down.fetch_add(n as u64, Ordering::Relaxed);
+                                stats.add_down(n);
                             }
                         }
                     }
@@ -690,8 +770,7 @@ async fn run_direct_session(
 async fn run_proxy_tls_session(
     relay: Arc<UdpSocket>,
     mut rx: mpsc::Receiver<UdpIn>,
-    up: Arc<AtomicU64>,
-    down: Arc<AtomicU64>,
+    stats: SessionStats,
     tls: TlsStream<TcpStream>,
     stream_id: u32,
     host: String,
@@ -709,7 +788,7 @@ async fn run_proxy_tls_session(
                     let mut out = Vec::with_capacity(m.data.len() + 300);
                     if append_udp_frame(&mut out, stream_id, &host, port, &m.data) {
                         if tw.write_all(&out).await.is_ok() {
-                            up.fetch_add(m.data.len() as u64, Ordering::Relaxed);
+                            stats.add_up(m.data.len());
                         } else {
                             log::debug!("UDP tunnel write failed ({}:{}), session dead", host, port);
                             break; // 隧道断开：会话失效，下次发包重建
@@ -724,10 +803,10 @@ async fn run_proxy_tls_session(
                 Ok(FLAG_UDP) => {
                     if let Some(pkt) = parse_udp_packet(&payload) {
                         if let Some(origin) = last_origin {
-                            if let Ok(peer) = format!("{}:{}", pkt.host, pkt.port).parse::<SocketAddr>() {
+                            if let Some(peer) = parse_peer(&pkt.host, pkt.port) {
                                 if let Some(reply) = wrap_socks5_udp_reply(peer, pkt.dgram) {
                                     if relay.send_to(&reply, origin).await.is_ok() {
-                                        down.fetch_add(pkt.dgram.len() as u64, Ordering::Relaxed);
+                                        stats.add_down(pkt.dgram.len());
                                     }
                                 }
                             }
@@ -750,8 +829,7 @@ async fn run_proxy_tls_session(
 async fn run_proxy_mux_session(
     relay: Arc<UdpSocket>,
     mut rx: mpsc::Receiver<UdpIn>,
-    up: Arc<AtomicU64>,
-    down: Arc<AtomicU64>,
+    stats: SessionStats,
     mut stream: MuxUdpStream,
     host: String,
     port: u16,
@@ -764,9 +842,7 @@ async fn run_proxy_mux_session(
                 Some(m) => {
                     last_origin = Some(m.origin);
                     match stream.send_dgram(&host, port, &m.data).await {
-                        Ok(true) => {
-                            up.fetch_add(m.data.len() as u64, Ordering::Relaxed);
-                        }
+                        Ok(true) => stats.add_up(m.data.len()),
                         Ok(false) => {
                             log::debug!(
                                 "UDP datagram to {}:{} exceeds frame limit, dropped",
@@ -785,10 +861,10 @@ async fn run_proxy_mux_session(
             read = stream.recv_dgram() => match read {
                 Ok(Some((rhost, rport, dgram))) => {
                     if let Some(origin) = last_origin {
-                        if let Ok(peer) = format!("{}:{}", rhost, rport).parse::<SocketAddr>() {
+                        if let Some(peer) = parse_peer(&rhost, rport) {
                             if let Some(reply) = wrap_socks5_udp_reply(peer, &dgram) {
                                 if relay.send_to(&reply, origin).await.is_ok() {
-                                    down.fetch_add(dgram.len() as u64, Ordering::Relaxed);
+                                    stats.add_down(dgram.len());
                                 }
                             }
                         }
@@ -876,6 +952,20 @@ mod tests {
             parse_socks_udp_request(&[0, 0, 0, 9, 8, 8, 8, 8, 0, 53]),
             Err(SocksUdpParseError::BadAtyp)
         );
+    }
+
+    #[test]
+    fn peer_addr_handles_ipv6_and_rejects_domains() {
+        assert_eq!(
+            parse_peer("8.8.8.8", 53),
+            Some("8.8.8.8:53".parse().unwrap())
+        );
+        // IPv6 必须走 SocketAddr::new，字符串拼接会解析失败
+        assert_eq!(
+            parse_peer("2001:db8::1", 443),
+            Some("[2001:db8::1]:443".parse().unwrap())
+        );
+        assert!(parse_peer("example.com", 53).is_none());
     }
 
     #[test]

@@ -72,16 +72,24 @@ pub struct ProtocolHeader {
 
 // ==================== Protocol header (v2) ====================
 
-/// 编码 v2 首包：MAC 之后固定追加 1 字节 UDP 扩展位（[`EXT_UDP`]）
+/// 编码 v2 首包
 ///
-/// 旧版服务端将扩展位视为多余字节忽略；新版服务端据此在 ACK MAC 后
-/// 回 1 字节能力位，客户端据此完成 UDP 能力探测。
-pub fn create_protocol_header(host: &str, port: u16, password: &str) -> ProtocolHeader {
+/// `request_udp = true` 时在 MAC 之后追加 1 字节 UDP 扩展位（[`EXT_UDP`]），
+/// 新版服务端据此在 ACK MAC 之后回 1 字节能力位。
+///
+/// 普通 TCP 隧道必须传 `false`：旧版服务端不会回能力位，客户端若跟进读取
+/// 就会白等探测超时，甚至在"目标先说话"的协议上吞掉第一个真实数据字节。
+pub fn create_protocol_header(
+    host: &str,
+    port: u16,
+    password: &str,
+    request_udp: bool,
+) -> ProtocolHeader {
     let timestamp = unix_now();
     let mac = compute_mac(password, REQ_PREFIX, timestamp, port, host);
     let host_bytes = host.as_bytes();
 
-    let mut bytes = Vec::with_capacity(14 + host_bytes.len() + MAC_LEN + 1);
+    let mut bytes = Vec::with_capacity(14 + host_bytes.len() + MAC_LEN + usize::from(request_udp));
     bytes.extend_from_slice(&MAGIC);
     bytes.push(VERSION);
     bytes.extend_from_slice(&timestamp.to_be_bytes());
@@ -89,7 +97,9 @@ pub fn create_protocol_header(host: &str, port: u16, password: &str) -> Protocol
     bytes.push(host_bytes.len() as u8);
     bytes.extend_from_slice(host_bytes);
     bytes.extend_from_slice(&mac);
-    bytes.push(EXT_UDP);
+    if request_udp {
+        bytes.push(EXT_UDP);
+    }
 
     ProtocolHeader { bytes, timestamp }
 }
@@ -140,10 +150,12 @@ pub(crate) async fn tls_handshake(
 pub struct ProxyConnection {
     /// 已通过双向认证的 TLS 隧道
     pub stream: TlsStream<TcpStream>,
-    /// 服务端是否支持 UDP 转发（能力协商结果；旧版服务端为 false）
-    pub udp_supported: bool,
 }
 
+/// 建立普通（TCP）代理隧道。
+///
+/// 首包**不携带** UDP 扩展位，因此服务端不会在 ACK 后追加能力位，客户端
+/// 也不会做探测读取——避免多一次超时等待或吞掉目标的首个数据字节。
 pub async fn connect_proxy(
     proxy_server: &str,
     proxy_port: u16,
@@ -162,8 +174,8 @@ pub async fn connect_proxy(
     )
     .await?;
 
-    // Step 2: 发送 v2 首包（时间戳 + HMAC，密码不参与传输；末尾带 UDP 扩展位）
-    let header = create_protocol_header(host, port, password);
+    // Step 2: 发送 v2 首包（时间戳 + HMAC，密码不参与传输）
+    let header = create_protocol_header(host, port, password, false);
     tls_stream
         .write_all(&header.bytes)
         .await
@@ -183,21 +195,83 @@ pub async fn connect_proxy(
         ));
     }
 
-    let mut mac = HmacSha256::new_from_slice(password.as_bytes()).map_err(|e| e.to_string())?;
-    mac.update(ACK_PREFIX);
-    mac.update(&header.timestamp.to_be_bytes());
-    mac.update(&port.to_be_bytes());
-    mac.update(host.as_bytes());
-    mac.verify_slice(&ack[2..])
-        .map_err(|_| "Proxy server authentication failed (ACK MAC mismatch)".to_string())?;
-
-    // Step 4: UDP 能力探测（旧服务端不会发能力字节，短超时视为不支持）
-    let udp_supported = probe_udp_capability(&mut tls_stream).await;
+    let expected = compute_mac(password, ACK_PREFIX, header.timestamp, port, host);
+    if ack[2..] != expected {
+        return Err("Proxy server authentication failed (ACK MAC mismatch)".to_string());
+    }
 
     Ok(ProxyConnection {
         stream: tls_stream,
-        udp_supported,
     })
+}
+
+/// UDP 隧道建连错误分类
+#[derive(Debug)]
+pub enum UdpTunnelError {
+    /// 服务端不支持 UDP（旧版服务端 / `udp.enabled=false`）：调用方应降级直连
+    Unsupported(String),
+    /// 传输或认证失败：不应降级，避免把 UDP 流量漏成直连
+    Transport(String),
+}
+
+/// 建立非 mux UDP 隧道（认证首包 `port = 0`）并完成能力协商。
+///
+/// 与 TCP 隧道的区别：
+/// - 首包携带 UDP 扩展位，服务端据此回能力位；
+/// - 读 ACK 失败（服务端在 ACK 前关闭）判定为"不支持 UDP"——旧版服务端会把
+///   `port = 0` 当作普通目标连接失败后直接断开；
+/// - 能力位未置位同样判定为"不支持 UDP"（新版服务端 `udp.enabled=false`）。
+pub async fn connect_udp_tunnel(
+    proxy_server: &str,
+    proxy_port: u16,
+    host: &str,
+    password: &str,
+    danger_accept_invalid_certs: bool,
+    sni_name: &str,
+) -> Result<TlsStream<TcpStream>, UdpTunnelError> {
+    let mut tls_stream = tls_handshake(
+        proxy_server,
+        proxy_port,
+        sni_name,
+        danger_accept_invalid_certs,
+    )
+    .await
+    .map_err(UdpTunnelError::Transport)?;
+
+    let header = create_protocol_header(host, 0, password, true);
+    tls_stream
+        .write_all(&header.bytes)
+        .await
+        .map_err(|e| UdpTunnelError::Transport(e.to_string()))?;
+
+    let mut ack = [0u8; 2 + MAC_LEN];
+    if let Err(e) = tls_stream.read_exact(&mut ack).await {
+        // ACK 之前就断开 = 服务端不认识 port=0 的 UDP 隧道
+        return Err(UdpTunnelError::Unsupported(format!(
+            "server closed before tunnel ack: {}",
+            e
+        )));
+    }
+    if ack[0] != MAGIC[0] || ack[1] != MAGIC[1] {
+        return Err(UdpTunnelError::Transport(format!(
+            "unexpected tunnel ack: [{:#04x}, {:#04x}]",
+            ack[0], ack[1]
+        )));
+    }
+    let expected = compute_mac(password, ACK_PREFIX, header.timestamp, 0, host);
+    if ack[2..] != expected {
+        return Err(UdpTunnelError::Transport(
+            "proxy server authentication failed (ACK MAC mismatch)".to_string(),
+        ));
+    }
+
+    if probe_udp_capability(&mut tls_stream).await {
+        Ok(tls_stream)
+    } else {
+        Err(UdpTunnelError::Unsupported(
+            "server did not advertise UDP support".to_string(),
+        ))
+    }
 }
 
 // ==================== Rule matching ====================
@@ -246,9 +320,6 @@ pub struct ConnectionResult {
     pub id: u32,
     pub _geo_info: GeoInfo,
     pub _is_direct: bool,
-    /// 服务端是否支持 UDP 转发（能力协商结果，供后续 UDP 路由使用）
-    #[allow(dead_code)]
-    pub udp_supported: bool,
 }
 
 // ==================== Resolve + connect to target (shared by SOCKS5 and HTTP handlers) ====================
@@ -383,8 +454,6 @@ pub async fn resolve_and_connect(
             id,
             _geo_info: geo_info,
             _is_direct: true,
-            // 直连不经隧道，不涉及服务端 UDP 能力
-            udp_supported: false,
         })
     } else if mux_enabled {
         // 复用模式：共享一条 TLS 隧道，只做一次 TCP + TLS 握手
@@ -415,9 +484,6 @@ pub async fn resolve_and_connect(
                     id,
                     _geo_info: geo_info,
                     _is_direct: false,
-                    // TODO(udp): mux 连接已在 MuxClient 记录能力协商结果，
-                    // 此处按流查询的接口由后续 UDP 任务接入
-                    udp_supported: false,
                 })
             }
             Err(e) => {
@@ -439,12 +505,11 @@ pub async fn resolve_and_connect(
         };
 
         log::info!(
-            "[PROXY] Connected: {}:{}, Time: {}ms, Country: {}, UDP: {}",
+            "[PROXY] Connected: {}:{}, Time: {}ms, Country: {}",
             host,
             port,
             time.elapsed().as_millis(),
-            geo_info.country,
-            if conn.udp_supported { "yes" } else { "no" }
+            geo_info.country
         );
 
         // Store latency
@@ -460,7 +525,6 @@ pub async fn resolve_and_connect(
             id,
             _geo_info: geo_info,
             _is_direct: false,
-            udp_supported: conn.udp_supported,
         })
     }
 }

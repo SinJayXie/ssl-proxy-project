@@ -3,7 +3,7 @@
 //! 每个用例都会完整装配 `StaticSourcesService` + `ForwardService` + `ProxyService` + `SocketService`，
 //! 用临时自签证书在随机端口上启动，再用 rustls 客户端发起真实 TLS 请求。
 
-use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -31,7 +31,7 @@ use ssl_proxy_svr::services::proxy_service::ProxyService;
 use ssl_proxy_svr::services::socket_service::{load_tls_config, SocketService};
 use ssl_proxy_svr::services::static_sources_service::StaticSourcesService;
 use ssl_proxy_svr::services::udp_relay_service::{
-    encode_udp_packet, is_forbidden_ip, parse_udp_packet, UdpSettings,
+    encode_udp_packet, parse_udp_packet, UdpSettings,
 };
 use ssl_proxy_svr::utils::protocol::{
     ack_mac, encode_packet, encode_packet_ext, EXT_UDP, MAC_LEN, TUNNEL_ACK,
@@ -68,12 +68,28 @@ impl Harness {
     }
 
     /// `udp_enabled = true` 时按默认参数启用 UDP relay（timeout=60s, rate=100）
+    /// — SSRF 防护保持开启（默认），用于验证内网/回环目标被拦截。
     async fn start_with_udp(udp_enabled: bool) -> Self {
         Self::start_with_options(
             DEFAULT_MAX_REQUESTS,
             udp_enabled.then(|| UdpSettings {
                 timeout: Duration::from_secs(60),
                 rate_limit: 100,
+                allow_private: false,
+            }),
+        )
+        .await
+    }
+
+    /// 同上，但放行回环/内网目标：UDP 回显用例统一绑 127.0.0.1，避免依赖本机
+    /// 是否存在公网地址（否则在办公室/家庭网络下用例必然失败）。
+    async fn start_with_udp_allow_private() -> Self {
+        Self::start_with_options(
+            DEFAULT_MAX_REQUESTS,
+            Some(UdpSettings {
+                timeout: Duration::from_secs(60),
+                rate_limit: 100,
+                allow_private: true,
             }),
         )
         .await
@@ -313,64 +329,30 @@ async fn spawn_echo_upstream() -> u16 {
     port
 }
 
-/// 收集本机候选 IP：主机名解析（覆盖各网卡地址）+ localhost。
-fn local_candidate_ips() -> Vec<IpAddr> {
-    let mut ips = Vec::new();
-    let mut push = |host: String| {
-        if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), 0u16)) {
-            for addr in addrs {
-                if !ips.contains(&addr.ip()) {
-                    ips.push(addr.ip());
-                }
-            }
-        }
-    };
-    if let Ok(name) = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")) {
-        push(name);
-    }
-    push("localhost".to_string());
-    ips
-}
-
 /// 启动一个 UDP 回显目标，返回 `(地址, 端口)`。
 ///
-/// 回环 / 内网地址会被 relay 的 SSRF 规则拦截，因此只在未被禁止的本机地址上
-/// 绑定（优先公网 / 全球单播地址），找不到则 panic。
-async fn spawn_udp_echo() -> (IpAddr, u16) {
-    let mut candidates = local_candidate_ips();
-    // 默认路由出口地址（UDP connect 只选路，不实际发包）
-    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-        if sock.connect("8.8.8.8:80").is_ok() {
-            if let Ok(addr) = sock.local_addr() {
-                candidates.push(addr.ip());
-            }
-        }
-    }
-    let allowed: Vec<IpAddr> = candidates
-        .into_iter()
-        .filter(|ip| !is_forbidden_ip(*ip))
-        .collect();
-    for ip in allowed {
-        if let Ok(socket) = tokio::net::UdpSocket::bind((ip, 0)).await {
-            let port = socket.local_addr().expect("udp echo addr").port();
-            let socket = Arc::new(socket);
-            tokio::spawn(async move {
-                let mut buf = [0u8; 65535];
-                loop {
-                    match socket.recv_from(&mut buf).await {
-                        Ok((n, from)) => {
-                            if socket.send_to(&buf[..n], from).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+/// 统一绑回环地址：用例侧通过 `UdpSettings::allow_private = true` 放行，
+/// 这样测试不依赖本机是否拥有公网地址（否则在常见内网环境下必然失败）。
+async fn spawn_udp_echo() -> (Ipv4Addr, u16) {
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind udp echo");
+    let port = socket.local_addr().expect("udp echo addr").port();
+    let socket = Arc::new(socket);
+    tokio::spawn(async move {
+        let mut buf = [0u8; 65535];
+        loop {
+            match socket.recv_from(&mut buf).await {
+                Ok((n, from)) => {
+                    if socket.send_to(&buf[..n], from).await.is_err() {
+                        break;
                     }
                 }
-            });
-            return (ip, port);
+                Err(_) => break,
+            }
         }
-    }
-    panic!("本机不存在未被 SSRF 规则禁止的地址，无法搭建 UDP echo 目标");
+    });
+    (Ipv4Addr::LOCALHOST, port)
 }
 
 /// 编码并发送一个非 mux UDP 隧道的认证首包（`port = 0` 标记）+ 首个 FLAG_UDP 帧。
@@ -728,7 +710,7 @@ async fn mux_connection_carries_multiple_streams() {
 /// UDP over TLS 往返：认证（port=0）+ FLAG_UDP 帧 → 本地 UDP 回显目标 → 回包封帧。
 #[tokio::test]
 async fn udp_tunnel_relays_datagrams_both_ways() {
-    let h = Harness::start_with_udp(true).await;
+    let h = Harness::start_with_udp_allow_private().await;
     let (echo_ip, echo_port) = spawn_udp_echo().await;
     let mut stream = h.connect().await;
 
@@ -768,6 +750,7 @@ async fn udp_session_idle_timeout_reclaims_and_still_relays() {
         Some(UdpSettings {
             timeout: Duration::from_millis(300),
             rate_limit: 100,
+            allow_private: true,
         }),
     )
     .await;
@@ -828,7 +811,8 @@ async fn udp_ssrf_targets_are_dropped() {
     h.stop().await;
 }
 
-/// `udp.enabled=false`（默认）时：port=0 的 UDP 隧道认证被安全拒绝，连接被关闭。
+/// `udp.enabled=false`（默认）时：port=0 的 UDP 隧道会收到能力位 0x00 的 ACK，
+/// 随后连接被关闭——客户端据此自动降级为直连。
 #[tokio::test]
 async fn udp_disabled_rejects_udp_tunnel() {
     let h = Harness::start().await; // udp.enabled 默认 false
@@ -838,13 +822,16 @@ async fn udp_disabled_rejects_udp_tunnel() {
     let packet = encode_packet_ext("127.0.0.1", 0, PASSWORD, ts, EXT_UDP);
     stream.write_all(&packet).await.expect("write auth");
 
-    // 客户端随后发出 FLAG_UDP 帧（服务端不会处理，且连接即将被关闭）
-    let payload = encode_udp_packet(1, "127.0.0.1", 53312, b"nope").expect("encode");
-    let mut frame = Vec::new();
-    append_frame(&mut frame, &payload, 0, FLAG_UDP);
-    stream.write_all(&frame).await.expect("write udp frame");
+    // 先回 ACK + 能力位（0x00 = 不支持 UDP）
+    expect_tunnel_ack(&mut stream, PASSWORD, ts, "127.0.0.1", 0).await;
+    let mut cap = [0u8; 1];
+    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut cap))
+        .await
+        .expect("cap timeout")
+        .expect("read cap");
+    assert_eq!(cap[0], 0x00, "udp 未启用时能力位应为 0x00");
 
-    // 服务端不回 ACK，直接关闭连接：读端 EOF / TLS 错误 / 超时
+    // 随后服务端关闭连接：读端 EOF / TLS 错误（不再有任何数据）
     let mut buf = [0u8; 8];
     match tokio::time::timeout(Duration::from_millis(500), stream.read(&mut buf)).await {
         Err(_) => {}           // 超时：无数据
@@ -900,7 +887,7 @@ async fn udp_enabled_ack_carries_capability_bit() {
 /// mux UDP 流（FLAG_UDP = 6）：payload 与非 mux 一致，NAT 按 payload stream_id 维护。
 #[tokio::test]
 async fn mux_udp_stream_relays_datagrams() {
-    let h = Harness::start_with_udp(true).await;
+    let h = Harness::start_with_udp_allow_private().await;
     let (echo_ip, echo_port) = spawn_udp_echo().await;
     let mut stream = h.connect().await;
 
@@ -949,7 +936,7 @@ async fn mux_udp_stream_relays_datagrams() {
 /// 不回任何帧（尤其不得落入兜底分支回 RST），连接保持可用。
 #[tokio::test]
 async fn mux_udp_close_frame_reclaims_session_without_breaking_connection() {
-    let h = Harness::start_with_udp(true).await;
+    let h = Harness::start_with_udp_allow_private().await;
     let (echo_ip, echo_port) = spawn_udp_echo().await;
     let mut stream = h.connect().await;
 
@@ -1152,7 +1139,7 @@ fn cli_parse_udp_packet(payload: &[u8]) -> Option<(u32, String, u16, Vec<u8>)> {
 /// 4. 断言回包为同 stream_id 的 FLAG_UDP 帧且内容正确。
 #[tokio::test]
 async fn udp_non_mux_client_format_roundtrip() {
-    let h = Harness::start_with_udp(true).await;
+    let h = Harness::start_with_udp_allow_private().await;
     let (echo_ip, echo_port) = spawn_udp_echo().await;
     let mut stream = h.connect().await;
 

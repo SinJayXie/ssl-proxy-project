@@ -148,11 +148,16 @@ impl ProxyService {
     ) -> Result<()> {
         // port = 0 标记非 mux UDP 隧道：每报文目标取自帧 payload，host 仅参与 MAC
         if auth.port == 0 {
-            let Some(settings) = self.udp.clone() else {
-                tracing::warn!("[Proxy] udp disabled, reject udp tunnel (host={})", auth.host);
-                return Ok(()); // 安全拒绝：不回 ACK，直接关闭连接
-            };
+            // 无论 udp 是否启用都要回 ACK：客户端据此读取能力位
+            // （udp.enabled=false 时能力位为 0x00，客户端随即降级为直连）
             self.write_ack(&mut tls_stream, auth, ext).await?;
+            let Some(settings) = self.udp.clone() else {
+                tracing::warn!(
+                    "[Proxy] udp disabled, reject udp tunnel after capability ack (host={})",
+                    auth.host
+                );
+                return Ok(());
+            };
             tracing::info!("[Proxy] udp tunnel up (host={})", auth.host);
             return udp_relay_service::serve_tunnel(tls_stream, settings).await;
         }

@@ -176,8 +176,8 @@ impl MuxClient {
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
 
-        // v2 mux 首包（hostLen = 0，末尾带 UDP 扩展位）
-        let header = create_protocol_header("", 0, &cfg.password);
+        // v2 mux 首包（hostLen = 0，末尾带 UDP 扩展位：mux 池需要感知 UDP 能力）
+        let header = create_protocol_header("", 0, &cfg.password, true);
         tls.write_all(&header.bytes).await?;
 
         let mut ack = [0u8; 2 + MAC_LEN];
