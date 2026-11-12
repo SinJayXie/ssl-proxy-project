@@ -6,6 +6,7 @@
 
 - 客户端：`crates/gui`（包名 `ssl-proxy-gui`，安装后为 `ssl-proxy-client.exe`），当前版本 **2.3.2**
 - 服务端：`crates/svr`（`ssl-proxy-svr`），当前版本 **1.2.0**
+- 许可证：[MIT](LICENSE)
 
 ## 功能
 
@@ -25,6 +26,42 @@
 - 自签证书零配置启动，密码认证，限流与黑名单，日志自动轮转
 - 支持多路复用会话
 
+## 快速开始
+
+### 1. 安装客户端
+
+运行 `SSLProxyClient_2.3.2_x64-setup.exe`（来自 `dist/client`，或 `version.json` 中的下载地址）。安装到 `%LOCALAPPDATA%\SSLProxyClient`，`GeoDB.dat` 会放在 exe 同目录，旧版本原地覆盖升级。首次启动需确认免责声明。
+
+### 2. 让应用走本地代理
+
+客户端默认监听 `127.0.0.1:1080`，同一端口同时支持 SOCKS5、HTTP 与 HTTPS（CONNECT）。在浏览器、系统设置或单个应用中把它配置为代理即可。
+
+### 3. 配置上游
+
+打开「系统设置」，填写代理服务器地址、端口和认证密钥（需与服务端一致）。同一页面还可以配置 SNI、证书校验、绑定地址、DNS、直连地区与 mux 开关。代理服务器留空则全部直连。点击**保存**后应用会自动重启。
+
+### 4. 启动服务端
+
+```bash
+ssl-proxy-svr --config ./config.yaml
+```
+
+默认监听 `0.0.0.0:1888`；未配置证书时启动阶段会自动生成自签证书。
+
+## 工作原理
+
+```text
+应用 ──▶ 127.0.0.1:1080（SOCKS5 / HTTP / HTTPS）
+          │ 首字节识别协议
+          ├─ 规则匹配（HOST / GEO）──▶ 直连
+          └─ TLS 隧道 ──▶ ssl-proxy-svr ──▶ 目标
+```
+
+- 客户端：首字节区分 SOCKS5 与 HTTP；先匹配 HOST / GEO 规则（再回退到 `directs`）决定直连或代理。代理流量在 TLS 内封装为私有协议帧，带 HMAC-SHA256 认证、长度填充与可选多路复用。
+- 服务端：单 TLS 端口；通过认证的私有协议流量被转发（可选择复用），其余请求返回伪装站点。
+
+协议帧格式与实现细节见 [crates/svr/docs/ARCHITECTURE.md](crates/svr/docs/ARCHITECTURE.md)。
+
 ## 目录结构
 
 ```text
@@ -42,7 +79,8 @@
 ## 环境要求
 
 - Rust 1.85+（edition 2024）
-- 客户端：Windows 10 / 11；打安装包需要 NSIS（`makensis`），UPX 可选
+- 客户端：Windows 10 / 11（GPUI 客户端仅支持 Windows）
+- 打包：NSIS（`makensis`）；UPX 可选
 - 服务端：Windows / Linux / macOS
 
 ## 构建
@@ -57,6 +95,13 @@ cargo run -p ssl-proxy-svr -- --config crates/svr/config.example.yaml
 ```
 
 客户端开发期若可执行文件旁没有 `GeoDB.dat`，会自动回退到 `crates/gui/assets`。
+
+## 测试
+
+```bash
+cargo test -p ssl-proxy-gui
+cargo test -p ssl-proxy-svr
+```
 
 ## 打包
 
@@ -79,7 +124,7 @@ Linux / macOS：
 产物：
 
 - `dist/client/SSLProxyClient_<gui版本>_x64-setup.exe`
-- `dist/server/ssl-proxy-svr-<平台>-<svr版本>.zip`
+- `dist/server/ssl-proxy-svr-<平台>-<svr版本>.zip`（可执行文件、`config.yaml`、`certs/`、`logs/`）
 
 安装包会覆盖升级旧版本：复用注册表中的安装目录，停止正在运行的 `ssl-proxy-client.exe` 后原地替换。
 
@@ -104,11 +149,38 @@ Linux / macOS：
 
 ## 服务端配置
 
-服务端通过 `--config <FILE>` 加载 YAML（字段 kebab-case），优先级：**命令行参数 > YAML > 内置默认值**。示例见 `crates/svr/config.example.yaml`。
+服务端通过 `--config <FILE>` 加载 YAML（字段 kebab-case），优先级：**命令行参数 > YAML > 内置默认值**。
 
-- [服务端说明](crates/svr/README.md)
+```yaml
+server:
+  listen: "0.0.0.0"
+  port: 1888
+  password: "your-strong-password"   # 必须与客户端的认证密钥一致
+  mux: true                          # false 时拒绝多路复用会话
+
+tls:
+  cert: "./certs/server.crt"         # 可选；缺省时自动生成自签证书
+  key: "./certs/server.key"
+
+static-sources:
+  html: "./html"                     # 伪装站点，缺省时统一返回 404
+
+rate-limit:
+  max-requests: 300
+  rate-time-secs: 60
+  black-time-secs: 600
+```
+
 - [架构设计](crates/svr/docs/ARCHITECTURE.md)
 - [配置项说明](crates/svr/docs/CONFIGURATION.md)
+
+## 常见问题
+
+- **端口被占用（10048）**：在设置中更换本地端口，或结束占用该端口的进程。
+- **找不到 `GeoDB.dat`**：保持它与 exe 同目录；安装包会自带，开发期会自动回退到 `crates/gui/assets`。
+- **mux 连接失败**：服务端配置为 `mux: false`，或中间设备会断开长连接时，在设置中关闭 mux。
+- **检查更新失败**：客户端需要能访问 `https://hk.dishuyl.cn/ssl-proxy/version.json`。
+- **设置未生效**：设置需要应用自动重启后生效；若重启失败，手动再启动一次客户端即可。
 
 ## 版本与更新
 
@@ -118,10 +190,12 @@ Linux / macOS：
 
 ## 更多文档
 
-- 客户端重构与架构笔记：[REFACTOR.md](crates/gui/REFACTOR.md)
-- 客户端规格与验收清单：`crates/gui/specs/`
-- mux 协议实现规格：`.trae/specs/implement-mux-protocol/`
+- 客户端规格与验收清单：`crates/gui/specs/gpui-refactor/`
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request。改动版本时请同步 `Cargo.toml`、`version.json` 与应用内更新日志，并在提交前运行 `cargo test`。
 
 ## License
 
-MIT
+[MIT](LICENSE)
