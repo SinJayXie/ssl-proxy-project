@@ -1,0 +1,7 @@
+# 本机全局 cargo 把 crates-io 指向阿里云镜像，但该镜像索引落后（缺少 gpui-kit 0.9.x）。
+# 这里改用 rsproxy 的 sparse 索引（索引较新），仅对本工程生效。
+[source.crates-io]
+replace-with = "rsproxy"
+
+[source.rsproxy]
+registry = "sparse+https://rsproxy.cn/index/"

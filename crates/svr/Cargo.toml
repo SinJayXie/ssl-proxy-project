@@ -1,0 +1,46 @@
+[package]
+name = "ssl-proxy-svr"
+version = "1.2.0"
+edition = "2021"
+authors = ["ssl-proxy-svr"]
+description = "Lightweight TLS proxy server with HTTP masquerade, refactored from the Node.js implementation"
+license = "MIT"
+repository = "local"
+
+[dependencies]
+# Async runtime + TLS
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pemfile = "2"
+rustls-pki-types = "1"
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive", "wrap_help"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Utilities
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+bytes = "1"
+mime_guess = "2"
+dashmap = "6"
+parking_lot = "0.12"
+httparse = "1"
+futures = "0.3"
+rand = "0.8"
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+rcgen = "0.13"
+hmac = "0.12"
+sha2 = "0.10"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"

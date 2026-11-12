@@ -1,0 +1,40 @@
+# ssl-proxy-svr 配置文件示例
+# 通过 --config <path> 加载；命令行参数优先级高于配置文件
+#
+# 不传证书时自动生成自签证书，可直接启动：
+#   ssl-proxy-svr --html ./html
+
+# ---- server ----
+server:
+  listen: "0.0.0.0"
+  port: 1888
+  # 代理协议密码；缺省随机生成
+  # password: "your-strong-password"
+  # 是否接受多路复用（mux）连接，默认 true；false 等同于 --no-mux
+  # mux: true
+
+# ---- tls ----
+# 证书 / 私钥均缺省时启动期自动生成自签证书 (SAN: localhost, 127.0.0.1)
+# 生产环境取消注释并指向正式证书 (PEM 格式)
+tls:
+  # cert: "./certs/server.crt"
+  # key: "./certs/server.key"
+
+# ---- static-sources ----
+# 静态资源（伪装站点），缺省则所有 HTTP 请求统一 404
+static-sources:
+  html: "./html"
+  index: "index.html"
+
+# ---- log ----
+log:
+  dir: "./logs"
+  level: "info"
+  # 单个日志文件最大字节数（默认 5MB）
+  max-size: 5242880
+
+# ---- rate-limit ----
+rate-limit:
+  max-requests: 300
+  rate-time-secs: 60
+  black-time-secs: 600

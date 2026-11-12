@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = ["crates/gui", "crates/svr"]
+default-members = ["crates/gui", "crates/svr"]
+
+# ---- 统一 release 配置 ----
+# workspace 成员的 [profile.*] 会被 Cargo 忽略，所有 profile 必须放在这里。
+[profile.release]
+opt-level = 3
+# fat LTO：跨 crate 内联 + 更强的死代码消除
+lto = "fat"
+codegen-units = 1
+# 不展开栈：去掉 landing pad / 展开表，GUI 不需要 catch_unwind 兜底
+panic = "abort"
+strip = true
+
+# ---- 冷路径依赖用 -Os 编译以压缩体积 ----
+[profile.release.package.usvg]
+opt-level = "s"
+[profile.release.package.resvg]
+opt-level = "s"
+[profile.release.package.tiny-skia]
+opt-level = "s"
+[profile.release.package.image]
+opt-level = "s"
+[profile.release.package.zune-jpeg]
+opt-level = "s"
+[profile.release.package.zune-core]
+opt-level = "s"
+[profile.release.package.exr]
+opt-level = "s"
+[profile.release.package.image-webp]
+opt-level = "s"
+[profile.release.package.markdown]
+opt-level = "s"
+[profile.release.package.regex]
+opt-level = "s"
+[profile.release.package.regex-automata]
+opt-level = "s"
+[profile.release.package.regex-syntax]
+opt-level = "s"
+[profile.release.package.serde_yaml]
+opt-level = "s"
+[profile.release.package.unsafe-libyaml]
+opt-level = "s"
+[profile.release.package.trust-dns-proto]
+opt-level = "s"
+[profile.release.package.trust-dns-resolver]
+opt-level = "s"
+[profile.release.package.flate2]
+opt-level = "s"
+[profile.release.package.miniz_oxide]
+opt-level = "s"
+
+# ---- Debug 下让框架依赖带优化，避免 UI 卡顿（gpui-kit 官方建议）----
+[profile.dev.package]
+gpui-pre = { opt-level = 3 }
+gpui-component = { opt-level = 3 }
+gpui-kit = { opt-level = 3 }
+gpui-kit-assets = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }

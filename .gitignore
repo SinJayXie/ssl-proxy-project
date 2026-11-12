@@ -1,0 +1,6 @@
+/target
+/dist
+/logs
+/.screenshots
+crates/*/target
+crates/svr/releases

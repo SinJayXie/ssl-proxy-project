@@ -1,0 +1,209 @@
+use crate::ui::{i18n, theme};
+use gpui_kit::base::v_flex;
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::*;
+
+struct Entry {
+    version: &'static str,
+    date: &'static str,
+    changes: &'static [&'static str],
+}
+
+const CHANGELOG: &[Entry] = &[
+    Entry {
+        version: "2.3.2",
+        date: "2026-11-12",
+        changes: &[
+            "Fix: the multiplexing switch was not saved on restart and came back enabled",
+            "Fix: \"Save and restart\" showed an open-path error and the app did not relaunch",
+            "Restart: the new process is spawned directly and waits for the previous instance to exit, so paths with spaces work",
+            "Single instance: ignore a stale error code so the running window is detected reliably",
+        ],
+    },
+    Entry {
+        version: "2.3.0",
+        date: "2026-11-12",
+        changes: &[
+            "Protocol v2: HMAC-SHA256 authentication with timestamp and mutual ACK verification",
+            "TLS: ALPN advertises http/1.1 so the port looks like a regular HTTPS site",
+            "Anti-fingerprint: frame padding masks TLS-in-TLS record lengths and the tiny first packet",
+            "Multiplexing: many target connections share one TLS tunnel (trojan-go style), tunable in Settings",
+            "Multiplexing can be switched off in Settings to fall back to one TLS connection per target",
+        ],
+    },
+    Entry {
+        version: "2.2.1",
+        date: "2026-11-12",
+        changes: &[
+            "Installer: in-place upgrade over the previous version, reusing its install directory and uninstall entry",
+            "Installer / EXE: embed app icon and version metadata, optional UPX compression",
+            "Tray: fix Show Window and Exit menu items, menu labels follow the UI language",
+            "Fix dark / light theme toggle in the title bar",
+            "Update check: restore the update dialog and add an \"already up to date\" notice",
+            "Build: reduce the executable size by ~42% (fat LTO, abort on panic, size-tuned dependencies)",
+        ],
+    },
+    Entry {
+        version: "2.1.6",
+        date: "2026-08-04",
+        changes: &["Add single-instance mutex: activate existing window when another instance is launched"],
+    },
+    Entry {
+        version: "2.1.5",
+        date: "2026-07-01",
+        changes: &["GEO: integrated geo-loader-rs SDK, load country codes from country_codes.yaml"],
+    },
+    Entry {
+        version: "2.1.4",
+        date: "2026-06-17",
+        changes: &["Rules: HOST rules now take priority over GEO rules"],
+    },
+    Entry {
+        version: "2.1.3",
+        date: "2026-06-12",
+        changes: &[
+            "Connections: add group close & optimize styles",
+            "TestRule: add rule directly from test result",
+            "Rules: optimize styles",
+        ],
+    },
+    Entry {
+        version: "2.1.2",
+        date: "2026-06-12",
+        changes: &[
+            "Add quit app button on Dashboard page",
+            "Add check for updates button on Dashboard",
+            "Update GeoDB.dat geo IP database structure and improve query speed",
+        ],
+    },
+    Entry {
+        version: "2.1.1",
+        date: "2026-06-11",
+        changes: &["Update GeoDB.dat geo IP database"],
+    },
+    Entry {
+        version: "2.1.0",
+        date: "2026-06-11",
+        changes: &[
+            "TestRule: show the DNS server used for resolution (config.dns_servers or fallback)",
+            "Fix trust-dns-resolver 0.23 API breakage: parse IP/SocketAddr, use add_name_server()",
+            "i18n: add TEST_RESULT_DNS key in 5 languages",
+        ],
+    },
+    Entry {
+        version: "2.0.3",
+        date: "2026-06-11",
+        changes: &[
+            "Config files switched from JSON to YAML format",
+            "Build: copy resources/ files to output directory automatically",
+            "Add imperative showAlert / showConfirm modal composable",
+            "Add delete rule confirmation dialog",
+            "Fix save_rule IPC parameter key mismatch",
+            "Fix error pool check after first consent",
+            "i18n: add DELETE_RULE_TITLE, DELETE_RULE_PROMPT, CONFIRM keys",
+            "Modal: add backdrop click to close support",
+        ],
+    },
+    Entry {
+        version: "2.0.2",
+        date: "2026-06-10",
+        changes: &[
+            "Add bind IPs support per-IP listener binding",
+            "Add form validation for settings (ports, IPs, proxy)",
+            "Add revert button for unsaved settings changes",
+            "Add show/hide password toggle",
+            "Add first-run consent modal with disclaimer",
+            "Add changelog panel",
+            "Dark mode via View Transition API",
+            "Refactor Rust backend modules",
+            "Simplify About page",
+        ],
+    },
+    Entry {
+        version: "2.0.1",
+        date: "2026-05-20",
+        changes: &[
+            "Initial release",
+            "SOCKS5 proxy with optional upstream proxy",
+            "Geo-based direct/proxy routing rule engine",
+            "Connection monitoring and management",
+            "Real-time log viewer",
+            "Multi-language support (EN / 中文 / 繁體中文 / 日本語 / 한국어)",
+            "System tray integration",
+            "Dark / light theme support",
+        ],
+    },
+];
+
+pub struct ChangelogPage;
+
+impl ChangelogPage {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Render for ChangelogPage {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut entries = v_flex().gap_6();
+
+        for entry in CHANGELOG {
+            let mut changes = v_flex().gap_1();
+            for change in entry.changes {
+                changes = changes.child(
+                    div()
+                        .text_sm()
+                        .text_color(theme::text_muted(cx))
+                        .child(format!("• {change}")),
+                );
+            }
+
+            entries = entries.child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_lg()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(cx.theme().primary)
+                                    .child(format!("v{}", entry.version)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme::text_muted(cx))
+                                    .child(entry.date),
+                            ),
+                    )
+                    .child(changes),
+            );
+        }
+
+        v_flex()
+            .size_full()
+            .gap_4()
+            .child(
+                div()
+                    .pr_6()
+                    .text_size(px(20.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(i18n::t("CHANGELOG")),
+            )
+            .child(
+                div()
+                    .id("changelog-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .pr_6()
+                    .overflow_y_scrollbar()
+                    .child(entries),
+            )
+    }
+}
+
+use gpui_kit::base::h_flex;
