@@ -257,6 +257,7 @@ Artifacts:
 
 - `dist/client/SSLProxyClient_<gui-version>_x64-setup.exe` (also rewrites `version.json` with the new SHA-256 and Ed25519 signature)
 - `dist/client/SSLProxyClient.app` (macOS bundle, ad-hoc signed)
+- `dist/client/SSLProxyClient_<gui-version>_<arch>.dmg` (macOS disk image; also rewrites `version-mac.json` with the new SHA-256 and Ed25519 signature)
 - `dist/server/ssl-proxy-svr-<platform>-<svr-version>.zip` (binary, `config.yaml`, `certs/`, `logs/`)
 - `dist/server/ssl-proxy-svr-linux-musl-<svr-version>.tar.gz` (static Linux build)
 

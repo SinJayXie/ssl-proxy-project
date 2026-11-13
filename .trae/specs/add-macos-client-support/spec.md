@@ -88,6 +88,8 @@ macOS 上配置、日志 SHALL 写入 `~/Library/Application Support/ssl-proxy-c
 
 ### Requirement: macOS 不提供自动更新
 
+> 后续变更：macOS 更新已改为独立清单 `version-mac.json` + DMG（见文末「后续变更」），本条仅记录本次交付时的状态。
+
 macOS 上 SHALL 跳过定时与启动时的更新检查，并 SHALL 隐藏仪表盘的「检查更新」入口与相关更新弹窗。
 
 #### Scenario: macOS 启动
@@ -117,3 +119,9 @@ macOS 上 SHALL 跳过定时与启动时的更新检查，并 SHALL 隐藏仪表
 ## REMOVED Requirements
 
 无。
+
+## 后续变更
+
+- macOS 应用内更新已启用：客户端在 macOS 上改为拉取 `version-mac.json`，下载 `.dmg` 后交给系统挂载（`open`），签名与 SHA-256 校验流程与 Windows 一致
+- `scripts/bundle-macos.sh` 额外产出 `dist/client/SSLProxyClient_<version>_<arch>.dmg`，并用 `update-signer` 重写 `version-mac.json`
+- 上述变更取代「macOS 不提供自动更新」这一条

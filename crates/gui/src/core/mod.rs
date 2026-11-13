@@ -377,9 +377,16 @@ async fn run_test_rule(state: Arc<AppState>, host: String) -> Result<TestRuleRes
     })
 }
 
+/// 更新清单按平台区分：Windows 是 NSIS 安装包，macOS 是 DMG。
+#[cfg(windows)]
+const UPDATE_MANIFEST_URL: &str = "https://hk.dishuyl.cn/ssl-proxy/version.json";
+#[cfg(target_os = "macos")]
+const UPDATE_MANIFEST_URL: &str = "https://hk.dishuyl.cn/ssl-proxy/version-mac.json";
+#[cfg(not(any(windows, target_os = "macos")))]
+const UPDATE_MANIFEST_URL: &str = "https://hk.dishuyl.cn/ssl-proxy/version.json";
+
 async fn run_check_update() -> Result<CheckUpdateResult, String> {
     const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-    const UPDATE_URL: &str = "https://hk.dishuyl.cn/ssl-proxy/version.json";
 
     log::info!("Checking for updates...");
 
@@ -392,7 +399,7 @@ async fn run_check_update() -> Result<CheckUpdateResult, String> {
         })?;
 
     let manifest: UpdateManifest = client
-        .get(UPDATE_URL)
+        .get(UPDATE_MANIFEST_URL)
         .send()
         .await
         .map_err(|err| {
@@ -564,7 +571,15 @@ async fn run_download_update(
                 Err(err) => log::error!("Failed to launch installer: {}", err),
             }
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        {
+            // DMG 不能直接执行，交给系统挂载，Finder 会弹出拖入 Applications 的窗口。
+            match std::process::Command::new("open").arg(&installer_path).spawn() {
+                Ok(_) => log::info!("DMG opened via open"),
+                Err(err) => log::error!("Failed to open dmg: {}", err),
+            }
+        }
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
         {
             match std::process::Command::new(&installer_path).spawn() {
                 Ok(_) => log::info!("Installer launched"),

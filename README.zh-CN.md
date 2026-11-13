@@ -258,6 +258,7 @@ wsl -d Ubuntu-22.04 -e bash /mnt/e/myProjects/ssl-proxy-project/scripts/build-sv
 
 - `dist/client/SSLProxyClient_<gui版本>_x64-setup.exe`（同时用新的 SHA-256 与 Ed25519 签名重写 `version.json`）
 - `dist/client/SSLProxyClient.app`（macOS 应用包，ad-hoc 签名）
+- `dist/client/SSLProxyClient_<gui版本>_<arch>.dmg`（macOS 磁盘映像，同时用新的 SHA-256 与 Ed25519 签名重写 `version-mac.json`）
 - `dist/server/ssl-proxy-svr-<平台>-<svr版本>.zip`（可执行文件、`config.yaml`、`certs/`、`logs/`）
 - `dist/server/ssl-proxy-svr-linux-musl-<svr版本>.tar.gz`（静态 Linux 构建）
 

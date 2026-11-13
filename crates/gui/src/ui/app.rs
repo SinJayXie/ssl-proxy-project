@@ -24,8 +24,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Set by the Dashboard "Check Update" button, consumed by the shell.
 static UPDATE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// 更新清单只发布 Windows 安装包，macOS 上不提供应用内自更新。
-const UPDATES_SUPPORTED: bool = cfg!(windows);
+/// 更新清单按平台区分（Windows 安装包 / macOS DMG），两者都支持应用内更新。
+const UPDATES_SUPPORTED: bool = cfg!(any(windows, target_os = "macos"));
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {

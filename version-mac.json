@@ -1,0 +1,13 @@
+{
+  "version": "2.5.2",
+  "changelog": [
+    "Appearance: acrylic (blurred) window background on Windows 10/11 and macOS, switchable in Settings",
+    "Appearance: background opacity slider (30-100%); sidebar, title bar and cards fade along with it so the blur shows through",
+    "Appearance: dialogs and modal overlays stay fully opaque while acrylic is enabled",
+    "Settings: the footer action bar no longer paints its own background",
+    "macOS: native traffic-light title bar, single-instance guard and native config directory"
+  ],
+  "downloadUrl": "https://hk.dishuyl.cn/ssl-proxy/mac/SSLProxyClient_2.5.2_arm64.dmg",
+  "sha256": "",
+  "signature": ""
+}

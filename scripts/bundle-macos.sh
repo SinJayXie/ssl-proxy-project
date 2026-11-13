@@ -93,3 +93,59 @@ else
 fi
 
 echo "    客户端应用包: $APP"
+
+# ---- DMG 与 macOS 更新清单（version-mac.json）----
+ARCH="$(uname -m)"
+DMG="$ROOT/dist/client/SSLProxyClient_${VERSION}_${ARCH}.dmg"
+MANIFEST="$ROOT/version-mac.json"
+# 清单里 downloadUrl 的目录前缀，可用 DOWNLOAD_BASE 覆盖。
+DOWNLOAD_BASE="${DOWNLOAD_BASE:-https://hk.dishuyl.cn/ssl-proxy/mac}"
+SIGN_KEY="${SSL_PROXY_UPDATE_KEY:-$ROOT/.secrets/update-signing-key.der}"
+
+if ! command -v hdiutil >/dev/null 2>&1; then
+  echo '==> 未找到 hdiutil，跳过 DMG 与 version-mac.json' >&2
+  exit 0
+fi
+
+# 暂存目录里只放 .app，DMG 打开后就是标准的拖拽安装界面。
+STAGE="$(mktemp -d)"
+cp -R "$APP" "$STAGE/"
+rm -f "$DMG"
+hdiutil create -quiet -volname "SSL Proxy Client" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+rm -rf "$STAGE"
+echo "    客户端磁盘映像: $DMG"
+
+# 更新清单：版本号取自 Cargo.toml，sha256/signature 来自本次 DMG，
+# changelog 沿用 version-mac.json 里已有的列表（与 build.ps1 对 version.json 的处理一致）。
+if [ ! -f "$SIGN_KEY" ]; then
+  echo "==> 未找到签名私钥 $SIGN_KEY，跳过 version-mac.json 更新" >&2
+  exit 0
+fi
+
+SHA="$(shasum -a 256 "$DMG" | awk '{print $1}')"
+SIG="$(cargo run -q -p update-signer -- sign "$SIGN_KEY" "$DMG" | tr -d '\r\n')"
+
+CHANGELOG_JSON='[]'
+if [ -f "$MANIFEST" ] && command -v plutil >/dev/null 2>&1; then
+  CHANGELOG_JSON="$(plutil -extract changelog json -o - "$MANIFEST" 2>/dev/null || printf '[]')"
+fi
+# plutil 解析失败时可能是空串，兜底成空数组，保证清单始终是合法 JSON。
+if [ -z "$(printf '%s' "$CHANGELOG_JSON" | tr -d '[:space:]')" ]; then
+  CHANGELOG_JSON='[]'
+fi
+
+cat > "$MANIFEST" <<JSON
+{
+  "version": "${VERSION}",
+  "changelog": ${CHANGELOG_JSON},
+  "downloadUrl": "${DOWNLOAD_BASE}/$(basename "$DMG")",
+  "sha256": "${SHA}",
+  "signature": "${SIG}"
+}
+JSON
+
+if command -v plutil >/dev/null 2>&1 && ! plutil -lint "$MANIFEST" >/dev/null; then
+  echo '==> version-mac.json 不是合法 JSON，请检查' >&2
+fi
+
+echo "    更新清单: $MANIFEST"

@@ -20,6 +20,7 @@
 - [x] Windows 标题栏布局（图标、标题、版本号、主题按钮位置）与改动前一致（版本号仅用 `.when(!macos)` 包裹）
 
 ## 更新
+> 后续已改为 macOS 走 `version-mac.json` + DMG，Windows 行为不变。
 - [x] macOS 启动与运行期间不发起版本检查，不出现强制更新弹窗（`UPDATES_SUPPORTED = cfg!(windows)`，`check_updates` 与 `update_watch` 提前返回）
 - [x] macOS 仪表盘不显示「检查更新」按钮（`.when(UPDATES_SUPPORTED, ...)`）
 - [x] Windows 的自动检查、强制更新与下载安装流程无变化（常量在 Windows 恒为 true）
