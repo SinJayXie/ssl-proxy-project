@@ -54,8 +54,13 @@ if [ "$PLATFORM" = "win" ]; then
   cargo build --release --workspace
   GUI_BIN="$(find_bin ssl-proxy-gui)"
   SVR_BIN="$(find_bin ssl-proxy-svr)"
+elif [ "$PLATFORM" = "darwin" ]; then
+  echo '==> cargo build --release -p ssl-proxy-gui -p ssl-proxy-svr（macOS）'
+  cargo build --release -p ssl-proxy-gui -p ssl-proxy-svr
+  GUI_BIN="$(find_bin ssl-proxy-gui)"
+  SVR_BIN="$(find_bin ssl-proxy-svr)"
 else
-  echo '==> GUI 仅支持 Windows，本次只构建服务端'
+  echo '==> GUI 仅支持 Windows / macOS，本次只构建服务端'
   cargo build --release -p ssl-proxy-svr
   GUI_BIN=""
   SVR_BIN="$(find_bin ssl-proxy-svr)"
@@ -64,7 +69,10 @@ fi
 GUI_VERSION="$(crate_version "$GUI_CRATE/Cargo.toml")"
 SVR_VERSION="$(crate_version "$SVR_CRATE/Cargo.toml")"
 
-if [ -n "$GUI_BIN" ] && command -v makensis >/dev/null 2>&1; then
+if [ "$PLATFORM" = "darwin" ]; then
+  # macOS 打 .app 包（内部会重新构建 GUI，增量构建很快），不走下面的 NSIS 分支。
+  bash "$ROOT/scripts/bundle-macos.sh"
+elif [ -n "$GUI_BIN" ] && command -v makensis >/dev/null 2>&1; then
   payload_dir="$TARGET/installer/payload"
   mkdir -p "$payload_dir"
   cp "$GUI_BIN" "$payload_dir/ssl-proxy-gui.exe"

@@ -4,7 +4,7 @@
 
 ![Rust](https://img.shields.io/badge/Rust-1.85%2B%20%C2%B7%20edition%202024-000000)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Client](https://img.shields.io/badge/client-Windows%2010%2F11-0078D4)
+![Client](https://img.shields.io/badge/client-Windows%20%7C%20macOS-0078D4)
 ![Server](https://img.shields.io/badge/server-Windows%20%7C%20Linux%20%7C%20macOS-555)
 
 基于 Rust 的双端代理方案：一个原生 Windows 桌面客户端（GPUI）加一个 TLS 代理服务端，两者通过私有协议通信，对外表现得和普通 HTTPS 流量一致。
@@ -191,7 +191,7 @@ static-sources:
 ## 环境要求
 
 - Rust 1.85+（edition 2024）
-- 客户端：Windows 10 / 11（GPUI 客户端仅支持 Windows）
+- 客户端：Windows 10 / 11 或 macOS 11+
 - 打包：NSIS（`makensis`）；UPX 可选
 - 服务端：Windows / Linux / macOS；静态 Linux 构建需要 `x86_64-unknown-linux-musl` 工具链与 `musl-gcc`
 
@@ -236,8 +236,17 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -DownloadBase "https:
 Linux / macOS：
 
 ```bash
-./scripts/build.sh   # GUI 仅支持 Windows，此时只构建服务端
+./scripts/build.sh   # 各平台都会构建服务端；macOS 上还会构建客户端并打包 .app
 ```
+
+macOS 构建：
+
+```bash
+cargo run -p ssl-proxy-gui     # 本地运行
+./scripts/bundle-macos.sh      # 产出 dist/client/SSLProxyClient.app
+```
+
+`bundle-macos.sh` 生成普通 `.app` 并做 ad-hoc 签名（`codesign --sign -`），暂不包含 Apple Developer 签名与公证。macOS 版客户端暂不包含托盘常驻与自动更新。
 
 静态 Linux 服务端（WSL 内）：
 
@@ -248,6 +257,7 @@ wsl -d Ubuntu-22.04 -e bash /mnt/e/myProjects/ssl-proxy-project/scripts/build-sv
 产物：
 
 - `dist/client/SSLProxyClient_<gui版本>_x64-setup.exe`（同时用新的 SHA-256 与 Ed25519 签名重写 `version.json`）
+- `dist/client/SSLProxyClient.app`（macOS 应用包，ad-hoc 签名）
 - `dist/server/ssl-proxy-svr-<平台>-<svr版本>.zip`（可执行文件、`config.yaml`、`certs/`、`logs/`）
 - `dist/server/ssl-proxy-svr-linux-musl-<svr版本>.tar.gz`（静态 Linux 构建）
 

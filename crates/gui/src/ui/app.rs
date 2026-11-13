@@ -24,6 +24,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// Set by the Dashboard "Check Update" button, consumed by the shell.
 static UPDATE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// 更新清单只发布 Windows 安装包，macOS 上不提供应用内自更新。
+const UPDATES_SUPPORTED: bool = cfg!(windows);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Dashboard,
@@ -149,6 +152,9 @@ impl AppShell {
         });
 
         let update_watch = cx.spawn(async move |this, cx| {
+            if !UPDATES_SUPPORTED {
+                return;
+            }
             let mut last_periodic = Instant::now();
             loop {
                 smol::Timer::after(Duration::from_millis(250)).await;
@@ -254,6 +260,9 @@ impl AppShell {
     }
 
     fn check_updates(&mut self, force: bool, cx: &mut Context<Self>) {
+        if !UPDATES_SUPPORTED {
+            return;
+        }
         const UPDATE_INTERVAL_MS: u64 = 60 * 60 * 1000;
         let now = now_ms();
 
@@ -849,6 +858,9 @@ impl Render for AppShell {
                 .into_any_element()
         };
 
+        // 版本号小字仅在 Windows 显示，颜色在外层取好，避免闭包里重复借用。
+        let muted = theme::text_muted(cx);
+
         let mut root = v_flex()
             .size_full()
             .relative()
@@ -877,12 +889,16 @@ impl Render for AppShell {
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("SSL Proxy Client"),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(10.))
-                                    .text_color(theme::text_muted(cx))
-                                    .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
-                            ),
+                            // Windows 显示版本号，macOS 跟随系统习惯只显示产品名，
+                            // 左侧红绿灯安全区由组件内置。
+                            .when(!cfg!(target_os = "macos"), |this| {
+                                this.child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(muted)
+                                        .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
+                                )
+                            }),
                     )
                     .child(
                         h_flex()
@@ -1072,23 +1088,25 @@ impl Render for DashboardPage {
                         h_flex()
                             .items_center()
                             .gap_2()
-                            .child(
-                                Button::new("check-update")
-                                    .label(if self.checking_update {
-                                        i18n::t("CHECKING_UPDATE")
-                                    } else {
-                                        i18n::t("CHECK_UPDATE")
-                                    })
-                                    .icon(Icon::default().path(mdi(if self.checking_update {
-                                        "loading"
-                                    } else {
-                                        "cloud-download-outline"
-                                    })))
-                                    .disabled(self.checking_update)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.check_update(cx)
-                                    })),
-                            )
+                            .when(UPDATES_SUPPORTED, |this| {
+                                this.child(
+                                    Button::new("check-update")
+                                        .label(if self.checking_update {
+                                            i18n::t("CHECKING_UPDATE")
+                                        } else {
+                                            i18n::t("CHECK_UPDATE")
+                                        })
+                                        .icon(Icon::default().path(mdi(if self.checking_update {
+                                            "loading"
+                                        } else {
+                                            "cloud-download-outline"
+                                        })))
+                                        .disabled(self.checking_update)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.check_update(cx)
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new("quit")
                                     .danger()

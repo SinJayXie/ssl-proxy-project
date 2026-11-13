@@ -37,6 +37,37 @@ fn main() {
         }
     };
 
+    // ---- Single instance (macOS) ----
+    // 用配置目录下的 flock 代替 Windows 互斥体，被占用说明已有实例在运行。
+    // config_dir() 无副作用，这里先取一次不影响后续初始化。
+    //
+    // 与 Windows 的 RELAUNCH_ENV 对齐：由「保存并重启」拉起的新进程会重试一段时间，
+    // 等待旧进程退出并释放 flock，避免重启静默失败。
+    #[cfg(target_os = "macos")]
+    let _instance_guard = if std::env::var_os("SSL_PROXY_GUI_MULTI_INSTANCE").is_some() {
+        None
+    } else {
+        let retries = if std::env::var_os(crate::core::RELAUNCH_ENV).is_some() {
+            30
+        } else {
+            0
+        };
+        let mut guard = None;
+        for attempt in 0..=retries {
+            if let Some(acquired) = platform::mac::try_acquire(&platform::paths::config_dir()) {
+                guard = Some(acquired);
+                break;
+            }
+            if attempt < retries {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        match guard {
+            Some(guard) => Some(guard),
+            None => return,
+        }
+    };
+
     // ---- Paths + logging ----
     let app_path = platform::paths::resolve_app_path();
     let config_dir = platform::paths::config_dir();
@@ -70,6 +101,10 @@ fn main() {
         // MDI first, then the full Lucide catalog used by gpui-kit internals.
         .with_assets(ui::assets::AppAssets)
         .run(move |cx| {
+            // macOS 没有托盘常驻，关闭最后一个窗口即退出，避免留下无窗口的后台进程。
+            #[cfg(target_os = "macos")]
+            cx.set_quit_mode(QuitMode::LastWindowClosed);
+
             gpui_kit::init(cx);
             ui::theme::apply(cx, prefs.theme_mode());
             // 亚克力是偏好项，跟随主题一起在启动时恢复。
@@ -85,6 +120,16 @@ fn main() {
                 window_min_size: Some(size(px(800.), px(600.))),
                 is_resizable: true,
                 ..TitleBar::window_options()
+            };
+
+            // macOS 红绿灯在 34px 标题栏内垂直居中（直径约 12px）。
+            #[cfg(target_os = "macos")]
+            let options = {
+                let mut options = options;
+                if let Some(titlebar) = options.titlebar.as_mut() {
+                    titlebar.traffic_light_position = Some(point(px(12.), px(11.)));
+                }
+                options
             };
 
             let shell_core = core.clone();

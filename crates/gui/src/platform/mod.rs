@@ -7,3 +7,6 @@ pub mod single_instance;
 pub mod tray;
 #[cfg(windows)]
 pub mod window;
+
+#[cfg(target_os = "macos")]
+pub mod mac;

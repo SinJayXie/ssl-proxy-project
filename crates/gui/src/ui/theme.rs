@@ -3,6 +3,16 @@ use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
 use gpui_kit::{px, rgb, rgba, App, Hsla, WindowBackgroundAppearance};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+/// 平台默认字体：macOS 用系统无衬线/等宽字体，其它平台沿用 Windows 风格。
+#[cfg(target_os = "macos")]
+const UI_FONT: &str = "SF Pro Text";
+#[cfg(target_os = "macos")]
+const MONO_FONT: &str = "SF Mono";
+#[cfg(not(target_os = "macos"))]
+const UI_FONT: &str = "Segoe UI";
+#[cfg(not(target_os = "macos"))]
+const MONO_FONT: &str = "Consolas";
+
 /// 亚克力背景不透明度的默认值与下限（百分比）。再低就只剩模糊，字看不清了。
 pub const DEFAULT_ACRYLIC_OPACITY: u32 = 72;
 pub const MIN_ACRYLIC_OPACITY: u32 = 30;
@@ -92,9 +102,9 @@ fn apply_palette(cx: &mut App) {
         // macOS controls are pill-ish: 6-7px on inputs/buttons, 12-14px on cards.
         theme.radius = px(7.);
         theme.radius_lg = px(14.);
-        theme.font_family = "Segoe UI".into();
+        theme.font_family = UI_FONT.into();
         theme.font_size = px(13.);
-        theme.mono_font_family = "Consolas".into();
+        theme.mono_font_family = MONO_FONT.into();
         theme.mono_font_size = px(12.);
 
         if dark {

@@ -1,6 +1,10 @@
 use std::path::PathBuf;
 
-/// User data directory: `$HOME/ssl-proxy-client`.
+/// User data directory, per platform:
+/// - Windows: `%USERPROFILE%/ssl-proxy-client`（HOME 兜底）
+/// - macOS: `$HOME/Library/Application Support/ssl-proxy-client`
+/// - 其它平台: `$HOME/ssl-proxy-client`
+///
 /// Matches the Tauri client so both versions share the same config.
 ///
 /// `SSL_PROXY_GUI_CONFIG_DIR` overrides it (useful for development/QA).
@@ -9,12 +13,27 @@ pub fn config_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
 
-    if let Ok(home) = std::env::var("USERPROFILE") {
-        PathBuf::from(home).join("ssl-proxy-client")
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join("ssl-proxy-client")
-    } else {
-        PathBuf::from("ssl-proxy-client")
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("ssl-proxy-client")
+        } else {
+            PathBuf::from("ssl-proxy-client")
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Ok(home) = std::env::var("USERPROFILE") {
+            PathBuf::from(home).join("ssl-proxy-client")
+        } else if let Ok(home) = std::env::var("HOME") {
+            PathBuf::from(home).join("ssl-proxy-client")
+        } else {
+            PathBuf::from("ssl-proxy-client")
+        }
     }
 }
 

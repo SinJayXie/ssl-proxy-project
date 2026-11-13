@@ -4,7 +4,7 @@
 
 ![Rust](https://img.shields.io/badge/Rust-1.85%2B%20%C2%B7%20edition%202024-000000)
 ![License](https://img.shields.io/badge/license-MIT-blue)
-![Client](https://img.shields.io/badge/client-Windows%2010%2F11-0078D4)
+![Client](https://img.shields.io/badge/client-Windows%20%7C%20macOS-0078D4)
 ![Server](https://img.shields.io/badge/server-Windows%20%7C%20Linux%20%7C%20macOS-555)
 
 A two-part Rust proxy suite: a native Windows desktop client built with GPUI and a TLS proxy server, talking to each other over a private protocol that is designed to look like ordinary HTTPS traffic.
@@ -190,7 +190,7 @@ See [crates/svr/docs/ARCHITECTURE.md](crates/svr/docs/ARCHITECTURE.md) for the h
 ## Requirements
 
 - Rust 1.85+ (edition 2024)
-- Client: Windows 10 / 11 (the GPUI client is Windows-only)
+- Client: Windows 10 / 11 or macOS 11+
 - Packaging: NSIS (`makensis`); UPX optional
 - Server: Windows / Linux / macOS; `x86_64-unknown-linux-musl` toolchain + `musl-gcc` for static Linux builds
 
@@ -235,8 +235,17 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -DownloadBase "https:
 Linux / macOS:
 
 ```bash
-./scripts/build.sh   # The GUI is Windows-only, so only the server is built here
+./scripts/build.sh   # Server everywhere; on macOS it also builds the client and packs the .app
 ```
+
+macOS client:
+
+```bash
+cargo run -p ssl-proxy-gui     # run locally
+./scripts/bundle-macos.sh      # package dist/client/SSLProxyClient.app
+```
+
+`bundle-macos.sh` produces a plain `.app` with an ad-hoc signature (`codesign --sign -`); Apple Developer signing and notarization are not covered yet. On macOS the client has no tray residency and no automatic updates.
 
 Static Linux server (from WSL):
 
@@ -247,6 +256,7 @@ wsl -d Ubuntu-22.04 -e bash /mnt/e/myProjects/ssl-proxy-project/scripts/build-sv
 Artifacts:
 
 - `dist/client/SSLProxyClient_<gui-version>_x64-setup.exe` (also rewrites `version.json` with the new SHA-256 and Ed25519 signature)
+- `dist/client/SSLProxyClient.app` (macOS bundle, ad-hoc signed)
 - `dist/server/ssl-proxy-svr-<platform>-<svr-version>.zip` (binary, `config.yaml`, `certs/`, `logs/`)
 - `dist/server/ssl-proxy-svr-linux-musl-<svr-version>.tar.gz` (static Linux build)
 

@@ -54,3 +54,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 [target.'cfg(windows)'.build-dependencies]
 # 把 icon.ico 与版本信息编进 exe（build.rs）
 embed-resource = "3"
+
+[target.'cfg(unix)'.dependencies]
+# macOS 单实例文件锁（flock）
+libc = "0.2"

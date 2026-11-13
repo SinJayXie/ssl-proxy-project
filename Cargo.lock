@@ -6882,6 +6882,7 @@ dependencies = [
  "gpui-kit",
  "hmac",
  "image",
+ "libc",
  "log",
  "native-tls",
  "once_cell",
