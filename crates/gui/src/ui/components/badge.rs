@@ -5,16 +5,35 @@ use gpui_kit::*;
 
 /// PROXY / DIRECT badge matching the Vue `.badge` styles.
 ///
-/// UDP sessions (`UDP` direct / `UDP-PROXY` via tunnel) get a dedicated badge
-/// so the protocol stays visible in the connection list.
+/// UDP sessions carry their transport in [`protocol_badge`]; here only the
+/// route matters, so `UDP-PROXY` maps to PROXY and plain `UDP` to DIRECT.
 pub fn mode_badge(mode: &str, cx: &App) -> AnyElement {
     let upper = mode.to_ascii_uppercase();
-    if upper == "UDP" || upper == "UDP-PROXY" {
-        return badge(i18n::t("UDP_BADGE"), upper == "UDP-PROXY", cx);
-    }
-    let is_proxy = mode.eq_ignore_ascii_case("PROXY");
+    let is_proxy = upper == "PROXY" || upper == "UDP-PROXY";
     let label = i18n::t(if is_proxy { "PROXY" } else { "DIRECT" });
     badge(label, is_proxy, cx)
+}
+
+/// Transport pill: `TCP` for regular connections, `UDP` for relay sessions.
+pub fn protocol_badge(mode: &str, cx: &App) -> AnyElement {
+    let is_udp = mode.to_ascii_uppercase().starts_with("UDP");
+    let (bg, fg) = if is_udp {
+        (cx.theme().warning.opacity(0.16), cx.theme().warning)
+    } else {
+        (theme::bg_tertiary(cx), theme::text_secondary(cx))
+    };
+
+    h_flex()
+        .gap(px(3.))
+        .px(px(4.))
+        .py(px(2.))
+        .rounded(px(10.))
+        .bg(bg)
+        .text_size(px(10.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(fg)
+        .child(i18n::t(if is_udp { "UDP_BADGE" } else { "TCP_BADGE" }))
+        .into_any_element()
 }
 
 /// Mode badge with a `MODE_*` i18n label (used by Test Rule).

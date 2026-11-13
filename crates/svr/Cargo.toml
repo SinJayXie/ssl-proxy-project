@@ -1,6 +1,6 @@
 [package]
 name = "ssl-proxy-svr"
-version = "1.2.0"
+version = "1.3.1"
 edition = "2021"
 authors = ["ssl-proxy-svr"]
 description = "Lightweight TLS proxy server with HTTP masquerade, refactored from the Node.js implementation"

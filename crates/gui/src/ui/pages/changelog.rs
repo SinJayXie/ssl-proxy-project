@@ -12,6 +12,36 @@ struct Entry {
 
 const CHANGELOG: &[Entry] = &[
     Entry {
+        version: "2.3.5",
+        date: "2026-11-13",
+        changes: &[
+            "Connections: show a TCP / UDP transport badge on every connection group and row",
+            "Connections: UDP sessions show PROXY / DIRECT separately from the transport badge",
+        ],
+    },
+    Entry {
+        version: "2.3.4",
+        date: "2026-11-13",
+        changes: &[
+            "Dashboard: the 7-day traffic chart is now an interactive bar chart with a value axis and dashed grid lines",
+            "Dashboard: hover a bar to see that day's upload, download and total traffic",
+            "Dashboard: show the 7-day total next to the chart title",
+            "Connections: show a TCP / UDP badge for every connection group and row",
+            "Title bar: display the application version next to the product name",
+        ],
+    },
+    Entry {
+        version: "2.3.3",
+        date: "2026-11-13",
+        changes: &[
+            "UDP: SOCKS5 UDP ASSOCIATE relay with Off / Direct / Proxy modes (default Off)",
+            "UDP over the TLS tunnel: datagrams are framed by the client and forwarded by the server, with and without mux",
+            "UDP: per-target session reuse, idle timeout, capability negotiation and automatic fallback to direct when the server has no UDP support",
+            "Server: UDP relay is opt-in via udp.enabled, with per-session rate limiting, idle timeout and private-network blocking",
+            "Connections: UDP sessions are listed with their own traffic counters",
+        ],
+    },
+    Entry {
         version: "2.3.2",
         date: "2026-11-12",
         changes: &[

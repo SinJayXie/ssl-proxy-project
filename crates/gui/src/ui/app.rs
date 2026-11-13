@@ -9,6 +9,7 @@ use crate::ui::prefs::Prefs;
 use crate::ui::{i18n, theme, util};
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::chart::BarChart;
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{
@@ -845,6 +846,12 @@ impl Render for AppShell {
                                     .text_size(px(12.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child("SSL Proxy Client"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(theme::text_muted(cx))
+                                    .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
                             ),
                     )
                     .child(
@@ -1197,73 +1204,95 @@ fn stat_card(
         .into_any_element()
 }
 
-/// Seven-day up/down traffic bars, drawn with plain elements so it stays
-/// dependency-free and repaints with the rest of the dashboard.
+/// Seven-day traffic chart: an interactive bar chart with hover tooltips.
 fn traffic_chart_card(days: &[stats::DailyTraffic], cx: &App) -> AnyElement {
-    let max = days
-        .iter()
-        .flat_map(|day| [day.up, day.down])
-        .max()
-        .unwrap_or(0);
-    let empty_color = theme::bg_tertiary(cx);
-    let success = cx.theme().success;
+    let seven_day_total = days.iter().fold(0u64, |sum, day| {
+        sum.saturating_add(day.up).saturating_add(day.down)
+    });
+    let muted = theme::text_muted(cx);
     let primary = cx.theme().primary;
-    let label_color = theme::text_muted(cx);
+    let success = cx.theme().success;
 
-    let mut columns = h_flex().w_full().items_end().gap(px(8.));
-    for day in days {
-        let bar = |value: u64, color: Hsla| {
-            let height = if value == 0 || max == 0 {
-                px(3.)
-            } else {
-                px((value as f32 / max as f32 * 96.).max(4.))
-            };
-            div()
-                .w(px(12.))
-                .h(height)
-                .rounded(px(3.))
-                .bg(if value == 0 { empty_color } else { color })
-        };
-
-        columns = columns.child(
-            v_flex()
-                .flex_1()
-                .min_w_0()
-                .items_center()
-                .gap(px(8.))
-                .child(
-                    h_flex()
-                        .items_end()
-                        .justify_center()
-                        .gap(px(3.))
-                        .h(px(100.))
-                        .child(bar(day.up, success))
-                        .child(bar(day.down, primary)),
-                )
-                .child(
-                    div()
-                        .text_size(px(10.))
-                        .text_color(label_color)
-                        .child(stats::short_label(&day.date)),
-                ),
-        );
-    }
-
-    let chart: AnyElement = if max == 0 {
+    let chart: AnyElement = if seven_day_total == 0 {
         h_flex()
             .w_full()
-            .h(px(126.))
+            .h(px(150.))
             .items_center()
             .justify_center()
             .child(
                 div()
                     .text_size(px(12.))
-                    .text_color(theme::text_muted(cx))
+                    .text_color(muted)
                     .child(i18n::t("DASH_NO_DATA")),
             )
             .into_any_element()
     } else {
-        columns.into_any_element()
+        let up_label = i18n::t("DASH_UP");
+        let down_label = i18n::t("DASH_DOWN");
+        let total_label = i18n::t("DASH_TOTAL");
+
+        BarChart::new(days.to_vec())
+            .name(i18n::t("DASH_TRAFFIC_7D"))
+            .band(|day: &stats::DailyTraffic| day.date.clone())
+            .value(|day: &stats::DailyTraffic| day.up.saturating_add(day.down) as f64)
+            .label(|day: &stats::DailyTraffic| stats::short_label(&day.date))
+            .label_color(move |_: &stats::DailyTraffic| muted)
+            .label_axis(true)
+            .value_axis(true)
+            .value_tick_count(3)
+            .value_tick_format(|value| util::format_bytes(value.max(0.) as u64))
+            .grid(true)
+            .grid_dashed(true)
+            .corner_radii(Corners::all(px(4.)))
+            .fill(move |_: &stats::DailyTraffic, _, _, _| primary)
+            .tooltip_title(|day: &stats::DailyTraffic| day.date.clone().into())
+            .tooltip_content(move |day: &stats::DailyTraffic, _, cx| {
+                let row = |label: String, value: String, color: Hsla| {
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(color)
+                                .child(label),
+                        )
+                        .child(div().text_size(px(12.)).child(value))
+                };
+                let total = day.up.saturating_add(day.down);
+                v_flex()
+                    .w(px(180.))
+                    .gap_1()
+                    .child(row(format!("↑ {up_label}"), util::format_bytes(day.up), success))
+                    .child(row(
+                        format!("↓ {down_label}"),
+                        util::format_bytes(day.down),
+                        primary,
+                    ))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .justify_between()
+                            .gap_4()
+                            .pt_1()
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(total_label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(util::format_bytes(total)),
+                            ),
+                    )
+            })
+            .into_any_element()
     };
 
     v_flex()
@@ -1277,38 +1306,37 @@ fn traffic_chart_card(days: &[stats::DailyTraffic], cx: &App) -> AnyElement {
         .shadow_xs()
         .child(
             h_flex()
-                .items_center()
+                .items_start()
                 .justify_between()
                 .gap_3()
                 .child(
-                    div()
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(i18n::t("DASH_TRAFFIC_7D")),
+                    v_flex()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(i18n::t("DASH_TRAFFIC_7D")),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(muted)
+                                .child(i18n::t("DASH_CHART_HINT")),
+                        ),
                 )
                 .child(
-                    h_flex()
-                        .items_center()
-                        .gap_3()
-                        .child(legend(success, i18n::t("DASH_UP"), cx))
-                        .child(legend(primary, i18n::t("DASH_DOWN"), cx)),
+                    div()
+                        .text_size(px(11.))
+                        .text_color(muted)
+                        .child(format!(
+                            "{} {}",
+                            i18n::t("DASH_7D_TOTAL"),
+                            util::format_bytes(seven_day_total)
+                        )),
                 ),
         )
-        .child(chart)
-        .into_any_element()
-}
-
-fn legend(color: Hsla, label: String, cx: &App) -> AnyElement {
-    h_flex()
-        .items_center()
-        .gap(px(4.))
-        .child(div().w(px(7.)).h(px(7.)).rounded(px(4.)).bg(color))
-        .child(
-            div()
-                .text_size(px(11.))
-                .text_color(theme::text_muted(cx))
-                .child(label),
-        )
+        .child(div().w_full().h(px(150.)).child(chart))
         .into_any_element()
 }
 

@@ -4,7 +4,7 @@
 
 A two-part Rust proxy suite: a Windows desktop client built with GPUI and a TLS proxy server, communicating over a private protocol.
 
-- Client: `crates/gui` (package `ssl-proxy-gui`, installed as `ssl-proxy-client.exe`) — current version **2.3.2**
+- Client: `crates/gui` (package `ssl-proxy-gui`, installed as `ssl-proxy-client.exe`) — current version **2.3.5**
 - Server: `crates/svr` (`ssl-proxy-svr`) — current version **1.2.0**
 - License: [MIT](LICENSE)
 
@@ -30,7 +30,7 @@ A two-part Rust proxy suite: a Windows desktop client built with GPUI and a TLS 
 
 ### 1. Install the client
 
-Run `SSLProxyClient_2.3.2_x64-setup.exe` (from `dist/client` or the download URL in `version.json`). It installs to `%LOCALAPPDATA%\SSLProxyClient`, ships `GeoDB.dat` next to the executable and upgrades older versions in place. Accept the first-run disclaimer.
+Run `SSLProxyClient_2.3.5_x64-setup.exe` (from `dist/client` or the download URL in `version.json`). It installs to `%LOCALAPPDATA%\SSLProxyClient`, ships `GeoDB.dat` next to the executable and upgrades older versions in place. Accept the first-run disclaimer.
 
 ### 2. Point applications at the local proxy
 

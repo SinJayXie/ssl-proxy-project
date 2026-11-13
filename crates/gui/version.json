@@ -1,10 +1,8 @@
 {
-    "version": "2.3.2",
+    "version": "2.3.5",
     "changelog": [
-      "Fix: the multiplexing switch was not saved on restart and came back enabled",
-      "Fix: \"Save and restart\" showed an open-path error and the app did not relaunch",
-      "Restart: the new process is spawned directly and waits for the previous instance to exit, so paths with spaces work",
-      "Single instance: ignore a stale error code so the running window is detected reliably"
+      "Connections: show a TCP / UDP transport badge on every connection group and row",
+      "Connections: UDP sessions show PROXY / DIRECT separately from the transport badge"
     ],
-    "downloadUrl": "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.3.2_x64-setup.exe"
+    "downloadUrl": "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.3.5_x64-setup.exe"
 }

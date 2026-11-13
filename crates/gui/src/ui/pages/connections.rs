@@ -301,6 +301,7 @@ impl ConnectionsPage {
                             .items_center()
                             .gap_2()
                             .flex_wrap()
+                            .child(badge::protocol_badge(&conn_type, cx))
                             .child(badge::mode_badge(&conn_type, cx))
                             .when(average > 0, |this| {
                                 this.child(
@@ -447,6 +448,7 @@ fn connection_row(
     let weak = cx.weak_entity();
     let id = connection.id;
     let ping = connection.latency_ms;
+    let conn_type = connection.conn_type.clone();
     let row_hover = theme::card_hover(cx);
 
     h_flex()
@@ -460,6 +462,7 @@ fn connection_row(
             this.border_b_1().border_color(theme::border_light(cx))
         })
         .hover(move |style| style.bg(row_hover))
+        .child(badge::protocol_badge(&conn_type, cx))
         .child(
             h_flex()
                 .flex_1()
