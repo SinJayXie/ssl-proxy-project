@@ -14,35 +14,45 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::core::service::Service;
 use crate::libs::rate_limit::{RateLimit, RateLimitConfig};
+use crate::services::fallback_service::FallbackService;
 use crate::services::initial_stream::InitialThenStream;
 use crate::services::static_sources_service::StaticSourcesService;
 
 pub struct ForwardService {
     rate_limit: RateLimit,
     static_sources: Arc<StaticSourcesService>,
+    /// 配置了真实站点回落时优先使用，否则走静态站点
+    fallback: Option<Arc<FallbackService>>,
 }
 
 impl ForwardService {
     pub fn new(
         static_sources: Arc<StaticSourcesService>,
         rate_limit_cfg: RateLimitConfig,
+        fallback: Option<Arc<FallbackService>>,
     ) -> Self {
         Self {
             rate_limit: RateLimit::new(rate_limit_cfg),
             static_sources,
+            fallback,
         }
     }
 
     /// 处理一条"伪装"连接：
     /// 1. 限流检查；
     /// 2. 失败：直接关闭；
-    /// 3. 成功：交给 `StaticSourcesService`。
+    /// 3. 成功：回源真实站点（若配置）或交给 `StaticSourcesService`。
     pub async fn handle<S>(&self, stream: InitialThenStream<S>, initial: Bytes, peer_ip: &str)
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         if !self.rate_limit.record(peer_ip) {
             tracing::info!("[Forward] rate-limited peer={}, drop connection", peer_ip);
+            return;
+        }
+
+        if let Some(fallback) = &self.fallback {
+            fallback.handle(stream, initial.as_ref(), peer_ip).await;
             return;
         }
         self.static_sources.handle(stream, initial).await;
@@ -58,10 +68,11 @@ impl Service for ForwardService {
     async fn start(&self) -> Result<()> {
         let cfg = self.rate_limit.config();
         tracing::info!(
-            "[Forward] ready (rate_limit max={}, window={:?}, black={:?})",
+            "[Forward] ready (rate_limit max={}, window={:?}, black={:?}, fallback={:?})",
             cfg.max_requests,
             cfg.rate_time,
             cfg.black_time,
+            self.fallback.as_ref().map(|f| f.target().to_string()),
         );
         Ok(())
     }

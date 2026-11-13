@@ -1,5 +1,6 @@
 use crate::state::AppState;
 use crate::types::UdpMode;
+use std::net::Ipv6Addr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -14,7 +15,16 @@ pub const AUTH_NO_PASS: u8 = 0x00;
 const CMD_CONNECT: u8 = 0x01;
 const CMD_UDP_ASSOCIATE: u8 = 0x03;
 // SOCKS5 应答码
+const REPLY_GENERAL_FAILURE: u8 = 0x01;
 const REPLY_CMD_NOT_SUPPORTED: u8 = 0x07;
+const REPLY_ATYP_NOT_SUPPORTED: u8 = 0x08;
+
+/// 发送一个 SOCKS5 应答（BND.ADDR/PORT 统一为 0.0.0.0:0）
+async fn send_reply(client: &mut TcpStream, code: u8) {
+    let _ = client
+        .write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0])
+        .await;
+}
 
 /// Create a SOCKS5 connection task: resolve, connect, respond, pipe
 pub async fn create_connection_task(
@@ -41,71 +51,103 @@ pub async fn create_connection_task(
 }
 
 /// Handle a SOCKS5 client connection
+///
+/// 版本字节已由上游的协议探测消费。全程使用 `read_exact` 逐字段读取，
+/// 避免请求被 TCP 分段时把合法握手误判为非法。
 pub async fn handle_socks5_client(mut client: TcpStream, state: Arc<AppState>) {
-    let mut buf = [0u8; 262];
-
-    // Step 1: Read SOCKS5 greeting (version byte already consumed by protocol detection)
-    match client.read_exact(&mut buf[..1]).await {
-        Ok(_) => {}
-        _ => return,
-    };
-    let nauth = buf[0] as usize;
-    if nauth > 255 {
+    // Step 1: 读认证方法列表（nmethods + methods）
+    let mut nmethods = [0u8; 1];
+    if client.read_exact(&mut nmethods).await.is_err() {
         return;
     }
-    if nauth > 0 {
-        let _ = client.read_exact(&mut buf[..nauth]).await;
+    if nmethods[0] == 0 {
+        let _ = client.write_all(&[5, 0xFF]).await;
+        return;
+    }
+    let mut methods = vec![0u8; nmethods[0] as usize];
+    if client.read_exact(&mut methods).await.is_err() {
+        return;
     }
 
-    // Step 2: Negotiate auth method - send NO_AUTH
-    let _ = client.write_all(&[5, AUTH_NO_PASS]).await;
-
-    // Step 3: Read SOCKS5 request
-    let n = match client.read(&mut buf).await {
-        Ok(n) if n >= 7 && buf[0] == 5 => n,
-        Ok(n) => {
-            log::error!("Invalid SOCKS5 request: {:02x?}", &buf[..n.min(10)]);
-            return;
-        }
-        _ => return,
-    };
-
-    match buf[1] {
-        CMD_CONNECT => {}
-        CMD_UDP_ASSOCIATE => {
-            handle_udp_associate(client, state).await;
-            return;
-        }
-        cmd => {
-            log::error!("Unsupported SOCKS5 command: 0x{cmd:02x}");
-            return;
-        }
+    // Step 2: 只支持 NO_AUTH；客户端未提供时按规范拒绝
+    if !methods.contains(&AUTH_NO_PASS) {
+        let _ = client.write_all(&[5, 0xFF]).await;
+        return;
+    }
+    if client.write_all(&[5, AUTH_NO_PASS]).await.is_err() {
+        return;
     }
 
-    // Step 4: Parse address
-    let addr_type = buf[3];
-    let (host, port, is_domain) = match addr_type {
+    // Step 3: 读请求头 VER / CMD / RSV / ATYP
+    let mut head = [0u8; 4];
+    if client.read_exact(&mut head).await.is_err() {
+        return;
+    }
+    if head[0] != 5 || head[2] != 0 {
+        send_reply(&mut client, REPLY_GENERAL_FAILURE).await;
+        return;
+    }
+
+    // Step 4: 按 ATYP 读取目标地址（支持 IPv4 / 域名 / IPv6）
+    let (host, is_domain) = match head[3] {
         1 => {
-            if n < 10 {
+            let mut addr = [0u8; 4];
+            if client.read_exact(&mut addr).await.is_err() {
                 return;
             }
-            let ip = format!("{}.{}.{}.{}", buf[4], buf[5], buf[6], buf[7]);
-            let port = u16::from_be_bytes([buf[8], buf[9]]);
-            (ip, port, false)
+            (
+                format!("{}.{}.{}.{}", addr[0], addr[1], addr[2], addr[3]),
+                false,
+            )
         }
         3 => {
-            let len = buf[4] as usize;
-            if n < 5 + len + 2 {
+            let mut len = [0u8; 1];
+            if client.read_exact(&mut len).await.is_err() {
                 return;
             }
-            let host = String::from_utf8_lossy(&buf[5..5 + len]).to_string();
-            let port = u16::from_be_bytes([buf[5 + len], buf[5 + len + 1]]);
-            (host, port, true)
+            let mut domain = vec![0u8; len[0] as usize];
+            if client.read_exact(&mut domain).await.is_err() {
+                return;
+            }
+            (
+                String::from_utf8_lossy(&domain).to_string(),
+                true,
+            )
         }
-        _ => return,
+        4 => {
+            let mut addr = [0u8; 16];
+            if client.read_exact(&mut addr).await.is_err() {
+                return;
+            }
+            (Ipv6Addr::from(addr).to_string(), false)
+        }
+        _ => {
+            send_reply(&mut client, REPLY_ATYP_NOT_SUPPORTED).await;
+            return;
+        }
     };
 
-    create_connection_task(client, &host, port, is_domain, state).await;
+    let mut port_bytes = [0u8; 2];
+    if client.read_exact(&mut port_bytes).await.is_err() {
+        return;
+    }
+    let port = u16::from_be_bytes(port_bytes);
+
+    match head[1] {
+        CMD_CONNECT => create_connection_task(client, &host, port, is_domain, state).await,
+        CMD_UDP_ASSOCIATE => {
+            handle_udp_associate(client, state).await;
+        }
+        _ => {
+            log::error!(
+                "Unsupported SOCKS5 command: 0x{:02x} (target {}:{})",
+                head[1],
+                host,
+                port
+            );
+            send_reply(&mut client, REPLY_CMD_NOT_SUPPORTED).await;
+        }
+    }
 }
 
 /// 处理 SOCKS5 UDP ASSOCIATE（cmd=0x03）

@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_native_tls::TlsStream;
 
-use super::framing::{encode_chunk, read_frame, FLAG_RAW};
+use super::framing::{encode_chunk, read_frame, FLAG_PADDING, FLAG_RAW};
 use super::mux::MuxStream;
 
 // ==================== Target stream enum for unified handling ====================
@@ -89,13 +89,25 @@ pub async fn forward_bidirectional<R1, W1, R2, W2>(
         }
     });
 
-    tokio::select! {
-        r = track_copy(&mut cr, &mut tw, &up, &up_conn) => {
-            if let Err(e) = r { log::debug!("c2t pipe closed: {}", e); }
-        }
-        r = track_copy(&mut tr, &mut cw, &down, &down_conn) => {
-            if let Err(e) = r { log::debug!("t2c pipe closed: {}", e); }
-        }
+    // half-close：任一方向 EOF 后只关闭"对应写半边"，另一方向继续转发，
+    // 直到双方都结束（HTTP/1.1、WebSocket、SSH 等依赖半关闭的协议需要）。
+    let c2t = async {
+        let r = track_copy(&mut cr, &mut tw, &up, &up_conn).await;
+        let _ = tw.shutdown().await;
+        r
+    };
+    let t2c = async {
+        let r = track_copy(&mut tr, &mut cw, &down, &down_conn).await;
+        let _ = cw.shutdown().await;
+        r
+    };
+
+    let (c2t_res, t2c_res) = tokio::join!(c2t, t2c);
+    if let Err(e) = c2t_res {
+        log::debug!("c2t pipe closed: {}", e);
+    }
+    if let Err(e) = t2c_res {
+        log::debug!("t2c pipe closed: {}", e);
     }
 
     flush_handle.abort();
@@ -218,6 +230,9 @@ pub async fn forward_padded_bidirectional(
                     break;
                 }
             };
+            if flag == FLAG_PADDING {
+                continue;
+            }
             if !payload.is_empty() {
                 if cw.write_all(&payload).await.is_err() {
                     break;
@@ -328,6 +343,8 @@ pub async fn forward_mux_bidirectional(
                     }
                     down.fetch_add(data.len() as u64, Ordering::Relaxed);
                     down_conn.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    // 已消费：返还下载方向窗口，避免服务端单流窗口耗尽
+                    reader.ack(data.len()).await;
                 }
                 Ok(None) => break,
                 Err(e) => {

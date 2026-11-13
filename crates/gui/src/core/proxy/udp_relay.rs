@@ -205,53 +205,69 @@ async fn resolve_udp_route(
 ) -> Option<UdpRouteDecision> {
     let is_domain = host.parse::<std::net::IpAddr>().is_err();
 
-    let ip = if is_domain {
-        match dns::lookup(state, host).await {
-            Ok(ip) => ip,
-            Err(e) => {
-                log::error!("UDP DNS lookup failed for {}: {}", host, e);
-                return None;
-            }
-        }
-    } else {
-        host.to_string()
-    };
-
-    let geo_info = match state.geo_manager.get_country_by_ip(&ip) {
-        Some(country) => GeoInfo {
-            country: country.country.clone(),
-            alpha2_code: country.alpha2_code.clone(),
-            alpha3_code: country.alpha3_code.clone(),
-            numeric: country.numeric,
-        },
-        None => GeoInfo {
-            country: "Unknown".to_string(),
-            alpha2_code: "UNK".to_string(),
-            alpha3_code: "UNK".to_string(),
-            numeric: 0,
-        },
-    };
-
     let (has_upstream, directs) = {
         let config = state.config.read().await;
         (!config.proxy_server.is_empty(), config.directs.clone())
     };
+
+    // 解析失败时：有上游代理则按“地区未知”走代理，交给服务端解析
+    let resolved_ip = if is_domain {
+        match dns::lookup(state, host).await {
+            Ok(ip) => Some(ip),
+            Err(e) => {
+                if !has_upstream {
+                    log::error!("UDP DNS lookup failed for {}: {}", host, e);
+                    return None;
+                }
+                log::warn!(
+                    "UDP DNS lookup failed for {} ({}), routing through proxy",
+                    host,
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        Some(host.to_string())
+    };
+
+    let geo_info = resolved_ip
+        .as_ref()
+        .and_then(|ip| state.geo_manager.get_country_by_ip(ip))
+        .map(|country| GeoInfo {
+            country: country.country.clone(),
+            alpha2_code: country.alpha2_code.clone(),
+            alpha3_code: country.alpha3_code.clone(),
+            numeric: country.numeric,
+        })
+        .unwrap_or_else(|| GeoInfo {
+            country: "Unknown".to_string(),
+            alpha2_code: "UNK".to_string(),
+            alpha3_code: "UNK".to_string(),
+            numeric: 0,
+        });
+
     let rule_mode = {
         let rules = state.rules.read().await;
         match_rules(host, &geo_info.alpha2_code, &rules)
     };
 
-    let is_direct = decide_udp_route(
-        has_upstream,
-        rule_mode.as_deref(),
-        &geo_info.alpha2_code,
-        &directs,
-        udp_mode,
-    );
+    // 没有解析结果时无法直连：仅 proxy 模式改走代理，direct 模式维持原语义
+    let is_direct = if resolved_ip.is_none() && udp_mode == UdpMode::Proxy {
+        false
+    } else {
+        decide_udp_route(
+            has_upstream,
+            rule_mode.as_deref(),
+            &geo_info.alpha2_code,
+            &directs,
+            udp_mode,
+        )
+    };
 
     Some(UdpRouteDecision {
         is_direct,
-        ip,
+        ip: resolved_ip.unwrap_or_default(),
         geo: geo_info,
     })
 }

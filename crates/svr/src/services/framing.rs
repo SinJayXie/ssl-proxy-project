@@ -33,6 +33,8 @@ pub const FLAG_PAD: u8 = 0;
 pub const FLAG_RAW: u8 = 1;
 /// UDP 数据报帧（payload = `stream_id u32 BE || atyp || addr || port u16 BE || dgram_len u16 BE || dgram`）
 pub const FLAG_UDP: u8 = 2;
+/// 纯填充帧：接收方必须丢弃 payload（用于避免首条 TLS record 过小）
+pub const FLAG_PADDING: u8 = 3;
 
 /// 帧头长度：flag(1) + len(2) + padLen(1)
 pub const FRAME_HEADER: usize = 4;
@@ -58,6 +60,15 @@ pub fn append_frame(out: &mut Vec<u8>, payload: &[u8], pad_len: usize, flag: u8)
         out.resize(start + pad_len, 0);
         rand::thread_rng().fill(&mut out[start..]);
     }
+}
+
+/// 追加一个纯填充帧（接收方丢弃）
+///
+/// 用于把首条 TLS record 从 60~100B 的异常小包撑到接近真实 HTTPS 首包的大小。
+pub fn append_padding_frame(out: &mut Vec<u8>, payload_len: usize) {
+    let mut payload = vec![0u8; payload_len.min(MAX_PAYLOAD)];
+    rand::thread_rng().fill(&mut payload[..]);
+    append_frame(out, &payload, 0, FLAG_PADDING);
 }
 
 /// 按策略编码一段待发送数据（可能产生多帧）
@@ -162,6 +173,15 @@ mod tests {
         encode_chunk(b"abcdef", false, &mut out);
         assert_eq!(out.len(), FRAME_HEADER + 6);
         assert_eq!(out[3], 0);
+    }
+
+    #[test]
+    fn padding_frame_has_expected_layout() {
+        let mut out = Vec::new();
+        append_padding_frame(&mut out, 256);
+        assert_eq!(out[0], FLAG_PADDING);
+        assert_eq!(u16::from_be_bytes([out[1], out[2]]), 256);
+        assert_eq!(out.len(), FRAME_HEADER + 256);
     }
 
     #[tokio::test]

@@ -1,13 +1,10 @@
 use crate::state::AppState;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_native_tls::TlsStream;
 
 use super::connect::resolve_and_connect;
-use super::mux::MuxStream;
-use super::tunnel::{forward_target_stream, track_copy, TargetStream};
+use super::tunnel::{forward_target_stream, TargetStream};
 
 // ==================== HTTP / HTTPS proxy handler ====================
 
@@ -16,13 +13,28 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// 解析 `host:port` / `[v6]:port` 形式的 authority。
+fn parse_authority(authority: &str) -> Option<(String, u16)> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = rest[..end].to_string();
+        let port = rest[end + 1..].strip_prefix(':')?.parse().ok()?;
+        return Some((host, port));
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), port.parse().ok()?))
+}
+
 /// Parse absolute URL like http://host:port/path or https://host:port/path
 /// Returns (host, port, remaining_path)
 fn parse_absolute_url(url: &str) -> Option<(&str, u16, &str)> {
-    let url_no_scheme = if let Some(rest) = url.strip_prefix("http://") {
-        rest
+    let (url_no_scheme, default_port) = if let Some(rest) = url.strip_prefix("http://") {
+        (rest, 80u16)
     } else if let Some(rest) = url.strip_prefix("https://") {
-        rest
+        (rest, 443u16)
     } else {
         return None;
     };
@@ -35,179 +47,38 @@ fn parse_absolute_url(url: &str) -> Option<(&str, u16, &str)> {
         "/"
     };
 
-    let (host, port) = if let Some(colon_pos) = host_port.rfind(':') {
+    // 支持 IPv6 字面量（[::1]:8080）与普通 host:port
+    if let Some(rest) = host_port.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = &rest[..end];
+        let port = rest[end + 1..]
+            .strip_prefix(':')
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(default_port);
+        return Some((host, port, path));
+    }
+
+    if let Some(colon_pos) = host_port.rfind(':') {
         let h = &host_port[..colon_pos];
         let p: u16 = host_port[colon_pos + 1..].parse().ok()?;
-        (h, p)
+        Some((h, p, path))
     } else {
-        (host_port, 80u16)
-    };
-
-    Some((host, port, path))
-}
-
-/// Forward HTTP response data (TcpStream → client) with dataflow tracking
-async fn forward_response_tcp(
-    mut client: TcpStream,
-    mut target: TcpStream,
-    id: u32,
-    state: Arc<AppState>,
-) {
-    let down = Arc::new(AtomicU64::new(0));
-    let down_conn = Arc::new(AtomicU64::new(0));
-    let down_clone = down.clone();
-    let down_conn_clone = down_conn.clone();
-
-    let state_clone = Arc::clone(&state);
-    let flush_handle = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            let d = down_clone.load(Ordering::Relaxed);
-            let dc = down_conn_clone.load(Ordering::Relaxed);
-            let mut conns = state_clone.connections.write().await;
-            if let Some(info) = conns.get_mut(&id) {
-                info.data.down = dc;
-            }
-            drop(conns);
-            let mut total_df = state_clone.total_dataflow.write().await;
-            total_df.down = total_df.down.max(d);
-            total_df.total = total_df.up + total_df.down;
-        }
-    });
-
-    if let Err(e) = track_copy(&mut target, &mut client, &down, &down_conn).await {
-        log::debug!("HTTP response pipe closed: {}", e);
-    }
-
-    flush_handle.abort();
-
-    let d = down.load(Ordering::Relaxed);
-    let dc = down_conn.load(Ordering::Relaxed);
-    {
-        let mut conns = state.connections.write().await;
-        if let Some(info) = conns.get_mut(&id) {
-            info.data.down = dc;
-        }
-    }
-    {
-        let mut total_df = state.total_dataflow.write().await;
-        total_df.down = total_df.down.max(d);
-        total_df.total = total_df.up + total_df.down;
+        Some((host_port, default_port, path))
     }
 }
 
-/// Forward HTTP response data (TlsStream → client) with dataflow tracking
-async fn forward_response_tls(
-    mut client: TcpStream,
-    mut target: TlsStream<TcpStream>,
-    id: u32,
-    state: Arc<AppState>,
-) {
-    let down = Arc::new(AtomicU64::new(0));
-    let down_conn = Arc::new(AtomicU64::new(0));
-    let down_clone = down.clone();
-    let down_conn_clone = down_conn.clone();
-
-    let state_clone = Arc::clone(&state);
-    let flush_handle = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            let d = down_clone.load(Ordering::Relaxed);
-            let dc = down_conn_clone.load(Ordering::Relaxed);
-            let mut conns = state_clone.connections.write().await;
-            if let Some(info) = conns.get_mut(&id) {
-                info.data.down = dc;
-            }
-            drop(conns);
-            let mut total_df = state_clone.total_dataflow.write().await;
-            total_df.down = total_df.down.max(d);
-            total_df.total = total_df.up + total_df.down;
+/// 把客户端首批字节（请求头 + 可能紧随的 body）按目标类型写入上游。
+///
+/// `TargetStream::Proxy` 必须走隧道分帧，否则服务端会把 HTTP 明文字节当成帧头。
+async fn send_initial(target: &mut TargetStream, data: &[u8]) -> std::io::Result<()> {
+    match target {
+        TargetStream::Direct(t) => t.write_all(data).await,
+        TargetStream::Proxy(t) => {
+            let mut framed = Vec::with_capacity(data.len() + 128);
+            super::framing::encode_chunk(data, true, &mut framed);
+            t.write_all(&framed).await
         }
-    });
-
-    if let Err(e) = track_copy(&mut target, &mut client, &down, &down_conn).await {
-        log::debug!("HTTP response pipe closed (TLS): {}", e);
-    }
-
-    flush_handle.abort();
-
-    let d = down.load(Ordering::Relaxed);
-    let dc = down_conn.load(Ordering::Relaxed);
-    {
-        let mut conns = state.connections.write().await;
-        if let Some(info) = conns.get_mut(&id) {
-            info.data.down = dc;
-        }
-    }
-    {
-        let mut total_df = state.total_dataflow.write().await;
-        total_df.down = total_df.down.max(d);
-        total_df.total = total_df.up + total_df.down;
-    }
-}
-
-/// 明文 HTTP 代理走 mux 流时，转发响应回客户端
-async fn forward_response_mux(
-    mut client: TcpStream,
-    stream: MuxStream,
-    id: u32,
-    state: Arc<AppState>,
-) {
-    let (mut reader, _writer) = stream.split();
-
-    let down = Arc::new(AtomicU64::new(0));
-    let down_conn = Arc::new(AtomicU64::new(0));
-    let down_clone = down.clone();
-    let down_conn_clone = down_conn.clone();
-
-    let state_clone = Arc::clone(&state);
-    let flush_handle = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            let d = down_clone.load(Ordering::Relaxed);
-            let dc = down_conn_clone.load(Ordering::Relaxed);
-            let mut conns = state_clone.connections.write().await;
-            if let Some(info) = conns.get_mut(&id) {
-                info.data.down = dc;
-            }
-            drop(conns);
-            let mut total_df = state_clone.total_dataflow.write().await;
-            total_df.down = total_df.down.max(d);
-            total_df.total = total_df.up + total_df.down;
-        }
-    });
-
-    loop {
-        match reader.recv().await {
-            Ok(Some(data)) => {
-                if client.write_all(&data).await.is_err() {
-                    break;
-                }
-                down.fetch_add(data.len() as u64, Ordering::Relaxed);
-                down_conn.fetch_add(data.len() as u64, Ordering::Relaxed);
-            }
-            Ok(None) => break,
-            Err(e) => {
-                log::debug!("HTTP response pipe closed (mux): {}", e);
-                break;
-            }
-        }
-    }
-
-    flush_handle.abort();
-
-    let d = down.load(Ordering::Relaxed);
-    let dc = down_conn.load(Ordering::Relaxed);
-    {
-        let mut conns = state.connections.write().await;
-        if let Some(info) = conns.get_mut(&id) {
-            info.data.down = dc;
-        }
-    }
-    {
-        let mut total_df = state.total_dataflow.write().await;
-        total_df.down = total_df.down.max(d);
-        total_df.total = total_df.up + total_df.down;
+        TargetStream::Mux(s) => s.send(data).await,
     }
 }
 
@@ -257,17 +128,10 @@ pub async fn handle_http_client(mut client: TcpStream, first_byte: u8, state: Ar
 
     if method == "CONNECT" {
         // ---- HTTPS proxy: CONNECT tunnel ----
-        let host_port: Vec<&str> = url.split(':').collect();
-        if host_port.len() != 2 {
-            log::error!("Invalid CONNECT target: {}", url);
-            let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
-            return;
-        }
-        let host = host_port[0].to_string();
-        let port: u16 = match host_port[1].parse() {
-            Ok(p) => p,
-            Err(_) => {
-                log::error!("Invalid CONNECT port: {}", host_port[1]);
+        let (host, port) = match parse_authority(url) {
+            Some(v) => v,
+            None => {
+                log::error!("Invalid CONNECT target: {}", url);
                 let _ = client.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
                 return;
             }
@@ -275,7 +139,8 @@ pub async fn handle_http_client(mut client: TcpStream, first_byte: u8, state: Ar
 
         log::info!("[HTTP CONNECT] {}:{}", host, port);
 
-        let result = match resolve_and_connect(&host, port, true, &state).await {
+        let is_domain = host.parse::<std::net::IpAddr>().is_err();
+        let result = match resolve_and_connect(&host, port, is_domain, &state).await {
             Some(r) => r,
             None => {
                 let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
@@ -284,9 +149,11 @@ pub async fn handle_http_client(mut client: TcpStream, first_byte: u8, state: Ar
         };
 
         // Send 200 Connection Established to client
-        let _ = client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await;
+        let _ = client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await;
 
-        // Bidirectional tunnel
+        // Bidirectional tunnel（含 half-close 语义）
         forward_target_stream(client, result.target, result.id, state.clone()).await;
 
         // Cleanup
@@ -305,7 +172,8 @@ pub async fn handle_http_client(mut client: TcpStream, first_byte: u8, state: Ar
 
         log::info!("[HTTP {}] {}:{}{}", method, host, port, path);
 
-        let mut result = match resolve_and_connect(host, port, true, &state).await {
+        let is_domain = host.parse::<std::net::IpAddr>().is_err();
+        let mut result = match resolve_and_connect(host, port, is_domain, &state).await {
             Some(r) => r,
             None => {
                 let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
@@ -320,47 +188,18 @@ pub async fn handle_http_client(mut client: TcpStream, first_byte: u8, state: Ar
         let rest = &buf[request_line.len()..headers_end];
         let header_body = rest.strip_prefix(b"\r\n").unwrap_or(rest);
         new_req.extend_from_slice(header_body);
+        // 与请求头同批到达的 body 必须一并转发，否则 POST/PUT 会丢数据
+        new_req.extend_from_slice(&buf[headers_end..]);
 
-        // Send modified request to target
-        match &mut result.target {
-            TargetStream::Direct(t) => {
-                if let Err(e) = t.write_all(&new_req).await {
-                    log::error!("Failed to send HTTP request to direct target: {}", e);
-                    let mut conns = state.connections.write().await;
-                    conns.remove(&result.id);
-                    return;
-                }
-            }
-            TargetStream::Proxy(t) => {
-                if let Err(e) = t.write_all(&new_req).await {
-                    log::error!("Failed to send HTTP request via proxy: {}", e);
-                    let mut conns = state.connections.write().await;
-                    conns.remove(&result.id);
-                    return;
-                }
-            }
-            TargetStream::Mux(s) => {
-                if let Err(e) = s.send(&new_req).await {
-                    log::error!("Failed to send HTTP request via mux: {}", e);
-                    let mut conns = state.connections.write().await;
-                    conns.remove(&result.id);
-                    return;
-                }
-            }
+        if let Err(e) = send_initial(&mut result.target, &new_req).await {
+            log::error!("Failed to send HTTP request to {}:{}: {}", host, port, e);
+            let mut conns = state.connections.write().await;
+            conns.remove(&result.id);
+            return;
         }
 
-        // Forward response back to client
-        match result.target {
-            TargetStream::Direct(target) => {
-                forward_response_tcp(client, target, result.id, state.clone()).await;
-            }
-            TargetStream::Proxy(target) => {
-                forward_response_tls(client, target, result.id, state.clone()).await;
-            }
-            TargetStream::Mux(target) => {
-                forward_response_mux(client, target, result.id, state.clone()).await;
-            }
-        }
+        // 双向转发：后续客户端数据（body / keep-alive / WebSocket）与响应都走同一管道
+        forward_target_stream(client, result.target, result.id, state.clone()).await;
 
         // Cleanup
         let mut conns = state.connections.write().await;

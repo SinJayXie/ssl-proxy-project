@@ -1,0 +1,17 @@
+{
+    "version":  "2.5.1",
+    "changelog":  [
+                      "Updates: installers are verified with SHA-256 and an Ed25519 signature before running; unsigned or tampered packages are refused",
+                      "Updates: downgrade packages are rejected and the manifest download URL must use HTTPS",
+                      "Server: SSRF protection also blocks NAT64, 6to4, Teredo, site-local and IPv4-compatible IPv6 targets",
+                      "Server: repeated protocol authentication failures are rate-limited per IP; normal HTTP visitors are not counted",
+                      "Server: the real-site fallback caps request bodies at 8 MB even for chunked uploads",
+                      "Protocol v3: every handshake carries a random nonce plus a server-side replay cache",
+                      "Anti-fingerprinting: the first TLS records are padded on both sides and ALPN offers h2 + http/1.1",
+                      "Server: optional real-site reverse-proxy fallback with HTTP/2 and TLS session resumption",
+                      "Updates: mandatory prompt for new versions with an hourly re-check"
+                  ],
+    "downloadUrl":  "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.5.1_x64-setup.exe",
+    "sha256":  "4b75bc831fdfa040a692357b997fd924d5fc8c7bb169b448371c11af3e86aaf3",
+    "signature":  "8741d6bd77df74588aa141cf8176d755102236be0b67466deb4ce0b5cdd626b4b553e7e66c713a0c42bff2fbf218da445e40cc76c700346d043e19ab2cd24301"
+}

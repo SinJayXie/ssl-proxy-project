@@ -11,7 +11,9 @@ param(
     [string]$Makensis,
     [switch]$SkipClient,
     [switch]$SkipServer,
-    [switch]$NoUpx
+    [switch]$NoUpx,
+    # version.json 中 downloadUrl 的目录前缀
+    [string]$DownloadBase = 'https://hk.dishuyl.cn/ssl-proxy/win'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -99,6 +101,41 @@ if (-not $SkipClient) {
         (Join-Path $GuiCrate 'installer\installer.nsi')
     if ($LASTEXITCODE -ne 0) { throw "makensis 失败（退出码 $LASTEXITCODE）" }
     Write-Host "    客户端安装包: $setup"
+
+    # 发布清单：版本号取自 Cargo.toml，sha256/signature 来自本次产物，
+    # changelog 沿用项目根目录 version.json 中已有的列表。
+    $setupHash = (Get-FileHash -Algorithm SHA256 $setup).Hash.ToLower()
+    Write-Host "    安装包 SHA256: $setupHash"
+
+    $signKey = if ($env:SSL_PROXY_UPDATE_KEY) { $env:SSL_PROXY_UPDATE_KEY } else { Join-Path $Root '.secrets\update-signing-key.der' }
+    if (-not (Test-Path $signKey)) {
+        throw "未找到签名私钥 $signKey；新版客户端会拒绝执行未签名更新（可用 SSL_PROXY_UPDATE_KEY 指定私钥）"
+    }
+
+    Write-Host '==> Ed25519 签名（update-signer）'
+    $sig = "$(& cargo run -q -p update-signer -- sign $signKey $setup)".Trim()
+    if ($LASTEXITCODE -ne 0) { throw "安装包签名失败（退出码 $LASTEXITCODE）" }
+    Write-Host "    安装包签名: $sig"
+
+    $manifestPath = Join-Path $Root 'version.json'
+    $changelog = @()
+    if (Test-Path $manifestPath) {
+        $existing = Get-Content $manifestPath -Raw | ConvertFrom-Json
+        if ($existing.PSObject.Properties.Name -contains 'changelog') {
+            $changelog = @($existing.changelog)
+        }
+    }
+    $manifest = [ordered]@{
+        version     = $guiVersion
+        changelog   = $changelog
+        downloadUrl = "$DownloadBase/SSLProxyClient_${guiVersion}_x64-setup.exe"
+        sha256      = $setupHash
+        signature   = $sig
+    }
+    # 必须写成无 BOM 的 UTF-8，否则客户端 serde_json 解析会失败
+    $json = $manifest | ConvertTo-Json -Depth 5
+    [System.IO.File]::WriteAllText($manifestPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+    Write-Host "    发布清单: $manifestPath"
 }
 
 if (-not $SkipServer) {

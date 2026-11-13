@@ -50,6 +50,8 @@ pub struct ServerConfigYaml {
     pub password: Option<String>,
     /// 是否接受 mux（多路复用）连接，缺省 true
     pub mux: Option<bool>,
+    /// 允许 TCP 隧道连接回环 / 内网目标（默认 false，防 SSRF）
+    pub allow_private_targets: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -66,6 +68,8 @@ pub struct TlsConfigYaml {
 pub struct StaticSourcesConfigYaml {
     pub html: Option<PathBuf>,
     pub index: Option<String>,
+    /// 真实站点回落地址（绝对 URL，例如 `https://example.com`）
+    pub fallback_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -147,6 +151,13 @@ pub struct Cli {
     #[arg(long, help = "disable multiplexed (mux) connections")]
     pub no_mux: bool,
 
+    /// 允许隧道访问回环 / 内网目标（默认拒绝，防 SSRF）
+    #[arg(
+        long,
+        help = "allow tunneling to loopback/private targets (default: denied, SSRF protection)"
+    )]
+    pub allow_private_targets: bool,
+
     /// TLS 证书路径 (PEM)；缺省时自动生成自签证书
     #[arg(long, value_name = "FILE", help = "TLS certificate path (PEM); self-signed cert is generated if not provided")]
     pub cert: Option<PathBuf>,
@@ -162,6 +173,14 @@ pub struct Cli {
     /// 静态伪装站点根目录
     #[arg(long, value_name = "DIR", help = "static site root directory")]
     pub html: Option<PathBuf>,
+
+    /// 真实站点回落地址（绝对 URL，例如 https://example.com）
+    #[arg(
+        long,
+        value_name = "URL",
+        help = "reverse-proxy fallback to a real site (absolute URL, enables HTTP/2)"
+    )]
+    pub fallback_url: Option<String>,
 
     /// 日志目录
     #[arg(long, value_name = "DIR", help = "log output directory (rotated by size)")]
@@ -183,6 +202,8 @@ pub struct ServerConfig {
     pub password: String,
     /// 是否接受 mux 连接
     pub mux: bool,
+    /// 是否允许隧道访问回环 / 内网目标
+    pub allow_private_targets: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +219,8 @@ pub struct TlsConfig {
 pub struct StaticSourcesConfig {
     pub html: Option<PathBuf>,
     pub index: String,
+    /// 真实站点回落地址；`None` 时只提供静态站点
+    pub fallback_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -257,6 +280,10 @@ impl AppConfig {
         // mux 默认开启；`--no-mux` 或 yaml `mux: false` 可关闭
         let mux = !cli.no_mux && yaml.server.mux.unwrap_or(true);
 
+        // SSRF 防护默认开启；CLI 或 YAML 可显式放行回环 / 内网目标
+        let allow_private_targets =
+            cli.allow_private_targets || yaml.server.allow_private_targets.unwrap_or(false);
+
         // ---- tls ----
         // 证书/私钥均缺省时，运行时自动生成自签证书
         let cert = cli.cert.or(yaml.tls.cert);
@@ -277,6 +304,11 @@ impl AppConfig {
             .static_sources
             .index
             .unwrap_or_else(|| "index.html".to_string());
+        let fallback_url = cli
+            .fallback_url
+            .or(yaml.static_sources.fallback_url)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
 
         // ---- log ----
         let log_dir = cli
@@ -320,13 +352,18 @@ impl AppConfig {
                 port,
                 password,
                 mux,
+                allow_private_targets,
             },
             tls: TlsConfig {
                 cert: cert.clone(),
                 key: key.clone(),
                 sni,
             },
-            static_sources: StaticSourcesConfig { html, index },
+            static_sources: StaticSourcesConfig {
+                html,
+                index,
+                fallback_url,
+            },
             log: LogConfig {
                 dir: log_dir,
                 level: log_level,
@@ -374,6 +411,8 @@ mod tests {
         assert_eq!(cfg.server.listen, "0.0.0.0");
         assert_eq!(cfg.server.port, DEFAULT_PORT);
         assert_eq!(cfg.server.password.len(), 12, "缺省应生成 12 位随机密码");
+        assert!(cfg.server.mux, "mux 默认开启");
+        assert!(!cfg.server.allow_private_targets, "SSRF 防护默认开启");
 
         assert!(cfg.tls.cert.is_none() && cfg.tls.key.is_none());
         assert!(cfg.tls.sni.is_none());
@@ -403,6 +442,7 @@ mod tests {
                 port: Some(7000),
                 password: Some("from-yaml".to_string()),
                 mux: None,
+                allow_private_targets: None,
             },
             tls: TlsConfigYaml {
                 cert: Some(PathBuf::from("certs/a.crt")),
@@ -412,6 +452,7 @@ mod tests {
             static_sources: StaticSourcesConfigYaml {
                 html: Some(PathBuf::from("./html")),
                 index: Some("main.html".to_string()),
+                fallback_url: None,
             },
             log: LogConfigYaml {
                 dir: Some(PathBuf::from("./mylogs")),
@@ -458,10 +499,12 @@ mod tests {
                 port: Some(7000),
                 password: Some("from-yaml".to_string()),
                 mux: None,
+                allow_private_targets: None,
             },
             static_sources: StaticSourcesConfigYaml {
                 html: Some(PathBuf::from("./yaml-html")),
                 index: None,
+                fallback_url: None,
             },
             ..Default::default()
         };

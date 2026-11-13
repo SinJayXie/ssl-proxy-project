@@ -65,6 +65,8 @@ pub struct AppShell {
     show_errors: bool,
     errors: Vec<AppError>,
     show_update: bool,
+    /// 强制更新下载失败时的提示
+    update_failed: bool,
     /// 手动检查更新且已是最新版本时的提示弹窗
     no_update_notice: bool,
     update_info: Option<CheckUpdateResult>,
@@ -146,19 +148,35 @@ impl AppShell {
             }
         });
 
-        let update_watch = cx.spawn(async move |this, cx| loop {
-            smol::Timer::after(Duration::from_millis(250)).await;
+        let update_watch = cx.spawn(async move |this, cx| {
+            let mut last_periodic = Instant::now();
+            loop {
+                smol::Timer::after(Duration::from_millis(250)).await;
 
-            if this.upgrade().is_none() {
-                break;
-            }
-
-            if UPDATE_REQUESTED.swap(false, Ordering::Relaxed) {
-                let updated = this.update(cx, |shell, cx| {
-                    shell.check_updates(true, cx);
-                });
-                if updated.is_err() {
+                if this.upgrade().is_none() {
                     break;
+                }
+
+                if UPDATE_REQUESTED.swap(false, Ordering::Relaxed) {
+                    let updated = this.update(cx, |shell, cx| {
+                        shell.check_updates(true, cx);
+                    });
+                    if updated.is_err() {
+                        break;
+                    }
+                }
+
+                // 常驻进程也要周期性检查，保证强制更新能被发现。
+                if last_periodic.elapsed() >= Duration::from_secs(60 * 60) {
+                    last_periodic = Instant::now();
+                    let updated = this.update(cx, |shell, cx| {
+                        if !shell.show_update && !shell.downloading {
+                            shell.check_updates(false, cx);
+                        }
+                    });
+                    if updated.is_err() {
+                        break;
+                    }
                 }
             }
         });
@@ -195,6 +213,7 @@ impl AppShell {
             show_errors: false,
             errors: Vec::new(),
             show_update: false,
+            update_failed: false,
             no_update_notice: false,
             update_info: None,
             downloading: false,
@@ -319,11 +338,14 @@ impl AppShell {
         };
 
         self.downloading = true;
+        self.update_failed = false;
         self.download_percent = 0;
         cx.notify();
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<DownloadProgress>();
-        let handle = self.core.download_update(info.download_url, sender);
+        let handle = self
+            .core
+            .download_update(info.download_url, info.sha256, info.signature, sender);
 
         cx.spawn(async move |this, cx| {
             while let Some(progress) = receiver.recv().await {
@@ -339,6 +361,7 @@ impl AppShell {
                 log::error!("Update download failed: {err}");
                 let _ = this.update(cx, |shell, cx| {
                     shell.downloading = false;
+                    shell.update_failed = true;
                     cx.notify();
                 });
             }
@@ -553,6 +576,10 @@ impl AppShell {
                     .child(format!("• {item}")),
             );
         }
+        let changes = changes
+            .id("update-changelog")
+            .max_h(px(240.))
+            .overflow_y_scrollbar();
 
         let footer: AnyElement = if self.downloading {
             h_flex()
@@ -573,24 +600,13 @@ impl AppShell {
                 )
                 .into_any_element()
         } else {
-            h_flex()
-                .gap_2()
-                .justify_end()
-                .child(
-                    Button::new("update-later")
-                        .label(i18n::t("UPDATE_LATER"))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_update = false;
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("update-download")
-                        .primary()
-                        .label(i18n::t("UPDATE_DOWNLOAD"))
-                        .on_click(cx.listener(|this, _, _, cx| this.start_download(cx))),
-                )
-                .into_any_element()
+            h_flex().justify_end().child(
+                Button::new("update-download")
+                    .primary()
+                    .label(i18n::t("UPDATE_DOWNLOAD"))
+                    .on_click(cx.listener(|this, _, _, cx| this.start_download(cx))),
+            )
+            .into_any_element()
         };
 
         let card = v_flex()
@@ -627,6 +643,20 @@ impl AppShell {
                     )),
             )
             .child(changes)
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().warning)
+                    .child(i18n::t("UPDATE_REQUIRED")),
+            )
+            .when(self.update_failed, |this| {
+                this.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().danger)
+                        .child(i18n::t("UPDATE_FAILED")),
+                )
+            })
             .child(footer)
             .into_any_element();
 

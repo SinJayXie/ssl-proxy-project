@@ -4,8 +4,8 @@
 
 基于 Rust 的双端代理方案：一个 Windows 桌面客户端（GPUI）加一个 TLS 代理服务端，客户端与服务端通过私有协议通信。
 
-- 客户端：`crates/gui`（包名 `ssl-proxy-gui`，安装后为 `ssl-proxy-client.exe`），当前版本 **2.3.5**
-- 服务端：`crates/svr`（`ssl-proxy-svr`），当前版本 **1.2.0**
+- 客户端：`crates/gui`（包名 `ssl-proxy-gui`，安装后为 `ssl-proxy-client.exe`），当前版本 **2.5.0**
+- 服务端：`crates/svr`（`ssl-proxy-svr`），当前版本 **1.5.0**
 - 许可证：[MIT](LICENSE)
 
 ## 功能
@@ -14,6 +14,7 @@
 
 - 单端口协议自动识别，同时支持 SOCKS5 与 HTTP / HTTPS（CONNECT）代理
 - 上游代理走 TLS 隧道：HMAC-SHA256 认证、帧填充抗指纹，可选多路复用（mux）
+- 浏览器式 ALPN（`h2`、`http/1.1`）与首条 record 填充，握手不再呈现异常小包特征
 - 规则路由：HOST / GEO 规则优先，未命中时按 `directs` 直连地区回退
 - GeoIP 地理识别（`assets/GeoDB.dat`）
 - 运行概览、近 7 天流量统计、连接列表与按组断开、实时日志
@@ -23,14 +24,15 @@
 ### 服务端
 
 - 单 TLS 端口按协议识别：私有协议 → 上游转发，其余流量 → 伪装站点
+- 可选真实站点回落（反代），支持 HTTP/1.1 与 HTTP/2
 - 自签证书零配置启动，密码认证，限流与黑名单，日志自动轮转
-- 支持多路复用会话
+- 支持多路复用会话与 TLS session resumption（ticket + session cache）
 
 ## 快速开始
 
 ### 1. 安装客户端
 
-运行 `SSLProxyClient_2.3.5_x64-setup.exe`（来自 `dist/client`，或 `version.json` 中的下载地址）。安装到 `%LOCALAPPDATA%\SSLProxyClient`，`GeoDB.dat` 会放在 exe 同目录，旧版本原地覆盖升级。首次启动需确认免责声明。
+运行 `SSLProxyClient_2.5.1_x64-setup.exe`（来自 `dist/client`，或 `version.json` 中的下载地址）。安装到 `%LOCALAPPDATA%\SSLProxyClient`，`GeoDB.dat` 会放在 exe 同目录，旧版本原地覆盖升级。首次启动需确认免责声明。
 
 ### 2. 让应用走本地代理
 
@@ -157,6 +159,7 @@ server:
   port: 1888
   password: "your-strong-password"   # 必须与客户端的认证密钥一致
   mux: true                          # false 时拒绝多路复用会话
+  allow-private-targets: false       # 默认拒绝回环/内网目标（SSRF 防护）
 
 tls:
   cert: "./certs/server.crt"         # 可选；缺省时自动生成自签证书
@@ -164,6 +167,7 @@ tls:
 
 static-sources:
   html: "./html"                     # 伪装站点，缺省时统一返回 404
+  # fallback-url: "https://example.com"  # 真实站点回落并启用 HTTP/2
 
 rate-limit:
   max-requests: 300
@@ -186,7 +190,7 @@ rate-limit:
 ## 版本与更新
 
 - `crates/gui/Cargo.toml` 的 `version` 同时决定 exe 元数据、安装包命名与应用内版本号
-- `crates/gui/version.json` 是在线更新清单（`version` / `changelog` / `downloadUrl`），发版时需上传到 `https://hk.dishuyl.cn/ssl-proxy/version.json`
+- 项目根目录的 `version.json` 是在线更新清单（`version` / `changelog` / `downloadUrl` / `sha256` / `signature`），由 `scripts/build.ps1` 自动生成；发版时上传到 `https://hk.dishuyl.cn/ssl-proxy/version.json`
 - 应用内「更新日志」页面由 `crates/gui/src/ui/pages/changelog.rs` 维护，发版时与 `version.json` 同步补充
 
 ## 更多文档

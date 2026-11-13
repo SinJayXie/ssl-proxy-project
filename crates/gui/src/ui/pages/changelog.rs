@@ -12,6 +12,47 @@ struct Entry {
 
 const CHANGELOG: &[Entry] = &[
     Entry {
+        version: "2.5.1",
+        date: "2026-11-13",
+        changes: &[
+            "Updates: installers are verified with SHA-256 and an Ed25519 signature before running; unsigned or tampered packages are refused",
+            "Updates: downgrade packages are rejected and the manifest download URL must use HTTPS",
+            "Server: SSRF protection also blocks NAT64, 6to4, Teredo, site-local and IPv4-compatible IPv6 targets",
+            "Server: repeated protocol authentication failures are rate-limited per IP; normal HTTP visitors are not counted",
+            "Server: the real-site fallback caps request bodies at 8 MB even for chunked uploads",
+            "Protocol v3: every handshake carries a random nonce plus a server-side replay cache",
+            "Anti-fingerprinting: the first TLS records are padded on both sides and ALPN offers h2 + http/1.1",
+            "Server: optional real-site reverse-proxy fallback with HTTP/2 and TLS session resumption",
+            "Updates: mandatory prompt for new versions with an hourly re-check",
+        ],
+    },
+    Entry {
+        version: "2.5.0",
+        date: "2026-11-13",
+        changes: &[
+            "Updates: when a new version is found the prompt is mandatory and cannot be dismissed; the client also re-checks hourly",
+            "Anti-fingerprinting: the first TLS records are padded on both sides, so handshakes no longer start with an unusually small packet",
+            "Client: TLS now offers h2 and http/1.1 via ALPN, matching a normal browser handshake",
+            "Server: optional real-site reverse-proxy fallback with HTTP/2, so unauthenticated probes see a real website",
+            "Server: TLS session resumption reduces reconnect latency",
+        ],
+    },
+    Entry {
+        version: "2.4.0",
+        date: "2026-11-13",
+        changes: &[
+            "Protocol v3: every handshake carries a random nonce and the server keeps a replay cache, so captured handshakes can no longer be reused",
+            "Security: servers reject loopback / private / cloud-metadata targets for both TCP and UDP (opt-in with allow-private-targets)",
+            "DNS: a failed local lookup now falls back to the proxy instead of dropping the connection",
+            "SOCKS5: IPv6 targets, robust fragmented handshake parsing and standards-compliant replies",
+            "HTTP proxy: request bodies, keep-alive connections and WebSocket upgrades now work; IPv6 CONNECT targets are supported",
+            "Direct connections now honour half-close, so protocols that shut down one direction keep receiving data",
+            "Mux: per-stream 256 KB flow-control window keeps one slow stream from blocking the shared tunnel",
+            "Mux: stale shared tunnels are retried with a fresh connection instead of failing the first request",
+            "Server: mux streams are cleaned up on disconnect and idle sessions close after 90 seconds",
+        ],
+    },
+    Entry {
         version: "2.3.5",
         date: "2026-11-13",
         changes: &[

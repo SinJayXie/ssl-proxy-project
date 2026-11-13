@@ -146,11 +146,13 @@ check_is_http_protocol(首包)？
 RateLimit.record(peer_ip) ── 被限流/黑名单 → 直接断开
    │ 通过
    ▼
-StaticSourcesService.handle：
-   1. httparse 解析请求（失败 → 400）
-   2. 无 base 目录 → 404
-   3. sanitize_path 防路径穿越（`..`/绝对路径/盘符 → 403）
-   4. GET → 200 + gzip 流式输出（Connection: close 定界 body）；HEAD → 仅响应头；文件缺失 → 404
+配置了 fallback-url？
+   ├── 是 → FallbackService（hyper 反代真实站点，支持 h1 / h2，固定目标）
+   └── 否 → StaticSourcesService.handle：
+        1. httparse 解析请求（失败 → 400）
+        2. 无 base 目录 → 404
+        3. sanitize_path 防路径穿越（`..`/绝对路径/盘符 → 403）
+        4. GET → 200 + gzip 流式输出（Connection: close 定界 body）；HEAD → 仅响应头；文件缺失 → 404
 ```
 
 [`InitialThenStream`](file:///e:/myProjects/ssl-proxy/ssl-proxy-svr/src/services/initial_stream.rs) 把"已读出的首包字节"与"剩余 TLS 流"拼接成一个连续 `AsyncRead`，供后续解析器或管道直接消费。
@@ -170,33 +172,43 @@ ProxyService.authenticate：
 
 ---
 
-## 5. 私有协议设计（v2）
+## 5. 私有协议设计（v3，兼容 v2）
 
 ### 5.1 首包格式
 
+v3（当前客户端）：
+
 ```text
-+----+----+----+---------------+--------+----------+----------+----------+
-| 10 | ff | 02 |   timestamp   |  port  | hostLen  |   host   |   mac    |
-+----+----+----+---------------+--------+----------+----------+----------+
- 1B   1B   1B     8B BE(u64)      2B BE     1B       N byte     32B
++----+----+----+---------------+-----------------+--------+----------+----------+----------+------+
+| 10 | ff | 03 |   timestamp   |      nonce      |  port  | hostLen  |   host   |   mac    | ext? |
++----+----+----+---------------+-----------------+--------+----------+----------+----------+------+
+ 1B   1B   1B     8B BE(u64)       8B BE(u64)       2B BE     1B       N byte     32B      0/1B
 ```
 
 | 字段 | 长度 | 说明 |
 | ---- | ---- | ---- |
 | 魔数 | 2B | 固定 `0x10 0xFF` |
-| version | 1B | 固定 `0x02`（v1 已废弃，硬切不兼容） |
+| version | 1B | `0x03`（v2 仍兼容解析，`0x02` 无 nonce） |
 | timestamp | 8B | Unix 秒级时间戳，大端序 |
+| nonce | 8B | 客户端随机数，参与签名，保证同一秒内多条连接 MAC 互不相同 |
 | port | 2B | 目标端口，大端序 |
-| hostLen | 1B | 目标主机名长度（N，不能为 0） |
+| hostLen | 1B | 目标主机名长度（N；mux 连接为 0） |
 | host | N B | 目标主机名（UTF-8） |
-| mac | 32B | `HMAC-SHA256(password, "ssl-proxy-v2" || timestamp || port || host)` |
+| mac | 32B | `HMAC-SHA256(password, "ssl-proxy-v3" || timestamp || nonce || port || host)` |
+| ext | 1B | 扩展位：bit0 = 请求 UDP，bit1 = 请求 mux 流级窗口；v3 新客户端固定携带（可为 0） |
+
+v2 兼容格式（`ver=0x02`）没有 nonce 字段，MAC 域为 `"ssl-proxy-v2" || timestamp || port || host`；
+服务端接受 v2 但不做重放缓存（同秒同目标 MAC 相同，无法安全去重），建议客户端升级到 v3。
+
 
 ### 5.2 认证与重放防护
 
 1. **密码不过线**：客户端只发送 HMAC，服务端用本地密码重算并做常量时间比对（`verify_slice`）；
 2. **时间窗**：`|now - timestamp| <= 120s`，超出直接拒绝，窗口外无法重放；
-3. **防篡改**：timestamp / port / host 均参与签名，任一字段被改都会导致 MAC 校验失败；
-4. 校验失败一律回落为 HTTP 伪装响应，不返回任何协议特征。
+3. **窗口内重放**：v3 的 nonce 参与签名，服务端按 MAC 记录 120s 内已用首包（`libs/replay_guard.rs`），
+   重复首包一律回落伪装站点。mux 首包被重放可直接 OPEN 任意目标，重放缓存是关键防线；
+4. **防篡改**：timestamp / nonce / port / host 均参与签名，任一字段被改都会导致 MAC 校验失败；
+5. 校验失败一律回落为 HTTP 伪装响应，不返回任何协议特征。
 
 ### 5.3 隧道应答（双向认证）
 
@@ -209,7 +221,7 @@ ProxyService.authenticate：
  1B   1B                 32B
 ```
 
-`ack_mac = HMAC-SHA256(password, "ssl-proxy-v2-ack" || timestamp || port || host)`。
+`ack_mac = HMAC-SHA256(password, "ssl-proxy-v3-ack" || timestamp || nonce || port || host)`。
 
 客户端必须校验该 MAC——它证明对端确实持有密码，即使 `danger_accept_invalid_certs`
 跳过了证书校验，中间人伪造的“成功应答”也会被识破。首包字节已被消费，**不参与后续转发**。
@@ -225,19 +237,21 @@ ProxyService.authenticate：
   1B      2B       1B       len       padLen
 ```
 
-- `flag = 0` 普通数据帧；`flag = 1` 表示此后切换为裸字节流；
+- `flag = 0` 普通数据帧；`flag = 1` 表示此后切换为裸字节流；`flag = 2` UDP 数据报；
+  `flag = 3` 纯填充帧（接收方丢弃 payload）；
+- **首条 record 整形**：v3 客户端把「认证首包 + 纯填充帧」合并为一次 `write_all`，
+  服务端 v3 ACK 也追加纯填充帧，避免 60~100B / 34B 的异常小包特征；
 - **上行（客户端→服务端）全程分帧**：≤2KB 的小包随机切片（64~512B）并随机填充（0~256B），
   把 ClientHello / 请求头的长度直方图打平；大包整段一帧、仅 0~32B 填充，上传吞吐几乎无损；
 - **下行只在前 16KB（覆盖 TLS 握手）内 padding**，之后发 `RAW` 标记帧并裸透传，
   下载带宽与速度不受影响；
-- v2 首包随首个上行帧一起被填充，消除 59 字节异常小记录的特征；
 - 编码结果攒批后一次 `write_all`，不增加 syscall。
 
 **帧格式必须与客户端 [`framing.rs`](file:///e:/myProjects/ssl-proxy/ssl-proxy-project/crates/gui/src/core/proxy/framing.rs) 保持一致。**
 
 ### 5.5 Mux 多路复用（参考 trojan-go + smux）
 
-`hostLen = 0` 的 v2 首包表示「mux 连接」：认证通过后整条 TLS 连接进入复用模式，
+`hostLen = 0` 的 v3 首包表示「mux 连接」：认证通过后整条 TLS 连接进入复用模式，
 每个目标连接对应一个逻辑流（sid），省掉反复的 TCP + TLS 握手。
 
 ```text
@@ -254,10 +268,16 @@ ProxyService.authenticate：
 | 2 FIN | 发送方向结束（半关闭） |
 | 3 RST | 中止流 |
 | 4 / 5 | PING / PONG 保活 |
+| 6 / 7 | UDP 数据报 / 关闭 UDP 会话 |
+| 8 WINDOW | 流级窗口返还，payload = `credit u32 BE` |
+| 9 PADDING | 纯填充帧，接收方丢弃 payload |
 
 - 单连接最多 256 条并发流，客户端最多复用 4 条连接（满了再建新连接）；
-- 流控为**连接级背压**：某流命令缓冲满时暂停整条连接读取，实现简单、单流大文件不受影响；
-- 客户端每 25s 发 PING 保活；连接断开时所有流统一结束；
+- **流级窗口**：客户端在 mux 首包请求 `EXT_MUX_WINDOW`，服务端 ACK 置位 `CAP_MUX_WINDOW`
+  后，双方为每条流维护 256KB 独立窗口。发送方按字节申请额度，接收方实际写入后回
+  `WINDOW` 帧返还；单个慢流不再阻塞整条连接（旧客户端/旧服务端自动回退连接级背压）；
+- 流任务由连接统一托管：连接结束时 abort 所有流，半开上游不会长期泄漏；
+- 连接空闲 90s（无任何帧）自动关闭；客户端每 25s 发 PING 保活；
 - DATA 帧继续做小包随机 padding，mux 帧头不会成为新的长度指纹；
 - 服务端可用 `--no-mux`（或 YAML `server.mux: false`）关闭 mux，关闭后 mux 首包直接拒绝。
 
@@ -282,7 +302,10 @@ ProxyService.authenticate：
 
 - 提供 `--cert/--key`：读取 PEM 证书链 + 私钥（兼容 PKCS#8 / PKCS#1 / SEC1）；
 - 两者均缺省：`rcgen` 生成 ECDSA P-256 自签证书，SAN 为 `tls.sni`（若配置）+ `localhost` + `127.0.0.1`，仅供本地开发；
-- ALPN 只广告 `http/1.1`，与回落时的 HTTP/1.1 伪装保持一致，避免“协商了 h2 却回 HTTP/1.1”的破绽；
+- ALPN 默认只广告 `http/1.1`；配置 `static-sources.fallback-url` 时同时广告 `h2` 与 `http/1.1`，
+  由 hyper 回落服务分别处理 h1 / h2；
+- 启用 TLS session resumption：TLS 1.3 使用 `Ticketer`，TLS 1.2 使用 256 条内存 session cache，
+  只影响重连性能，不改变认证与重放模型；
 - 客户端证书校验关闭（`with_no_client_auth`）。
 
 ### 6.4 优雅关闭
@@ -304,8 +327,10 @@ ProxyService.authenticate：
 | `--port <PORT>` | 监听端口，默认 `1888` |
 | `--pwd <PWD>` | 代理密码，缺省随机 12 位 |
 | `--no-mux` | 关闭 mux 多路复用（默认开启） |
+| `--allow-private-targets` | 允许隧道访问回环 / 内网目标（默认拒绝，防 SSRF） |
 | `--cert/--key <FILE>` | TLS 证书/私钥（PEM），须成对提供 |
 | `--html <DIR>` | 静态伪装站点根目录 |
+| `--fallback-url <URL>` | 真实站点回落地址（启用 hyper 反代与 HTTP/2） |
 | `--log-dir <DIR>` / `--log-level <LEVEL>` | 日志目录 / 级别 |
 
 ### 快速启动示例
@@ -329,12 +354,15 @@ ssl-proxy-svr --cert ./certs/server.crt --key ./certs/server.key --html ./html
 | ---- | -------- |
 | 路径穿越（`../`、绝对路径、盘符） | [`sanitize_path`](file:///e:/myProjects/ssl-proxy/ssl-proxy-project/crates/svr/src/services/static_sources_service.rs) 逐组件校验，违规返回 403 |
 | 端口扫描 / 暴力请求 | 每 IP 限流 + 黑名单封禁 |
-| 首包重放 | 时间戳（±120s 窗口）+ 参与签名的 HMAC-SHA256 |
+| 首包重放 | 时间戳（±120s 窗口）+ nonce 签名 + 120s 重放缓存（v3） |
+| 服务器被当作内网跳板 | TCP / UDP 统一 SSRF 校验：解析后拦截回环、内网、CGNAT、metadata 地址 |
 | 密码泄露 / 暴力破解 | 密码不参与传输，仅发送 HMAC；失败直接回落静态站点，不暴露代理特征 |
-| 首包篡改 | host / port / timestamp 全部参与签名，常量时间比对 |
+| 首包篡改 | host / port / timestamp / nonce 全部参与签名，常量时间比对 |
 | 中间人伪造服务端 | 客户端校验 ACK MAC（双向认证），跳过证书校验时仍能识别伪造应答 |
-| 主动探测 / TLS 指纹 | ALPN 广告 `http/1.1`，非协议流量回落为正常 HTTP/1.1 站点 |
+| 主动探测 / TLS 指纹 | ALPN 默认 `http/1.1`；启用真实站点回落时广告 `h2,http/1.1`，非协议流量回落为正常站点 |
 | TLS-in-TLS 流量指纹 | 隧道分帧 + 随机 padding 打散 record 长度；下行握手后裸透传 |
+| 首条 TLS record 过小 | v3 首包与 ACK 均批量追加纯填充帧，避免 60~100B / 34B 的异常小包 |
+| 主动探测看到假站点 | 可选 `fallback-url` 反代真实站点，支持 h1/h2，固定目标防止开放代理 |
 | 频繁 TLS 握手特征 | mux 复用：一条 TLS 连接承载多条流（trojan-go 式），显著减少握手次数 |
 | 非法协议 | 非 HTTP 且认证失败统一回落，不返回错误特征 |
 

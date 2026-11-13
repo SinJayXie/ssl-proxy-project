@@ -17,6 +17,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -33,9 +34,10 @@ use crate::config::{load_yaml, AppConfig, Cli};
 use crate::core::logger::{init, RotatingFileWriter};
 use crate::core::service::ServiceRegister;
 use crate::libs::rate_limit::RateLimitConfig;
+use crate::services::fallback_service::FallbackService;
 use crate::services::forward_service::ForwardService;
 use crate::services::proxy_service::ProxyService;
-use crate::services::socket_service::{load_tls_config, SocketService};
+use crate::services::socket_service::{load_tls_config_with_alpn, SocketService};
 use crate::services::static_sources_service::StaticSourcesService;
 use crate::services::udp_relay_service::UdpSettings;
 
@@ -65,10 +67,19 @@ async fn main() -> Result<()> {
     );
 
     // 5. 加载 TLS（缺省自动生成自签证书）
-    let tls_cfg = load_tls_config(
+    // 配置了真实站点回落时广告 h2，让回落与真实站点一致。
+    let fallback = match &app_cfg.static_sources.fallback_url {
+        Some(url) => Some(Arc::new(FallbackService::new(
+            url,
+            Duration::from_secs(10),
+        )?)),
+        None => None,
+    };
+    let tls_cfg = load_tls_config_with_alpn(
         app_cfg.tls.cert.as_deref(),
         app_cfg.tls.key.as_deref(),
         app_cfg.tls.sni.as_deref(),
+        fallback.is_some(),
     )
     .context("load TLS cert/key")?;
 
@@ -82,13 +93,15 @@ async fn main() -> Result<()> {
         return Err(e);
     }
 
+    let rate_limit = RateLimitConfig {
+        max_requests: app_cfg.rate_limit.max_requests,
+        rate_time: app_cfg.rate_limit.rate_time,
+        black_time: app_cfg.rate_limit.black_time,
+    };
     let forward = Arc::new(ForwardService::new(
         static_sources.clone(),
-        RateLimitConfig {
-            max_requests: app_cfg.rate_limit.max_requests,
-            rate_time: app_cfg.rate_limit.rate_time,
-            black_time: app_cfg.rate_limit.black_time,
-        },
+        rate_limit,
+        fallback,
     ));
 
     // UDP relay：`udp.enabled=false`（默认）时为 None，UDP 帧/流被安全拒绝
@@ -96,8 +109,8 @@ async fn main() -> Result<()> {
         Some(Arc::new(UdpSettings {
             timeout: app_cfg.udp.timeout,
             rate_limit: app_cfg.udp.rate_limit,
-            // 生产环境不允许回环/内网目标（SSRF 防护）
-            allow_private: false,
+            // SSRF 防护：默认拒绝回环/内网目标，与 TCP 隧道共用同一开关
+            allow_private: app_cfg.server.allow_private_targets,
         }))
     } else {
         None
@@ -108,6 +121,8 @@ async fn main() -> Result<()> {
         forward.clone(),
         app_cfg.server.mux,
         udp,
+        app_cfg.server.allow_private_targets,
+        rate_limit,
     ));
 
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);

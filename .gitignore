@@ -4,3 +4,5 @@
 /.screenshots
 crates/*/target
 crates/svr/releases
+clash-verge-rev-dev
+/.secrets

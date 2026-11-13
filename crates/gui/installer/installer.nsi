@@ -114,10 +114,10 @@ Section "Install" SEC_MAIN
   File "/oname=GeoDB.dat" "${SOURCE_GEO}"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
+  ; Start-menu + desktop shortcuts are always (re)created, so upgrades keep a
+  ; working icon even when the old version had none.
   CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
-  ; Only refresh the desktop shortcut if the old version created one.
-  IfFileExists "$DESKTOP\${PRODUCT_NAME}.lnk" 0 +2
-    CreateShortCut "$DESKTOP\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
+  CreateShortCut "$DESKTOP\${PRODUCT_NAME}.lnk" "$INSTDIR\${PRODUCT_EXE}"
 
   ${GetSize} "$INSTDIR" "/S=0K" $0 $1 $2
   IntFmt $0 "0x%08X" $0

@@ -26,9 +26,8 @@
 //! UDP 数据报一个 [`framing::FLAG_UDP`] 帧。[`mux::FLAG_UDP`]（=6）为 mux 模式
 //! 下的 UDP 流类型，payload 与非 mux 完全一致。
 
-use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -40,8 +39,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::services::framing::{self, append_frame as append_tunnel_frame, read_frame, FLAG_UDP};
+use crate::services::framing::{self, append_frame as append_tunnel_frame, read_frame, FLAG_PADDING, FLAG_UDP};
 use crate::services::mux;
+use crate::utils::ssrf::is_forbidden_ip;
 
 /// UDP 帧地址类型：IPv4
 pub const ATYP_IPV4: u8 = 1;
@@ -191,78 +191,6 @@ pub fn parse_udp_packet(payload: &[u8]) -> Option<(u32, String, u16, &[u8])> {
         return None;
     }
     Some((stream_id, host, port, &p[..dgram_len]))
-}
-
-// -----------------------------------------------------------------------------
-// SSRF 防护
-// -----------------------------------------------------------------------------
-
-/// 服务端本机地址集合（进程内惰性缓存一次）
-fn local_addresses() -> &'static HashSet<IpAddr> {
-    static SET: OnceLock<HashSet<IpAddr>> = OnceLock::new();
-    SET.get_or_init(|| {
-        let mut set = HashSet::new();
-        // localhost 解析（通常为 127.0.0.1 / ::1）
-        if let Ok(addrs) = ("localhost", 0u16).to_socket_addrs() {
-            for addr in addrs {
-                set.insert(addr.ip());
-            }
-        }
-        // 默认路由出口地址（UDP connect 只选路，不实际发包）
-        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-            if sock.connect("8.8.8.8:80").is_ok() {
-                if let Ok(addr) = sock.local_addr() {
-                    set.insert(addr.ip());
-                }
-            }
-        }
-        set
-    })
-}
-
-/// 判断目标 IP 是否禁止转发（SSRF 防护）
-///
-/// 覆盖：127.0.0.0/8、10/8、100.64/10（CGNAT，含云厂商 metadata）、172.16/12、
-/// 192.168/16、169.254/16、192.0.0/24、198.18/15、0.0.0.0/8、组播 224/4、
-/// 保留 240/4（含广播 255.255.255.255）、::1、::、fe80::/10、fc00::/7、
-/// 组播 ff00::/8、IPv4 映射 IPv6（::ffff:x.y.z.w 按 IPv4 规则复查）以及本机地址。
-pub fn is_forbidden_ip(ip: IpAddr) -> bool {
-    let forbidden = match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            o[0] == 127                                    // 127.0.0.0/8
-                || o[0] == 10                              // 10/8
-                || o[0] == 0                               // 0.0.0.0/8
-                || (o[0] == 172 && o[1] & 0xf0 == 16)      // 172.16/12
-                || (o[0] == 192 && o[1] == 168)            // 192.168/16
-                || (o[0] == 169 && o[1] == 254)            // 169.254/16
-                || (o[0] == 100 && (o[1] & 0xc0) == 64)    // 100.64/10（阿里云 100.100.100.200 等）
-                || (o[0] == 192 && o[1] == 0 && o[2] == 0) // 192.0.0.0/24
-                || (o[0] == 198 && (o[1] & 0xfe) == 18)    // 198.18/15
-                || o[0] >= 224                             // 组播 224/4 + 保留 240/4（含广播）
-        }
-        IpAddr::V6(v6) => {
-            let s = v6.segments();
-            v6.is_loopback()                               // ::1
-                || v6.is_unspecified()                     // ::
-                || (s[0] & 0xffc0) == 0xfe80               // fe80::/10
-                || (s[0] & 0xfe00) == 0xfc00               // fc00::/7
-                || (s[0] & 0xff00) == 0xff00               // ff00::/8 组播
-                || (s[0] == 0
-                    && s[1] == 0
-                    && s[2] == 0
-                    && s[3] == 0
-                    && s[4] == 0
-                    && s[5] == 0xffff
-                    && is_forbidden_ip(IpAddr::V4(Ipv4Addr::new(
-                        (s[6] >> 8) as u8,
-                        s[6] as u8,
-                        (s[7] >> 8) as u8,
-                        s[7] as u8,
-                    ))) ) // ::ffff:x.y.z.w 映射地址按 IPv4 规则复查
-        }
-    };
-    forbidden || local_addresses().contains(&ip)
 }
 
 // -----------------------------------------------------------------------------
@@ -553,6 +481,9 @@ where
                 break;
             }
         };
+        if flag == FLAG_PADDING {
+            continue;
+        }
         if flag != FLAG_UDP {
             // UDP 隧道只承载 FLAG_UDP 帧（客户端不发 FLAG_RAW）
             tracing::debug!("[Udp] unexpected frame flag {} on udp tunnel, close", flag);
@@ -625,44 +556,6 @@ mod tests {
     fn encode_rejects_oversize_datagram() {
         let big = vec![0u8; MAX_DGRAM + 1];
         assert!(encode_udp_packet(1, "1.2.3.4", 80, &big).is_none());
-    }
-
-    #[test]
-    fn forbidden_ip_covers_private_ranges() {
-        for ip in [
-            "127.0.0.1", "127.8.8.8", "10.0.0.1", "10.255.1.1", "172.16.0.1", "172.31.255.255",
-            "192.168.1.1", "169.254.10.10", "0.0.0.0", "0.1.2.3", "::1", "fe80::1", "febf::1",
-            "fc00::1", "fd12:3455:1234::1", "::ffff:127.0.0.1", "::ffff:10.0.0.2",
-            // CGNAT / 云厂商 metadata、保留段、组播与广播
-            "100.64.0.1", "100.100.100.200", "100.127.255.254", "192.0.0.8", "198.18.0.1",
-            "198.19.255.255", "224.0.0.1", "239.255.255.250", "240.0.0.1", "255.255.255.255",
-            "::", "ff02::1",
-        ] {
-            assert!(
-                is_forbidden_ip(ip.parse().unwrap()),
-                "{} 应被判为禁止目标",
-                ip
-            );
-        }
-    }
-
-    #[test]
-    fn public_ip_is_allowed() {
-        for ip in [
-            "8.8.8.8",
-            "1.1.1.1",
-            "172.32.0.1",
-            "172.15.255.255",
-            "100.63.255.255",
-            "198.20.0.1",
-            "2001:4860:4860::8888",
-        ] {
-            assert!(
-                !is_forbidden_ip(ip.parse().unwrap()),
-                "{} 不应被判为禁止目标",
-                ip
-            );
-        }
     }
 
     #[test]

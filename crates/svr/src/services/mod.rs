@@ -1,5 +1,6 @@
 //! 业务服务模块
 
+pub mod fallback_service;
 pub mod forward_service;
 pub mod framing;
 mod initial_stream;

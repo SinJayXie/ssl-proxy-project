@@ -9,7 +9,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use hmac::{Hmac, Mac};
+use http_body_util::{BodyExt, Empty};
+use hyper::Request;
+use hyper_rustls::HttpsConnectorBuilder;
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::TokioExecutor;
 use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -21,20 +27,27 @@ use tokio_rustls::TlsConnector;
 use ssl_proxy_svr::config::ServerConfig as ServerCfg;
 use ssl_proxy_svr::core::service::ServiceRegister;
 use ssl_proxy_svr::libs::rate_limit::RateLimitConfig;
+use ssl_proxy_svr::services::fallback_service::FallbackService;
 use ssl_proxy_svr::services::forward_service::ForwardService;
-use ssl_proxy_svr::services::framing::{append_frame, encode_chunk, read_frame, FLAG_UDP};
+use ssl_proxy_svr::services::framing::{
+    append_frame, append_padding_frame, encode_chunk, read_frame, FLAG_PADDING, FLAG_UDP,
+};
 use ssl_proxy_svr::services::mux::{
     append_frame as append_mux_frame, encode_ctl, encode_data, encode_open,
-    read_frame as read_mux_frame, FLAG_UDP as MUX_FLAG_UDP, FLAG_UDP_CLOSE as MUX_FLAG_UDP_CLOSE,
+    read_frame as read_mux_frame, FLAG_UDP as MUX_FLAG_UDP,
+    FLAG_UDP_CLOSE as MUX_FLAG_UDP_CLOSE, FLAG_WINDOW as MUX_FLAG_WINDOW,
 };
 use ssl_proxy_svr::services::proxy_service::ProxyService;
-use ssl_proxy_svr::services::socket_service::{load_tls_config, SocketService};
+use ssl_proxy_svr::services::socket_service::{
+    load_tls_config, load_tls_config_with_alpn, SocketService,
+};
 use ssl_proxy_svr::services::static_sources_service::StaticSourcesService;
 use ssl_proxy_svr::services::udp_relay_service::{
     encode_udp_packet, parse_udp_packet, UdpSettings,
 };
 use ssl_proxy_svr::utils::protocol::{
-    ack_mac, encode_packet, encode_packet_ext, EXT_UDP, MAC_LEN, TUNNEL_ACK,
+    ack_mac, ack_mac_v3, encode_packet, encode_packet_ext, encode_packet_v3_ext,
+    EXT_MUX_WINDOW, EXT_UDP, MAC_LEN, TUNNEL_ACK,
 };
 
 const PASSWORD: &str = "e2e-secret-password";
@@ -60,11 +73,19 @@ struct Harness {
 
 impl Harness {
     async fn start() -> Self {
-        Self::start_with_options(DEFAULT_MAX_REQUESTS, None).await
+        Self::start_with_options(DEFAULT_MAX_REQUESTS, None, None).await
     }
 
     async fn start_with_rate_limit(max_requests: u32) -> Self {
-        Self::start_with_options(max_requests, None).await
+        Self::start_with_options(max_requests, None, None).await
+    }
+
+    /// 启用真实站点回落（用于验证 h1 反代路径）
+    async fn start_with_fallback(url: &str) -> Self {
+        let fallback = Arc::new(
+            FallbackService::new(url, Duration::from_secs(5)).expect("build fallback service"),
+        );
+        Self::start_with_options(DEFAULT_MAX_REQUESTS, None, Some(fallback)).await
     }
 
     /// `udp_enabled = true` 时按默认参数启用 UDP relay（timeout=60s, rate=100）
@@ -77,6 +98,7 @@ impl Harness {
                 rate_limit: 100,
                 allow_private: false,
             }),
+            None,
         )
         .await
     }
@@ -91,11 +113,16 @@ impl Harness {
                 rate_limit: 100,
                 allow_private: true,
             }),
+            None,
         )
         .await
     }
 
-    async fn start_with_options(max_requests: u32, udp: Option<UdpSettings>) -> Self {
+    async fn start_with_options(
+        max_requests: u32,
+        udp: Option<UdpSettings>,
+        fallback: Option<Arc<FallbackService>>,
+    ) -> Self {
         let dir = unique_dir();
         let html_dir = dir.join("html");
         std::fs::create_dir_all(&html_dir).expect("create html dir");
@@ -107,8 +134,13 @@ impl Harness {
         std::fs::write(&cert_path, cert_pem).expect("write cert");
         std::fs::write(&key_path, key_pem).expect("write key");
 
-        let tls_cfg = load_tls_config(Some(cert_path.as_path()), Some(key_path.as_path()), None)
-            .expect("load tls config");
+        let tls_cfg = load_tls_config_with_alpn(
+            Some(cert_path.as_path()),
+            Some(key_path.as_path()),
+            None,
+            fallback.is_some(),
+        )
+        .expect("load tls config");
 
         let port = free_port().await;
 
@@ -116,13 +148,15 @@ impl Harness {
             Some(html_dir),
             "index.html".to_string(),
         ));
+        let rate_limit = RateLimitConfig {
+            max_requests,
+            rate_time: Duration::from_secs(60),
+            black_time: Duration::from_secs(600),
+        };
         let forward = Arc::new(ForwardService::new(
             static_sources.clone(),
-            RateLimitConfig {
-                max_requests,
-                rate_time: Duration::from_secs(60),
-                black_time: Duration::from_secs(600),
-            },
+            rate_limit,
+            fallback,
         ));
         let udp = udp.map(Arc::new);
         let proxy = Arc::new(ProxyService::new(
@@ -130,6 +164,9 @@ impl Harness {
             forward.clone(),
             true,
             udp,
+            // 集成测试统一连 127.0.0.1 上的回显服务，显式放行回环目标
+            true,
+            rate_limit,
         ));
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
 
@@ -139,6 +176,7 @@ impl Harness {
                 port,
                 password: PASSWORD.to_string(),
                 mux: true,
+                allow_private_targets: true,
             },
             tls_cfg,
             forward.clone(),
@@ -250,6 +288,21 @@ async fn read_to_eof(stream: &mut ClientStream) -> Vec<u8> {
     out
 }
 
+/// 容错版：服务端可能直接丢弃连接（不发送 close_notify），读到 EOF / 错误 / 超时都返回已收数据。
+async fn try_send_and_read(stream: &mut ClientStream, data: &[u8]) -> Vec<u8> {
+    let _ = stream.write_all(data).await;
+    let _ = stream.flush().await;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(IO_TIMEOUT, stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+            Ok(Ok(n)) => out.extend_from_slice(&buf[..n]),
+        }
+    }
+    out
+}
+
 fn split_response(raw: &[u8]) -> (String, Vec<u8>) {
     let pos = raw
         .windows(4)
@@ -299,6 +352,84 @@ async fn expect_tunnel_ack(
     assert_eq!(&ack[..2], &TUNNEL_ACK, "隧道应答魔数不匹配");
     let expected = ack_mac(password, timestamp, port, host);
     assert_eq!(&ack[2..], &expected, "ACK MAC 校验失败");
+}
+
+/// 读取并校验 v3 隧道应答（`[0x10,0xff] || ACK MAC`，nonce 参与签名）
+async fn expect_tunnel_ack_v3(
+    stream: &mut ClientStream,
+    password: &str,
+    timestamp: u64,
+    nonce: u64,
+    host: &str,
+    port: u16,
+) {
+    let mut ack = [0u8; 2 + MAC_LEN];
+    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut ack))
+        .await
+        .expect("ack timeout")
+        .expect("read ack");
+
+    assert_eq!(&ack[..2], &TUNNEL_ACK, "隧道应答魔数不匹配");
+    let expected = ack_mac_v3(password, timestamp, nonce, port, host);
+    assert_eq!(&ack[2..], &expected, "v3 ACK MAC 校验失败");
+}
+
+/// 启动一个最小的 HTTP/1.1 回源站点，返回其端口。
+async fn spawn_http_origin(body: &'static str) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+    let port = listener.local_addr().expect("origin addr").port();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                if sock.read(&mut buf).await.unwrap_or(0) == 0 {
+                    return;
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    port
+}
+
+/// 回源站点：持续读取并统计收到的字节数（用于验证请求体上限）
+async fn spawn_counting_origin() -> (u16, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+    let port = listener.local_addr().expect("origin addr").port();
+    let received = Arc::new(AtomicUsize::new(0));
+    let counter = received.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let counter = counter.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 16 * 1024];
+                let mut total = 0usize;
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            total += n;
+                            counter.store(total, Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (port, received)
 }
 
 /// 启动一个回显用的上游 TCP 服务，返回其端口。
@@ -467,6 +598,104 @@ async fn http_head_returns_no_body() {
 }
 
 #[tokio::test]
+async fn http_fallback_proxies_to_real_site() {
+    let origin = spawn_http_origin("fallback-body").await;
+    let h = Harness::start_with_fallback(&format!("http://127.0.0.1:{}", origin)).await;
+    let mut stream = h.connect().await;
+
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    let raw = send_and_read(&mut stream, request).await;
+    let text = String::from_utf8_lossy(&raw);
+    assert!(text.starts_with("HTTP/1.1 200"), "raw={text}");
+    assert!(text.contains("fallback-body"), "raw={text}");
+
+    h.stop().await;
+}
+
+/// chunked 请求没有 Content-Length，也必须在 8MB 处被截断（不能继续灌真实站点）
+#[tokio::test]
+async fn fallback_chunked_body_is_capped() {
+    const LIMIT: usize = 8 * 1024 * 1024;
+    let (origin, received) = spawn_counting_origin().await;
+    let h = Harness::start_with_fallback(&format!("http://127.0.0.1:{}", origin)).await;
+    let mut stream = h.connect().await;
+
+    let header = b"POST /upload HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    stream.write_all(header).await.expect("write header");
+
+    // 9MB（> 8MB 上限），按 64KB chunk 发送；服务端超限后连接会被中止
+    let chunk = vec![b'A'; 64 * 1024];
+    let chunk_head = format!("{:x}\r\n", chunk.len());
+    for _ in 0..(9 * 1024 * 1024 / chunk.len()) {
+        let write = async {
+            stream.write_all(chunk_head.as_bytes()).await?;
+            stream.write_all(&chunk).await?;
+            stream.write_all(b"\r\n").await
+        };
+        match tokio::time::timeout(IO_TIMEOUT, write).await {
+            Ok(Ok(())) => {}
+            // 服务端已因超限中止连接：停止上传
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    let _ = stream.write_all(b"0\r\n\r\n").await;
+
+    // 等上游接收量稳定（服务端中止上传后不再增长）
+    let mut last = 0usize;
+    for _ in 0..50 {
+        let now = received.load(Ordering::Relaxed);
+        if now > 0 && now == last {
+            break;
+        }
+        last = now;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(last > 0, "上游应至少收到部分请求体");
+    assert!(
+        last <= LIMIT + 64 * 1024,
+        "上游收到 {last} 字节，超过 8MB 上限"
+    );
+
+    h.stop().await;
+}
+
+/// HTTP/2 回落：浏览器式 h2 握手后，由反代回源真实站点。
+#[tokio::test]
+async fn http2_fallback_proxies_to_real_site() {
+    let origin = spawn_http_origin("h2-fallback-body").await;
+    let h = Harness::start_with_fallback(&format!("http://127.0.0.1:{}", origin)).await;
+
+    let mut roots = RootCertStore::empty();
+    roots.add(h.cert.clone()).expect("add test root");
+    let tls = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let https = HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_only()
+        .enable_http2()
+        .build();
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+
+    let uri: hyper::Uri = format!("https://localhost:{}/", h.port)
+        .parse()
+        .expect("test uri");
+    let req = Request::builder()
+        .uri(uri)
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+    let resp = client.request(req).await.expect("h2 request");
+    assert_eq!(resp.status(), 200);
+    let body = resp.into_body().collect().await.expect("h2 body").to_bytes();
+    assert_eq!(&body[..], b"h2-fallback-body");
+
+    drop(client);
+    h.stop().await;
+}
+
+#[tokio::test]
 async fn rate_limit_drops_connection_after_threshold() {
     // max_requests = 2：第 2 次请求即触发封禁，连接被直接断开
     let h = Harness::start_with_rate_limit(2).await;
@@ -502,6 +731,31 @@ async fn rate_limit_drops_connection_after_threshold() {
 // -----------------------------------------------------------------------------
 // 私有协议分支
 // -----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn protocol_auth_failures_blacklist_peer() {
+    // max_requests = 2：同一 IP 连续 2 次协议校验失败后进入黑名单
+    let echo_port = spawn_echo_upstream().await;
+    let h = Harness::start_with_rate_limit(2).await;
+
+    for nonce in [11u64, 12] {
+        let mut conn = h.connect().await;
+        let bad = cli_auth_packet("127.0.0.1", echo_port, "wrong-password", unix_now(), nonce);
+        let _ = try_send_and_read(&mut conn, &bad).await;
+    }
+
+    // 封禁后即使密码正确也不再建立隧道（不应回 ACK）
+    let mut conn = h.connect().await;
+    let good = cli_auth_packet("127.0.0.1", echo_port, PASSWORD, unix_now(), 13);
+    let raw = try_send_and_read(&mut conn, &good).await;
+    assert!(
+        !raw.starts_with(&TUNNEL_ACK),
+        "认证失败封禁后不应回 ACK（实际收到 {} 字节）",
+        raw.len()
+    );
+
+    h.stop().await;
+}
 
 #[tokio::test]
 async fn private_protocol_opens_tunnel_and_echoes() {
@@ -704,6 +958,126 @@ async fn mux_connection_carries_multiple_streams() {
 }
 
 // -----------------------------------------------------------------------------
+// v3（nonce + 重放防护 / 流级窗口）
+// -----------------------------------------------------------------------------
+
+/// v3 首包：同一秒内不同 nonce 不互相误杀；同一首包重放必须回落为伪装站点。
+#[tokio::test]
+async fn v3_handshake_roundtrip_and_replay_rejected() {
+    let h = Harness::start().await;
+    let echo_port = spawn_echo_upstream().await;
+    let ts = unix_now();
+    let nonce = 0xDEAD_BEEF_1234_5678u64;
+    let packet = encode_packet_v3_ext("127.0.0.1", echo_port, PASSWORD, ts, nonce, 0);
+
+    // 第一次：正常建隧道；首包后紧跟一个纯填充帧（模拟客户端首条 record 整形）
+    let mut first = h.connect().await;
+    let mut first_write = packet.clone();
+    append_padding_frame(&mut first_write, 512);
+    first.write_all(&first_write).await.expect("write v3 packet");
+    first.flush().await.expect("flush");
+    expect_tunnel_ack_v3(&mut first, PASSWORD, ts, nonce, "127.0.0.1", echo_port).await;
+    let mut cap = [0u8; 1];
+    first.read_exact(&mut cap).await.expect("read capability byte");
+
+    let plain: &[u8] = b"v3-tunnel-echo";
+    let mut framed = Vec::new();
+    encode_chunk(plain, true, &mut framed);
+    first.write_all(&framed).await.expect("write framed payload");
+
+    let mut echoed = Vec::new();
+    let mut payload = Vec::new();
+    while echoed.len() < plain.len() {
+        let flag = tokio::time::timeout(IO_TIMEOUT, read_frame(&mut first, &mut payload))
+            .await
+            .expect("echo timeout")
+            .expect("read echo frame");
+        if flag == FLAG_PADDING {
+            continue;
+        }
+        echoed.extend_from_slice(&payload);
+    }
+    assert_eq!(echoed.as_slice(), plain);
+
+    // 第二次：重放同一首包 → 认证被拒，回落静态站点（400）
+    let mut second = h.connect().await;
+    second.write_all(&packet).await.expect("write replay");
+    let raw = read_to_eof(&mut second).await;
+    let (head, _) = split_response(&raw);
+    assert!(head.starts_with("HTTP/1.1 400"), "重放应回落伪装站点，head={head}");
+
+    drop(first);
+    h.stop().await;
+}
+
+/// mux 首包请求窗口能力 → 服务端 ACK 置位 CAP_MUX_WINDOW，并按流返还 WINDOW。
+#[tokio::test]
+async fn mux_v3_advertises_window_and_relays() {
+    let h = Harness::start_with_udp(true).await;
+    let echo_port = spawn_echo_upstream().await;
+    let mut stream = h.connect().await;
+
+    let ts = unix_now();
+    let nonce = 0x1234_5678_9ABC_DEF0u64;
+    let packet = encode_packet_v3_ext(
+        "",
+        0,
+        PASSWORD,
+        ts,
+        nonce,
+        EXT_UDP | EXT_MUX_WINDOW,
+    );
+    stream.write_all(&packet).await.expect("write mux auth");
+    expect_tunnel_ack_v3(&mut stream, PASSWORD, ts, nonce, "", 0).await;
+
+    let mut cap = [0u8; 1];
+    tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut cap))
+        .await
+        .expect("cap timeout")
+        .expect("read cap");
+    assert_eq!(cap[0] & 0x02, 0x02, "应广告 mux 窗口能力");
+
+    stream
+        .write_all(&encode_open(1, "127.0.0.1", echo_port))
+        .await
+        .expect("open stream");
+    stream
+        .write_all(&encode_data(1, b"windowed"))
+        .await
+        .expect("send data");
+
+    let mut got = Vec::new();
+    let mut saw_window = false;
+    let mut payload = Vec::new();
+    while got.len() < b"windowed".len() || !saw_window {
+        let (flag, sid) = tokio::time::timeout(
+            IO_TIMEOUT,
+            read_mux_frame(&mut stream, &mut payload),
+        )
+        .await
+        .expect("mux frame timeout")
+        .expect("read mux frame");
+        match flag {
+            MUX_FLAG_WINDOW => {
+                assert_eq!(sid, 1);
+                assert_eq!(payload.len(), 4, "WINDOW payload 为 credit u32");
+                saw_window = true;
+            }
+            0 => {
+                if sid == 1 {
+                    got.extend_from_slice(&payload);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(got.as_slice(), b"windowed");
+
+    drop(stream);
+    h.stop().await;
+}
+
+// -----------------------------------------------------------------------------
 // UDP relay
 // -----------------------------------------------------------------------------
 
@@ -752,6 +1126,7 @@ async fn udp_session_idle_timeout_reclaims_and_still_relays() {
             rate_limit: 100,
             allow_private: true,
         }),
+        None,
     )
     .await;
     let (echo_ip, echo_port) = spawn_udp_echo().await;
@@ -1013,19 +1388,27 @@ async fn mux_udp_close_frame_reclaims_session_without_breaking_connection() {
 // - 回包解析：`gui/src/core/proxy/framing.rs::parse_udp_packet`
 
 /// 客户端 REQ MAC 域前缀（connect.rs `REQ_PREFIX`）
-const CLI_REQ_PREFIX: &[u8] = b"ssl-proxy-v2";
+const CLI_REQ_PREFIX: &[u8] = b"ssl-proxy-v3";
 /// 客户端 ACK MAC 域前缀（connect.rs `ACK_PREFIX`）
-const CLI_ACK_PREFIX: &[u8] = b"ssl-proxy-v2-ack";
+const CLI_ACK_PREFIX: &[u8] = b"ssl-proxy-v3-ack";
 /// 客户端首包扩展位（connect.rs `EXT_UDP`）
 const CLI_EXT_UDP: u8 = 0x01;
 /// 服务端 ACK 能力位（connect.rs `CAP_UDP`）
 const CLI_CAP_UDP: u8 = 0x01;
 
-/// 复刻客户端 `compute_mac`：HMAC-SHA256(password, prefix || ts BE || port BE || host)
-fn cli_mac(password: &str, prefix: &[u8], timestamp: u64, port: u16, host: &str) -> [u8; 32] {
+/// 复刻客户端 `compute_mac`：HMAC-SHA256(password, prefix || ts BE || nonce BE || port BE || host)
+fn cli_mac(
+    password: &str,
+    prefix: &[u8],
+    timestamp: u64,
+    nonce: u64,
+    port: u16,
+    host: &str,
+) -> [u8; 32] {
     let mut mac = Hmac::<Sha256>::new_from_slice(password.as_bytes()).expect("hmac key");
     mac.update(prefix);
     mac.update(&timestamp.to_be_bytes());
+    mac.update(&nonce.to_be_bytes());
     mac.update(&port.to_be_bytes());
     mac.update(host.as_bytes());
     let out = mac.finalize().into_bytes();
@@ -1034,18 +1417,19 @@ fn cli_mac(password: &str, prefix: &[u8], timestamp: u64, port: u16, host: &str)
     arr
 }
 
-/// 复刻客户端 `create_protocol_header(host, port, password)`：
-/// MAC 之后固定追加 1 字节 [`CLI_EXT_UDP`] 扩展位
-fn cli_auth_packet(host: &str, port: u16, password: &str, timestamp: u64) -> Vec<u8> {
+/// 复刻客户端 `create_protocol_header(host, port, password, ...)`：
+/// v3 布局（含 nonce），MAC 之后固定追加 1 字节 [`CLI_EXT_UDP`] 扩展位
+fn cli_auth_packet(host: &str, port: u16, password: &str, timestamp: u64, nonce: u64) -> Vec<u8> {
     let host_bytes = host.as_bytes();
-    let mut buf = Vec::with_capacity(14 + host_bytes.len() + 32 + 1);
+    let mut buf = Vec::with_capacity(22 + host_bytes.len() + 32 + 1);
     buf.extend_from_slice(&[0x10, 0xff]); // MAGIC
-    buf.push(2); // VERSION
+    buf.push(3); // VERSION
     buf.extend_from_slice(&timestamp.to_be_bytes());
+    buf.extend_from_slice(&nonce.to_be_bytes());
     buf.extend_from_slice(&port.to_be_bytes());
     buf.push(host_bytes.len() as u8);
     buf.extend_from_slice(host_bytes);
-    buf.extend_from_slice(&cli_mac(password, CLI_REQ_PREFIX, timestamp, port, host));
+    buf.extend_from_slice(&cli_mac(password, CLI_REQ_PREFIX, timestamp, nonce, port, host));
     buf.push(CLI_EXT_UDP);
     buf
 }
@@ -1146,8 +1530,9 @@ async fn udp_non_mux_client_format_roundtrip() {
     // Step 1: 客户端格式认证首包（port=0 标记 UDP 隧道）
     let host = echo_ip.to_string();
     let ts = unix_now();
+    let nonce = 0x0102_0304_0506_0708u64;
     stream
-        .write_all(&cli_auth_packet(&host, 0, PASSWORD, ts))
+        .write_all(&cli_auth_packet(&host, 0, PASSWORD, ts, nonce))
         .await
         .expect("write auth");
 
@@ -1158,7 +1543,7 @@ async fn udp_non_mux_client_format_roundtrip() {
         .expect("ack timeout")
         .expect("read ack");
     assert_eq!(&ack[..2], &TUNNEL_ACK, "隧道应答魔数不匹配");
-    let expected = cli_mac(PASSWORD, CLI_ACK_PREFIX, ts, 0, &host);
+    let expected = cli_mac(PASSWORD, CLI_ACK_PREFIX, ts, nonce, 0, &host);
     assert_eq!(&ack[2..], &expected, "ACK MAC 应按 port=0 + 目标 host 计算");
     let mut cap = [0u8; 1];
     tokio::time::timeout(IO_TIMEOUT, stream.read_exact(&mut cap))

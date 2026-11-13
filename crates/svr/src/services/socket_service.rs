@@ -231,10 +231,21 @@ async fn read_first_packet(
 ///
 /// 当 `cert_path` / `key_path` 同时为 `None` 时，启动期内生成一张自签证书，
 /// SAN 由 `sni` 指定（缺省为 `localhost` / `127.0.0.1`）。
+#[allow(dead_code)]
 pub fn load_tls_config(
     cert_path: Option<&std::path::Path>,
     key_path: Option<&std::path::Path>,
     sni: Option<&str>,
+) -> Result<Arc<ServerConfig>> {
+    load_tls_config_with_alpn(cert_path, key_path, sni, false)
+}
+
+/// 同上；`enable_h2 = true` 时额外广告 `h2`（真实站点回落需要）。
+pub fn load_tls_config_with_alpn(
+    cert_path: Option<&std::path::Path>,
+    key_path: Option<&std::path::Path>,
+    sni: Option<&str>,
+    enable_h2: bool,
 ) -> Result<Arc<ServerConfig>> {
     let (certs, key) = match (cert_path, key_path) {
         (Some(c), Some(k)) => load_cert_key_from_file(c, k)?,
@@ -249,9 +260,18 @@ pub fn load_tls_config(
         .with_single_cert(certs, key)
         .context("build rustls ServerConfig")?;
 
-    // ALPN 伪装：只广告 h2 之外的 http/1.1，保证与回落时的 HTTP/1.1 响应一致。
-    // 若不广告 ALPN，主动探测可凭握手特征判定为非常规站点。
-    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // ALPN 伪装：与回落服务保持一致。只有启用真实站点回落（支持 h2）时才广告 h2。
+    cfg.alpn_protocols = if enable_h2 {
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+    } else {
+        vec![b"http/1.1".to_vec()]
+    };
+
+    // TLS session resumption：TLS 1.3 用 ticket，TLS 1.2 用内存 session cache。
+    // 只影响重连性能，不改变认证与重放模型。
+    cfg.ticketer = rustls::crypto::aws_lc_rs::Ticketer::new()
+        .context("create TLS 1.3 ticketer")?;
+    cfg.session_storage = rustls::server::ServerSessionMemoryCache::new(256);
 
     Ok(Arc::new(cfg))
 }
@@ -305,4 +325,22 @@ fn generate_self_signed(
 
     tracing::info!("[TLS] self-signed cert generated (SAN: {})", names.join(", "));
     Ok((vec![cert_der], PrivateKeyDer::Pkcs8(key_der)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alpn_advertises_h2_only_when_enabled() {
+        let h1 = load_tls_config(None, None, Some("example.com")).expect("h1 config");
+        assert_eq!(h1.alpn_protocols, vec![b"http/1.1".to_vec()]);
+
+        let h2 = load_tls_config_with_alpn(None, None, Some("example.com"), true)
+            .expect("h2 config");
+        assert_eq!(
+            h2.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+    }
 }

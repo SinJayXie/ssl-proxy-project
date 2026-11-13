@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/gui", "crates/svr"]
+members = ["crates/gui", "crates/svr", "crates/update-signer"]
 default-members = ["crates/gui", "crates/svr"]
 
 # ---- 统一 release 配置 ----

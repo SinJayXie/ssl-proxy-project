@@ -105,6 +105,8 @@
   "UPDATE_AVAILABLE": "Update Available",
   "UPDATE_DOWNLOAD": "Download",
   "UPDATE_LATER": "Later",
+  "UPDATE_REQUIRED": "This update is required. Install it to continue using the app.",
+  "UPDATE_FAILED": "Update download failed. Check your network and try again.",
   "CHECK_UPDATE": "Check for Updates",
   "CHECKING_UPDATE": "Checking...",
   "UPDATE_NONE": "You are using the latest version",

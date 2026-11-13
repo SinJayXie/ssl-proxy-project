@@ -47,24 +47,30 @@ impl RateLimit {
         }
     }
 
-    /// 记录一次访问；返回 `true` 表示允许，`false` 表示被限流/黑名单。
-    pub fn record(&self, ip: &str) -> bool {
-        let now = current_millis();
-
-        // 1. 检查黑名单
+    /// 只检查黑名单（不计数）：供"已封禁则跳过昂贵校验"的路径使用
+    pub fn is_blacklisted(&self, ip: &str) -> bool {
         if let Some(entry) = self.blacklist.get(ip) {
-            if *entry.value() > now {
-                return false;
+            if *entry.value() > current_millis() {
+                return true;
             }
             // 已过期：惰性清理
             drop(entry);
             self.blacklist.remove(ip);
         }
+        false
+    }
+
+    /// 记录一次访问；返回 `true` 表示允许，`false` 表示被限流/黑名单。
+    pub fn record(&self, ip: &str) -> bool {
+        if self.is_blacklisted(ip) {
+            return false;
+        }
+        let now = current_millis();
 
         let rate_ms = self.config.rate_time.as_millis() as u64;
         let max = self.config.max_requests;
 
-        // 2. 累计/新建计数
+        // 累计/新建计数
         let mut exceeded = false;
         {
             let mut entry = self.records.entry(ip.to_string()).or_insert(RateRecord {
@@ -136,6 +142,26 @@ mod tests {
         std::thread::sleep(Duration::from_millis(40));
         // 窗口已过期，计数重置，不应触发封禁
         assert!(rl.record("3.3.3.3"));
+    }
+
+    #[test]
+    fn is_blacklisted_does_not_count() {
+        let rl = RateLimit::new(RateLimitConfig {
+            max_requests: 2,
+            rate_time: Duration::from_secs(60),
+            black_time: Duration::from_secs(600),
+        });
+        assert!(!rl.is_blacklisted("5.5.5.5"));
+        assert!(rl.record("5.5.5.5"));
+        // 只查询不应消耗配额
+        assert!(!rl.is_blacklisted("5.5.5.5"));
+        assert!(!rl.is_blacklisted("5.5.5.5"));
+        // 第 2 次达到上限并封禁
+        assert!(!rl.record("5.5.5.5"));
+        assert!(rl.is_blacklisted("5.5.5.5"));
+        assert!(!rl.record("5.5.5.5"));
+        assert!(rl.is_blacklisted("5.5.5.5"));
+        assert!(!rl.is_blacklisted("6.6.6.6"));
     }
 
     #[test]

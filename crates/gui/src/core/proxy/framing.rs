@@ -38,6 +38,8 @@ pub const FLAG_PAD: u8 = 0;
 pub const FLAG_RAW: u8 = 1;
 /// UDP 数据帧（payload 为 [`encode_udp_packet`] 编码的 UDP 包）
 pub const FLAG_UDP: u8 = 2;
+/// 纯填充帧：接收方丢弃 payload（用于撑大首条 TLS record）
+pub const FLAG_PADDING: u8 = 3;
 
 /// 帧头长度：flag(1) + len(2) + padLen(1)
 pub const FRAME_HEADER: usize = 4;
@@ -61,6 +63,15 @@ pub fn append_frame(out: &mut Vec<u8>, payload: &[u8], pad_len: usize, flag: u8)
         out.resize(start + pad_len, 0);
         rand::thread_rng().fill(&mut out[start..]);
     }
+}
+
+/// 编码一个纯填充帧（接收方丢弃）
+pub fn encode_padding_frame(payload_len: usize) -> Vec<u8> {
+    let mut payload = vec![0u8; payload_len.min(MAX_PAYLOAD)];
+    rand::thread_rng().fill(&mut payload[..]);
+    let mut out = Vec::with_capacity(FRAME_HEADER + payload.len());
+    append_frame(&mut out, &payload, 0, FLAG_PADDING);
+    out
 }
 
 /// 按策略编码一段待发送数据（上行：小包随机切片 + 随机填充）
@@ -269,6 +280,14 @@ mod tests {
         assert_eq!(out[3], 2);
         assert_eq!(&out[4..9], b"hello");
         assert_eq!(out.len(), FRAME_HEADER + 5 + 2);
+    }
+
+    #[test]
+    fn padding_frame_has_expected_layout() {
+        let out = encode_padding_frame(256);
+        assert_eq!(out[0], FLAG_PADDING);
+        assert_eq!(u16::from_be_bytes([out[1], out[2]]), 256);
+        assert_eq!(out.len(), FRAME_HEADER + 256);
     }
 
     #[tokio::test]

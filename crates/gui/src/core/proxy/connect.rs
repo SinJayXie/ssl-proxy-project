@@ -10,10 +10,11 @@ use native_tls::TlsConnector;
 use tokio_native_tls::TlsConnector as TokioTlsConnector;
 use tokio_native_tls::TlsStream;
 
+use super::framing::encode_padding_frame;
 use super::mux::{MuxConfig, MUX};
 use super::tunnel::TargetStream;
 
-// ==================== Protocol v2 (matches server utils/protocol.rs) ====================
+// ==================== Protocol v3 (matches server utils/protocol.rs) ====================
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -22,20 +23,24 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// 协议魔数
 pub(crate) const MAGIC: [u8; 2] = [0x10, 0xff];
-/// 协议版本
-const VERSION: u8 = 2;
+/// 协议版本（v3：带随机 nonce）
+const VERSION: u8 = 3;
 /// HMAC-SHA256 输出长度
 pub(crate) const MAC_LEN: usize = 32;
 
 /// 首包签名域前缀
-const REQ_PREFIX: &[u8] = b"ssl-proxy-v2";
+const REQ_PREFIX: &[u8] = b"ssl-proxy-v3";
 /// 隧道应答签名域前缀
-pub(crate) const ACK_PREFIX: &[u8] = b"ssl-proxy-v2-ack";
+pub(crate) const ACK_PREFIX: &[u8] = b"ssl-proxy-v3-ack";
 
 /// 客户端首包扩展位（MAC 之后追加 1 字节）：bit0 = 请求 UDP 能力
 pub(crate) const EXT_UDP: u8 = 0x01;
+/// 客户端首包扩展位：bit1 = 请求 mux 流级窗口（仅 mux 首包可置位）
+pub(crate) const EXT_MUX_WINDOW: u8 = 0x02;
 /// 服务端 ACK 能力位（ACK MAC 之后追加 1 字节）：bit0 = 支持 UDP 转发
 pub(crate) const CAP_UDP: u8 = 0x01;
+/// 服务端 ACK 能力位：bit1 = 支持 mux 流级窗口
+pub(crate) const CAP_MUX_WINDOW: u8 = 0x02;
 /// UDP 能力探测超时：ACK MAC 之后等待服务端能力位的最长时间
 ///
 /// 旧版服务端不会发送能力字节，超时即视为不支持。
@@ -48,11 +53,19 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-pub(crate) fn compute_mac(password: &str, prefix: &[u8], timestamp: u64, port: u16, host: &str) -> [u8; MAC_LEN] {
+pub(crate) fn compute_mac(
+    password: &str,
+    prefix: &[u8],
+    timestamp: u64,
+    nonce: u64,
+    port: u16,
+    host: &str,
+) -> [u8; MAC_LEN] {
     let mut mac =
         HmacSha256::new_from_slice(password.as_bytes()).expect("HMAC 支持任意长度密钥");
     mac.update(prefix);
     mac.update(&timestamp.to_be_bytes());
+    mac.update(&nonce.to_be_bytes());
     mac.update(&port.to_be_bytes());
     mac.update(host.as_bytes());
 
@@ -62,59 +75,70 @@ pub(crate) fn compute_mac(password: &str, prefix: &[u8], timestamp: u64, port: u
     arr
 }
 
-/// v2 首包及用于校验服务端 ACK 的时间戳
+/// v3 首包及用于校验服务端 ACK 的时间戳/nonce
 ///
-/// `bytes` 末尾固定含 1 字节 UDP 扩展位（请求 UDP 能力，见 [`EXT_UDP`]）。
+/// `bytes` 末尾可能含 1 字节能力扩展位（UDP / mux 窗口）。
 pub struct ProtocolHeader {
     pub bytes: Vec<u8>,
     pub timestamp: u64,
+    pub nonce: u64,
 }
 
-// ==================== Protocol header (v2) ====================
+// ==================== Protocol header (v3) ====================
 
-/// 编码 v2 首包
+/// 编码 v3 首包
 ///
-/// `request_udp = true` 时在 MAC 之后追加 1 字节 UDP 扩展位（[`EXT_UDP`]），
+/// `request_udp` / `request_window` 为真时设置对应扩展位；v3 新客户端**固定**
+/// 携带 1 字节扩展位（无能力时为 0），避免后续的填充帧首字节被服务端误判为 ext。
 /// 新版服务端据此在 ACK MAC 之后回 1 字节能力位。
 ///
-/// 普通 TCP 隧道必须传 `false`：旧版服务端不会回能力位，客户端若跟进读取
-/// 就会白等探测超时，甚至在"目标先说话"的协议上吞掉第一个真实数据字节。
+/// 普通 TCP 隧道两个参数都传 `false`（ext=0）；v3 新客户端固定携带 ext，
+/// 并在 ACK 后读取 1 字节能力位。`request_window` 只能在 mux 首包（hostLen = 0）上使用。
 pub fn create_protocol_header(
     host: &str,
     port: u16,
     password: &str,
     request_udp: bool,
+    request_window: bool,
 ) -> ProtocolHeader {
     let timestamp = unix_now();
-    let mac = compute_mac(password, REQ_PREFIX, timestamp, port, host);
+    let nonce: u64 = rand::random();
+    let mac = compute_mac(password, REQ_PREFIX, timestamp, nonce, port, host);
     let host_bytes = host.as_bytes();
+    let ext = (if request_udp { EXT_UDP } else { 0 })
+        | (if request_window { EXT_MUX_WINDOW } else { 0 });
 
-    let mut bytes = Vec::with_capacity(14 + host_bytes.len() + MAC_LEN + usize::from(request_udp));
+    // magic(2) + ver(1) + ts(8) + nonce(8) + port(2) + hostLen(1) + host + mac(32) + ext(1)
+    // v3 新客户端固定携带扩展位（无能力时为 0），避免后续帧的首字节被误判为 ext。
+    let mut bytes = Vec::with_capacity(23 + host_bytes.len() + MAC_LEN);
     bytes.extend_from_slice(&MAGIC);
     bytes.push(VERSION);
     bytes.extend_from_slice(&timestamp.to_be_bytes());
+    bytes.extend_from_slice(&nonce.to_be_bytes());
     bytes.extend_from_slice(&port.to_be_bytes());
     bytes.push(host_bytes.len() as u8);
     bytes.extend_from_slice(host_bytes);
     bytes.extend_from_slice(&mac);
-    if request_udp {
-        bytes.push(EXT_UDP);
-    }
+    bytes.push(ext);
 
-    ProtocolHeader { bytes, timestamp }
+    ProtocolHeader {
+        bytes,
+        timestamp,
+        nonce,
+    }
 }
 
-// ==================== UDP capability probe ====================
+// ==================== Capability probe ====================
 
 /// ACK MAC 校验通过后，带短超时尝试再读 1 字节服务端能力位
 ///
 /// - 新版服务端（客户端首包携带扩展位时）会在 ACK MAC 后追加 1 字节能力位；
-/// - 旧版服务端不发任何后续字节：超时 / EOF / 读错一律视为不支持（返回 false）。
-pub(crate) async fn probe_udp_capability(stream: &mut TlsStream<TcpStream>) -> bool {
+/// - 旧版服务端不发任何后续字节：超时 / EOF / 读错一律视为不支持（返回 0）。
+pub(crate) async fn probe_capabilities(stream: &mut TlsStream<TcpStream>) -> u8 {
     let mut cap = [0u8; 1];
     match timeout(CAP_PROBE_TIMEOUT, stream.read(&mut cap)).await {
-        Ok(Ok(1)) => cap[0] & CAP_UDP != 0,
-        _ => false,
+        Ok(Ok(1)) => cap[0],
+        _ => 0,
     }
 }
 
@@ -127,7 +151,7 @@ pub(crate) async fn tls_handshake(
     sni_name: &str,
     skip_verify: bool,
 ) -> Result<TlsStream<TcpStream>, String> {
-    let stream = TcpStream::connect(format!("{}:{}", proxy_server, proxy_port))
+    let stream = TcpStream::connect((proxy_server, proxy_port))
         .await
         .map_err(|e| e.to_string())?;
     let _ = stream.set_nodelay(true);
@@ -136,6 +160,8 @@ pub(crate) async fn tls_handshake(
         TlsConnector::builder()
             .danger_accept_invalid_certs(skip_verify)
             .danger_accept_invalid_hostnames(skip_verify)
+            // 与浏览器一致的 ALPN 列表；服务端仅支持 h1 时会自动退回 h1。
+            .request_alpns(&["h2", "http/1.1"])
             .build()
             .map_err(|e| e.to_string())?,
     );
@@ -174,10 +200,13 @@ pub async fn connect_proxy(
     )
     .await?;
 
-    // Step 2: 发送 v2 首包（时间戳 + HMAC，密码不参与传输）
-    let header = create_protocol_header(host, port, password, false);
+    // Step 2: 发送 v3 首包（时间戳 + nonce + HMAC，密码不参与传输）
+    // 与一个纯填充帧合并写出，避免首条 TLS record 只有 60~100B。
+    let header = create_protocol_header(host, port, password, false, false);
+    let mut first = header.bytes;
+    first.extend_from_slice(&encode_padding_frame(400 + rand::random::<u16>() as usize % 500));
     tls_stream
-        .write_all(&header.bytes)
+        .write_all(&first)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -195,10 +224,18 @@ pub async fn connect_proxy(
         ));
     }
 
-    let expected = compute_mac(password, ACK_PREFIX, header.timestamp, port, host);
+    let expected = compute_mac(password, ACK_PREFIX, header.timestamp, header.nonce, port, host);
     if ack[2..] != expected {
         return Err("Proxy server authentication failed (ACK MAC mismatch)".to_string());
     }
+
+    // v3 新客户端固定携带扩展位，服务端必定回 1 字节能力位。
+    // 普通 TCP 隧道不关心能力值，读掉即可，避免污染后续隧道数据。
+    let mut cap = [0u8; 1];
+    tls_stream
+        .read_exact(&mut cap)
+        .await
+        .map_err(|e| format!("Failed to read capability byte: {}", e))?;
 
     Ok(ProxyConnection {
         stream: tls_stream,
@@ -238,9 +275,11 @@ pub async fn connect_udp_tunnel(
     .await
     .map_err(UdpTunnelError::Transport)?;
 
-    let header = create_protocol_header(host, 0, password, true);
+    let header = create_protocol_header(host, 0, password, true, false);
+    let mut first = header.bytes;
+    first.extend_from_slice(&encode_padding_frame(400 + rand::random::<u16>() as usize % 500));
     tls_stream
-        .write_all(&header.bytes)
+        .write_all(&first)
         .await
         .map_err(|e| UdpTunnelError::Transport(e.to_string()))?;
 
@@ -258,14 +297,14 @@ pub async fn connect_udp_tunnel(
             ack[0], ack[1]
         )));
     }
-    let expected = compute_mac(password, ACK_PREFIX, header.timestamp, 0, host);
+    let expected = compute_mac(password, ACK_PREFIX, header.timestamp, header.nonce, 0, host);
     if ack[2..] != expected {
         return Err(UdpTunnelError::Transport(
             "proxy server authentication failed (ACK MAC mismatch)".to_string(),
         ));
     }
 
-    if probe_udp_capability(&mut tls_stream).await {
+    if probe_capabilities(&mut tls_stream).await & CAP_UDP != 0 {
         Ok(tls_stream)
     } else {
         Err(UdpTunnelError::Unsupported(
@@ -345,38 +384,48 @@ pub async fn resolve_and_connect(
     };
     drop(config);
 
-    // DNS lookup for domain
-    let ip = if is_domain {
+    // DNS lookup for domain.
+    // 解析失败不再直接放弃：有上游代理时按“地区未知”继续，交给服务端解析。
+    let resolved_ip = if is_domain {
         match dns::lookup(state, host).await {
-            Ok(ip) => ip,
+            Ok(ip) => Some(ip),
             Err(e) => {
-                log::error!("DNS lookup failed for {}: {}", host, e);
-                return None;
+                if proxy_server.is_empty() {
+                    log::error!("DNS lookup failed for {}: {}", host, e);
+                    return None;
+                }
+                log::warn!(
+                    "DNS lookup failed for {} ({}), routing through proxy",
+                    host,
+                    e
+                );
+                None
             }
         }
     } else {
-        host.to_string()
+        Some(host.to_string())
     };
 
-    // Geo lookup
-    let geo_info = if let Some(country) = state.geo_manager.get_country_by_ip(&ip) {
-        GeoInfo {
+    // Geo lookup（无解析结果时按 Unknown 处理，不参与直连判定）
+    let geo_info = resolved_ip
+        .as_ref()
+        .and_then(|ip| state.geo_manager.get_country_by_ip(ip))
+        .map(|country| GeoInfo {
             country: country.country,
             alpha2_code: country.alpha2_code,
             alpha3_code: country.alpha3_code,
             numeric: country.numeric,
-        }
-    } else {
-        GeoInfo {
+        })
+        .unwrap_or_else(|| GeoInfo {
             country: "Unknown".to_string(),
             alpha2_code: "UNK".to_string(),
             alpha3_code: "UNK".to_string(),
             numeric: 0,
-        }
-    };
+        });
 
     // Determine if direct connection.
     // Priority: no proxy → direct; rules.yaml → first match wins; config.directs → fallback.
+    // 没有解析结果时无法直连，即使规则命中 DIRECT 也回退到代理（可用性优先）。
     let is_direct = if proxy_server.is_empty() {
         // No upstream proxy configured — force direct
         true
@@ -384,11 +433,13 @@ pub async fn resolve_and_connect(
         let rules = state.rules.read().await;
         if let Some(mode) = match_rules(host, &geo_info.alpha2_code, &rules) {
             drop(rules);
-            mode == "DIRECT"
+            mode == "DIRECT" && resolved_ip.is_some()
         } else {
             drop(rules);
             // Fall back to legacy config.directs (regions from settings, case-insensitive)
-            geo_info.alpha2_code == "PRIVATE" || directs.iter().any(|d| d.eq_ignore_ascii_case(&geo_info.alpha2_code))
+            resolved_ip.is_some()
+                && (geo_info.alpha2_code == "PRIVATE"
+                    || directs.iter().any(|d| d.eq_ignore_ascii_case(&geo_info.alpha2_code)))
         }
     };
 
@@ -404,7 +455,7 @@ pub async fn resolve_and_connect(
         host: host.to_string(),
         port,
         id,
-        ip: ip.clone(),
+        ip: resolved_ip.clone().unwrap_or_default(),
         conn_type: if is_direct { "DIRECT".to_string() } else { "PROXY".to_string() },
         create_time: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -423,7 +474,8 @@ pub async fn resolve_and_connect(
     let time = std::time::Instant::now();
 
     if is_direct {
-        let target = match TcpStream::connect(format!("{}:{}", host, port)).await {
+        // 用 (host, port) 元组交给 tokio 解析：IPv6 字面量不能用字符串拼接
+        let target = match TcpStream::connect((host, port)).await {
             Ok(t) => t,
             Err(e) => {
                 log::error!("Direct connect failed for {}:{}: {}", host, port, e);

@@ -1,8 +1,0 @@
-{
-    "version": "2.3.5",
-    "changelog": [
-      "Connections: show a TCP / UDP transport badge on every connection group and row",
-      "Connections: UDP sessions show PROXY / DIRECT separately from the transport badge"
-    ],
-    "downloadUrl": "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.3.5_x64-setup.exe"
-}

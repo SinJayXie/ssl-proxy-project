@@ -19,6 +19,7 @@
 //! | 5 | PONG：保活应答 |
 //! | 6 | UDP：UDP 数据报（payload 见 `services/udp_relay_service.rs`） |
 //! | 7 | UDP_CLOSE：客户端回收 UDP 会话（payload 为空，服务端按 sid 摘除 NAT 表项） |
+//! | 8 | WINDOW：流级窗口返还（payload = credit u32 BE，接收方已消费的字节数） |
 //!
 //! `sid = 0` 保留给连接级控制帧。
 
@@ -40,6 +41,13 @@ pub const FLAG_UDP: u8 = 6;
 /// 关闭 UDP 会话（客户端 → 服务端，payload 为空）：服务端按 `sid` 回收
 /// 对应的 NAT 会话（`sid` 与 payload 中的 `stream_id` 为同一会话 ID）
 pub const FLAG_UDP_CLOSE: u8 = 7;
+/// 流级窗口返还（双向）：payload = `credit u32 BE`
+pub const FLAG_WINDOW: u8 = 8;
+/// 纯填充帧（连接级，接收方丢弃 payload）
+pub const FLAG_PADDING: u8 = 9;
+
+/// 单流初始窗口（字节）
+pub const STREAM_WINDOW: usize = 256 * 1024;
 
 /// 帧头：flag(1) + sid(4) + len(2) + padLen(1)
 pub const MUX_HEADER: usize = 8;
@@ -100,6 +108,22 @@ pub fn encode_open(sid: u32, host: &str, port: u16) -> Vec<u8> {
 pub fn encode_ctl(flag: u8, sid: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(MUX_HEADER);
     append_frame(&mut out, flag, sid, &[], 0);
+    out
+}
+
+/// 编码窗口返还帧：通知对端可以继续发送 `credit` 字节
+pub fn encode_window(sid: u32, credit: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(MUX_HEADER + 4);
+    append_frame(&mut out, FLAG_WINDOW, sid, &credit.to_be_bytes(), 0);
+    out
+}
+
+/// 编码纯填充帧（接收方丢弃），用于撑大首条 TLS record
+pub fn encode_padding_frame(payload_len: usize) -> Vec<u8> {
+    let mut payload = vec![0u8; payload_len.min(MAX_PAYLOAD)];
+    rand::thread_rng().fill(&mut payload[..]);
+    let mut out = Vec::with_capacity(MUX_HEADER + payload.len());
+    append_frame(&mut out, FLAG_PADDING, 0, &payload, 0);
     out
 }
 
@@ -200,6 +224,14 @@ mod tests {
         // 至少 5 字节 payload + 可能 padding，整体应大于头部 + 4
         assert!(frame.len() >= MUX_HEADER + 4);
         assert!(frame.len() <= MUX_HEADER + 4 + 96);
+    }
+
+    #[test]
+    fn padding_frame_has_expected_layout() {
+        let frame = encode_padding_frame(128);
+        assert_eq!(frame[0], FLAG_PADDING);
+        assert_eq!(u16::from_be_bytes([frame[5], frame[6]]), 128);
+        assert_eq!(frame.len(), MUX_HEADER + 128);
     }
 
     #[test]

@@ -1,0 +1,9 @@
+[package]
+name = "update-signer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Release-only tool: Ed25519 keygen / update package signing"
+
+[dependencies]
+ring = "0.17"

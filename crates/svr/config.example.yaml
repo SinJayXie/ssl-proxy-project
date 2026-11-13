@@ -12,6 +12,8 @@ server:
   # password: "your-strong-password"
   # 是否接受多路复用（mux）连接，默认 true；false 等同于 --no-mux
   # mux: true
+  # 允许隧道连接回环 / 内网目标，默认 false（防 SSRF）；内网代理场景才需开启
+  # allow-private-targets: false
 
 # ---- tls ----
 # 证书 / 私钥均缺省时启动期自动生成自签证书 (SAN: localhost, 127.0.0.1)
@@ -25,6 +27,8 @@ tls:
 static-sources:
   html: "./html"
   index: "index.html"
+  # 真实站点回落（绝对 URL）：配置后未认证流量反代到该站点，并启用 HTTP/2
+  # fallback-url: "https://example.com"
 
 # ---- log ----
 log:

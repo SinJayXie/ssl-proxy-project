@@ -8,6 +8,9 @@
 //! +------+--------+--------+--------+----------+-----+
 //!   1B      4B       2B       1B       len       padLen
 //! ```
+//!
+//! 流控：mux 首包请求窗口能力且服务端确认后，每条流有独立的 256KB 窗口；
+//! 发送方按字节申请额度，接收方消费后回 `FLAG_WINDOW` 返还。
 
 use std::collections::HashMap;
 use std::io;
@@ -19,12 +22,12 @@ use once_cell::sync::Lazy;
 use rand::Rng;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio_native_tls::TlsStream;
 
 use super::connect::{
-    compute_mac, create_protocol_header, probe_udp_capability, tls_handshake, ACK_PREFIX,
-    MAC_LEN, MAGIC,
+    compute_mac, create_protocol_header, probe_capabilities, tls_handshake, ACK_PREFIX,
+    CAP_MUX_WINDOW, CAP_UDP, MAC_LEN, MAGIC,
 };
 use super::framing::{encode_udp_packet, parse_udp_packet};
 
@@ -41,6 +44,10 @@ pub const FLAG_PONG: u8 = 5;
 pub const FLAG_UDP: u8 = 6;
 /// 关闭 UDP 会话（客户端 → 服务端，payload 为空）
 pub const FLAG_UDP_CLOSE: u8 = 7;
+/// 流级窗口返还（双向）：payload = `credit u32 BE`
+pub const FLAG_WINDOW: u8 = 8;
+/// 纯填充帧（连接级，接收方丢弃）
+pub const FLAG_PADDING: u8 = 9;
 
 pub const MUX_HEADER: usize = 8;
 pub const MAX_STREAMS: usize = 256;
@@ -49,6 +56,10 @@ const MAX_CONNS: usize = 4;
 const STREAM_BUFFER: usize = 64;
 const FRAME_QUEUE: usize = 512;
 const KEEPALIVE_SECS: u64 = 25;
+/// 单流初始窗口（字节）
+const STREAM_WINDOW: usize = 256 * 1024;
+/// 单次发送切片上限（避免单帧超过窗口）
+const SEND_CHUNK: usize = 16 * 1024;
 
 fn append_frame(out: &mut Vec<u8>, flag: u8, sid: u32, payload: &[u8], pad_len: usize) {
     let pad_len = pad_len.min(u8::MAX as usize);
@@ -91,6 +102,22 @@ fn encode_open(sid: u32, host: &str, port: u16) -> Vec<u8> {
 fn encode_ctl(flag: u8, sid: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(MUX_HEADER);
     append_frame(&mut out, flag, sid, &[], 0);
+    out
+}
+
+/// 编码窗口返还帧
+fn encode_window(sid: u32, credit: u32) -> Vec<u8> {
+    let mut out = Vec::with_capacity(MUX_HEADER + 4);
+    append_frame(&mut out, FLAG_WINDOW, sid, &credit.to_be_bytes(), 0);
+    out
+}
+
+/// 编码纯填充帧（接收方丢弃）
+fn encode_padding_frame(payload_len: usize) -> Vec<u8> {
+    let mut payload = vec![0u8; payload_len.min(u16::MAX as usize)];
+    rand::thread_rng().fill(&mut payload[..]);
+    let mut out = Vec::with_capacity(MUX_HEADER + payload.len());
+    append_frame(&mut out, FLAG_PADDING, 0, &payload, 0);
     out
 }
 
@@ -159,14 +186,24 @@ enum InEvent {
     Reset,
 }
 
+/// 流表中的一条记录：下行事件队列 + 上传窗口
+#[derive(Clone)]
+struct StreamEntry {
+    tx: mpsc::Sender<InEvent>,
+    /// 上传方向（客户端 → 服务端）窗口；窗口未协商时不使用
+    window: Arc<Semaphore>,
+}
+
 struct MuxClient {
     frame_tx: mpsc::Sender<Vec<u8>>,
-    streams: Arc<Mutex<HashMap<u32, mpsc::Sender<InEvent>>>>,
+    streams: Arc<Mutex<HashMap<u32, StreamEntry>>>,
     next_sid: AtomicU32,
     active: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
     /// 服务端是否支持 UDP 转发（能力协商结果，供 UDP over mux 使用）
     pub(crate) udp_supported: bool,
+    /// 是否启用流级窗口（客户端请求 + 服务端确认）
+    window_enabled: bool,
 }
 
 impl MuxClient {
@@ -176,9 +213,11 @@ impl MuxClient {
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e))?;
 
-        // v2 mux 首包（hostLen = 0，末尾带 UDP 扩展位：mux 池需要感知 UDP 能力）
-        let header = create_protocol_header("", 0, &cfg.password, true);
-        tls.write_all(&header.bytes).await?;
+        // v2 mux 首包（hostLen = 0，请求 UDP 能力 + 流级窗口）
+        let header = create_protocol_header("", 0, &cfg.password, true, true);
+        let mut first = header.bytes;
+        first.extend_from_slice(&encode_padding_frame(400 + rand::random::<u16>() as usize % 500));
+        tls.write_all(&first).await?;
 
         let mut ack = [0u8; 2 + MAC_LEN];
         tls.read_exact(&mut ack).await?;
@@ -188,7 +227,7 @@ impl MuxClient {
                 "mux handshake rejected",
             ));
         }
-        let expected = compute_mac(&cfg.password, ACK_PREFIX, header.timestamp, 0, "");
+        let expected = compute_mac(&cfg.password, ACK_PREFIX, header.timestamp, header.nonce, 0, "");
         if ack[2..] != expected {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -196,12 +235,14 @@ impl MuxClient {
             ));
         }
 
-        // UDP 能力探测：旧服务端不会发能力字节（短超时视为不支持）
-        let udp_supported = probe_udp_capability(&mut tls).await;
+        // 能力探测：旧服务端不会发能力字节（短超时视为都不支持）
+        let cap = probe_capabilities(&mut tls).await;
+        let udp_supported = cap & CAP_UDP != 0;
+        let window_enabled = cap & CAP_MUX_WINDOW != 0;
 
         let (mut reader, mut writer) = tokio::io::split(tls);
         let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE);
-        let streams: Arc<Mutex<HashMap<u32, mpsc::Sender<InEvent>>>> =
+        let streams: Arc<Mutex<HashMap<u32, StreamEntry>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
 
@@ -238,32 +279,40 @@ impl MuxClient {
                     Ok(v) => v,
                     Err(_) => break,
                 };
-                let sender = { reader_streams.lock().await.get(&sid).cloned() };
-                let Some(sender) = sender else {
+                let entry = { reader_streams.lock().await.get(&sid).cloned() };
+                let Some(entry) = entry else {
                     continue;
                 };
                 match flag {
-                    FLAG_DATA => {
-                        if sender.send(InEvent::Data(payload.clone())).await.is_err() {
+                    FLAG_DATA | FLAG_UDP => {
+                        if entry.tx.send(InEvent::Data(payload.clone())).await.is_err() {
                             reader_streams.lock().await.remove(&sid);
                         }
                     }
-                    FLAG_UDP => {
-                        if sender.send(InEvent::Data(payload.clone())).await.is_err() {
-                            reader_streams.lock().await.remove(&sid);
+                    FLAG_WINDOW => {
+                        if window_enabled && payload.len() >= 4 {
+                            let credit = u32::from_be_bytes([
+                                payload[0],
+                                payload[1],
+                                payload[2],
+                                payload[3],
+                            ]);
+                            // 窗口上限 = 初始值，防止对端无限放大
+                            let free = STREAM_WINDOW
+                                .saturating_sub(entry.window.available_permits());
+                            entry.window.add_permits((credit as usize).min(free));
                         }
                     }
                     FLAG_FIN | FLAG_UDP_CLOSE => {
-                        let _ = sender.send(InEvent::Fin).await;
+                        let _ = entry.tx.send(InEvent::Fin).await;
                         reader_streams.lock().await.remove(&sid);
                     }
                     FLAG_RST => {
-                        let _ = sender.send(InEvent::Reset).await;
+                        let _ = entry.tx.send(InEvent::Reset).await;
                         reader_streams.lock().await.remove(&sid);
                     }
-                    FLAG_PING => {
-                        let _ = sender;
-                    }
+                    FLAG_PING => {}
+                    FLAG_PADDING => {}
                     _ => {}
                 }
             }
@@ -280,6 +329,7 @@ impl MuxClient {
             active: Arc::new(AtomicUsize::new(0)),
             closed,
             udp_supported,
+            window_enabled,
         }))
     }
 
@@ -293,7 +343,14 @@ impl MuxClient {
         }
         let sid = self.next_sid.fetch_add(1, Ordering::Relaxed).max(1);
         let (tx, rx) = mpsc::channel(STREAM_BUFFER);
-        self.streams.lock().await.insert(sid, tx);
+        let window = Arc::new(Semaphore::new(STREAM_WINDOW));
+        self.streams.lock().await.insert(
+            sid,
+            StreamEntry {
+                tx,
+                window: window.clone(),
+            },
+        );
         self.active.fetch_add(1, Ordering::Relaxed);
 
         if self.frame_tx.send(encode_open(sid, host, port)).await.is_err() {
@@ -310,6 +367,7 @@ impl MuxClient {
             sid,
             rx,
             frame_tx: self.frame_tx.clone(),
+            window: self.window_enabled.then_some(window),
             guard,
         })
     }
@@ -324,7 +382,14 @@ impl MuxClient {
         }
         let sid = self.next_sid.fetch_add(1, Ordering::Relaxed).max(1);
         let (tx, rx) = mpsc::channel(STREAM_BUFFER);
-        self.streams.lock().await.insert(sid, tx);
+        self.streams.lock().await.insert(
+            sid,
+            StreamEntry {
+                tx,
+                // UDP 不使用流级窗口，占位保持表结构统一
+                window: Arc::new(Semaphore::new(STREAM_WINDOW)),
+            },
+        );
         self.active.fetch_add(1, Ordering::Relaxed);
 
         let guard = Arc::new(StreamGuard {
@@ -356,6 +421,8 @@ pub struct MuxStream {
     sid: u32,
     rx: mpsc::Receiver<InEvent>,
     frame_tx: mpsc::Sender<Vec<u8>>,
+    /// 上传窗口；窗口未协商时为 None（不限制）
+    window: Option<Arc<Semaphore>>,
     guard: Arc<StreamGuard>,
 }
 
@@ -363,6 +430,9 @@ pub struct MuxStream {
 pub struct MuxStreamReader {
     rx: mpsc::Receiver<InEvent>,
     eof: bool,
+    sid: u32,
+    frame_tx: mpsc::Sender<Vec<u8>>,
+    window_enabled: bool,
     _guard: Arc<StreamGuard>,
 }
 
@@ -370,20 +440,43 @@ pub struct MuxStreamReader {
 pub struct MuxStreamWriter {
     sid: u32,
     frame_tx: mpsc::Sender<Vec<u8>>,
+    window: Option<Arc<Semaphore>>,
     _guard: Arc<StreamGuard>,
+}
+
+/// 按窗口额度切片发送（未启用窗口时整段发送）
+async fn send_framed(
+    sid: u32,
+    frame_tx: &mpsc::Sender<Vec<u8>>,
+    window: Option<&Arc<Semaphore>>,
+    data: &[u8],
+) -> io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let mut off = 0;
+    while off < data.len() {
+        let take = (data.len() - off).min(SEND_CHUNK);
+        if let Some(window) = window {
+            // 消耗额度（forget）：额度由对端消费后通过 WINDOW 帧返还
+            if let Ok(permit) = window.clone().acquire_many_owned(take as u32).await {
+                permit.forget();
+            }
+        }
+        let frame = encode_data(sid, &data[off..off + take]);
+        frame_tx
+            .send(frame)
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "mux closed"))?;
+        off += take;
+    }
+    Ok(())
 }
 
 impl MuxStream {
     /// 直接发送数据（未拆分时使用）
     pub async fn send(&self, data: &[u8]) -> io::Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        let frame = encode_data(self.sid, data);
-        self.frame_tx
-            .send(frame)
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "mux closed"))
+        send_framed(self.sid, &self.frame_tx, self.window.as_ref(), data).await
     }
 
     /// 拆分为读半 / 写半，供双向并发转发使用
@@ -391,11 +484,15 @@ impl MuxStream {
         let reader = MuxStreamReader {
             rx: self.rx,
             eof: false,
+            sid: self.sid,
+            frame_tx: self.frame_tx.clone(),
+            window_enabled: self.window.is_some(),
             _guard: self.guard.clone(),
         };
         let writer = MuxStreamWriter {
             sid: self.sid,
             frame_tx: self.frame_tx,
+            window: self.window,
             _guard: self.guard,
         };
         (reader, writer)
@@ -424,19 +521,22 @@ impl MuxStreamReader {
             }
         }
     }
+
+    /// 已消费 `n` 字节：向服务端返还下载方向窗口
+    pub async fn ack(&self, n: usize) {
+        if self.window_enabled && n > 0 {
+            let _ = self
+                .frame_tx
+                .send(encode_window(self.sid, n as u32))
+                .await;
+        }
+    }
 }
 
 impl MuxStreamWriter {
     /// 发送数据（经由 mux 写队列）
     pub async fn send(&self, data: &[u8]) -> io::Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-        let frame = encode_data(self.sid, data);
-        self.frame_tx
-            .send(frame)
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "mux closed"))
+        send_framed(self.sid, &self.frame_tx, self.window.as_ref(), data).await
     }
 
     /// 半关闭：通知服务端本方向不再发送
@@ -513,6 +613,9 @@ impl MuxManager {
     }
 
     /// 打开一条逻辑流，必要时新建底层 mux 连接
+    ///
+    /// 已有连接上 OPEN 失败说明该连接多半已断（读任务还没标记 closed），
+    /// 此时丢弃这条连接并继续尝试/新建，避免断线后首个请求直接失败。
     pub async fn open(&self, cfg: &MuxConfig, host: &str, port: u16) -> io::Result<MuxStream> {
         let key = cfg.key();
         let mut cur_key = self.key.lock().await;
@@ -524,9 +627,19 @@ impl MuxManager {
         }
         conns.retain(|c| !c.is_closed());
 
-        for conn in conns.iter() {
-            if conn.active.load(Ordering::Relaxed) < MAX_STREAMS {
-                return conn.open_stream(host, port).await;
+        let mut idx = 0;
+        while idx < conns.len() {
+            let conn = conns[idx].clone();
+            if conn.active.load(Ordering::Relaxed) >= MAX_STREAMS {
+                idx += 1;
+                continue;
+            }
+            match conn.open_stream(host, port).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    log::warn!("Mux stream open failed, dropping connection: {}", e);
+                    conns.remove(idx);
+                }
             }
         }
 
@@ -541,13 +654,18 @@ impl MuxManager {
             cfg.port,
             conns.len()
         );
-        client.open_stream(host, port).await
+        let result = client.open_stream(host, port).await;
+        if result.is_err() {
+            conns.retain(|c| !Arc::ptr_eq(c, &client));
+        }
+        result
     }
 
     /// 打开一条 UDP 会话流，必要时新建底层 mux 连接
     ///
     /// 服务端不支持 UDP（能力协商 `udp_supported = false`）时返回
-    /// `ErrorKind::Unsupported`，调用方应降级为 direct。
+    /// `ErrorKind::Unsupported`，调用方应降级为 direct；其他错误按"连接已断"
+    /// 处理，丢弃该连接后重试/新建。
     pub async fn open_udp(&self, cfg: &MuxConfig) -> io::Result<MuxUdpStream> {
         let key = cfg.key();
         let mut cur_key = self.key.lock().await;
@@ -559,9 +677,20 @@ impl MuxManager {
         }
         conns.retain(|c| !c.is_closed());
 
-        for conn in conns.iter() {
-            if conn.active.load(Ordering::Relaxed) < MAX_STREAMS {
-                return open_udp_on(conn).await;
+        let mut idx = 0;
+        while idx < conns.len() {
+            let conn = conns[idx].clone();
+            if conn.active.load(Ordering::Relaxed) >= MAX_STREAMS {
+                idx += 1;
+                continue;
+            }
+            match open_udp_on(&conn).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => return Err(e),
+                Err(e) => {
+                    log::warn!("Mux UDP open failed, dropping connection: {}", e);
+                    conns.remove(idx);
+                }
             }
         }
 
@@ -576,7 +705,11 @@ impl MuxManager {
             cfg.port,
             conns.len()
         );
-        open_udp_on(&client).await
+        let result = open_udp_on(&client).await;
+        if matches!(&result, Err(e) if e.kind() != io::ErrorKind::Unsupported) {
+            conns.retain(|c| !Arc::ptr_eq(c, &client));
+        }
+        result
     }
 }
 

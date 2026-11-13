@@ -149,6 +149,12 @@ pub struct UpdateManifest {
     pub version: String,
     pub changelog: Vec<String>,
     pub download_url: String,
+    /// 安装包 SHA-256（64 位十六进制）；缺失或不匹配时客户端拒绝执行安装包
+    #[serde(default)]
+    pub sha256: String,
+    /// 安装包 Ed25519 签名（128 位十六进制）；缺失或校验失败时客户端拒绝执行
+    #[serde(default)]
+    pub signature: String,
 }
 
 /// Result returned to frontend after checking for updates
@@ -160,6 +166,12 @@ pub struct CheckUpdateResult {
     pub current_version: String,
     pub changelog: Vec<String>,
     pub download_url: String,
+    /// 安装包 SHA-256（来自更新清单），下载后用于完整性校验
+    #[serde(default)]
+    pub sha256: String,
+    /// 安装包 Ed25519 签名（来自更新清单），执行前用内置公钥校验
+    #[serde(default)]
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]

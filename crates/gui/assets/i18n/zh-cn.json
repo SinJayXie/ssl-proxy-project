@@ -105,6 +105,8 @@
   "UPDATE_AVAILABLE": "发现新版本",
   "UPDATE_DOWNLOAD": "下载",
   "UPDATE_LATER": "稍后",
+  "UPDATE_REQUIRED": "此版本为强制更新，安装完成前无法继续使用。",
+  "UPDATE_FAILED": "更新下载失败，请检查网络后重试。",
   "CHECK_UPDATE": "检查更新",
   "CHECKING_UPDATE": "检查中...",
   "UPDATE_NONE": "已是最新版本",
