@@ -1,4 +1,4 @@
-use crate::ui::i18n;
+use crate::ui::{i18n, theme};
 use gpui_kit::base::h_flex;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -16,7 +16,7 @@ pub fn open_confirm(
 ) {
     let on_confirm = Arc::new(on_confirm);
 
-    window.open_dialog(cx, move |dialog, _, _| {
+    window.open_dialog(cx, move |dialog, _, cx| {
         let title = title.clone();
         let message = message.clone();
         let action = on_confirm.clone();
@@ -25,6 +25,7 @@ pub fn open_confirm(
 
         dialog
             .w(px(380.))
+            .bg(theme::dialog(cx))
             .title(title)
             .child(div().text_sm().child(message))
             .footer(

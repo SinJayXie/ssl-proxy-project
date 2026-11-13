@@ -50,6 +50,8 @@
   "SETTINGS_NETWORK_DESC": "Bind addresses and DNS servers, one per row.",
   "SETTINGS_ROUTING": "Routing",
   "SETTINGS_ROUTING_DESC": "Traffic from these regions connects directly.",
+  "SETTINGS_APPEARANCE": "Appearance",
+  "SETTINGS_APPEARANCE_DESC": "Window background effect for this device. Takes effect immediately.",
   "UDP_MODE": "UDP Relay",
   "UDP_MODE_HINT": "Off: reject SOCKS5 UDP ASSOCIATE. Direct: UDP always leaves via the local network. Proxy: UDP follows routing rules through the server (falls back to direct if the server lacks UDP support).",
   "UDP_MODE_OFF": "Off",
@@ -132,5 +134,10 @@
   "SNI_NAME_HINT": "Hostname sent during TLS handshake. Leave empty to use the proxy server address.",
   "MUX_ENABLED": "Multiplexing (TLS reuse)",
   "MUX_ENABLED_ON": "Enabled (share one TLS tunnel, lower handshake latency)",
-  "MUX_ENABLED_OFF": "Disabled (one TLS handshake per connection)"
+  "MUX_ENABLED_OFF": "Disabled (one TLS handshake per connection)",
+  "ACRYLIC_BACKGROUND": "Acrylic Background",
+  "ACRYLIC_ON": "Enabled (blurred window background; text anti-aliasing gets a bit softer)",
+  "ACRYLIC_OFF": "Disabled (solid window background)",
+  "ACRYLIC_OPACITY": "Background Opacity",
+  "ACRYLIC_OPACITY_HINT": "Lower values let more of the desktop show through; too low hurts legibility. Requires acrylic background."
 }

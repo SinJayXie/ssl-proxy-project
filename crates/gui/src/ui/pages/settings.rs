@@ -9,6 +9,7 @@ use gpui_kit::component::combobox::{Combobox, ComboboxState};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::searchable_list::SearchableVec;
 use gpui_kit::component::select::{Select, SelectState};
+use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::WindowExt as _;
@@ -172,6 +173,13 @@ pub struct SettingsPage {
     inputs: SettingsInputs,
     tls_skip: bool,
     mux_enabled: bool,
+    /// 亚克力窗口背景（偏好项，改动立即生效，不参与配置保存）。
+    acrylic: bool,
+    /// 亚克力背景不透明度（30-100）。
+    acrylic_opacity: u32,
+    acrylic_slider: Entity<SliderState>,
+    /// 拖动滑块的回调订阅，必须在页面生命周期内保持存活。
+    _acrylic_slider_subscription: Subscription,
     error: Option<String>,
 }
 
@@ -180,6 +188,20 @@ impl SettingsPage {
         let config = core.snapshot_config().unwrap_or_default();
         let countries = core.geo_countries();
         let inputs = SettingsInputs::new(&config, &countries, window, cx);
+        let prefs = Prefs::load(&core.state.config_dir);
+        let acrylic = prefs.acrylic;
+        let acrylic_opacity = prefs.acrylic_opacity.clamp(theme::MIN_ACRYLIC_OPACITY, 100);
+        let acrylic_slider = cx.new(|_| {
+            SliderState::new()
+                .min(theme::MIN_ACRYLIC_OPACITY as f32)
+                .max(100.0)
+                .step(1.0)
+                .default_value(acrylic_opacity as f32)
+        });
+        let acrylic_slider_subscription =
+            cx.subscribe(&acrylic_slider, |this, _, event: &SliderEvent, cx| {
+                this.on_acrylic_opacity(event, cx)
+            });
 
         Self {
             core,
@@ -188,6 +210,10 @@ impl SettingsPage {
             inputs,
             tls_skip: config.danger_accept_invalid_certs,
             mux_enabled: config.mux_enabled,
+            acrylic,
+            acrylic_opacity,
+            acrylic_slider,
+            _acrylic_slider_subscription: acrylic_slider_subscription,
             error: None,
         }
     }
@@ -200,6 +226,40 @@ impl SettingsPage {
     fn toggle_mux(&mut self, checked: &bool, cx: &mut Context<Self>) {
         self.mux_enabled = *checked;
         cx.notify();
+    }
+
+    fn toggle_acrylic(&mut self, checked: &bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.acrylic = *checked;
+        self.save_acrylic_prefs();
+
+        // 立即生效：换半透明调色板 + 平台窗口背景（Blurred/Opaque）。
+        theme::set_acrylic(cx, self.acrylic);
+        window.set_background_appearance(theme::window_background(self.acrylic));
+        cx.notify();
+    }
+
+    /// 拖动/键盘调整背景不透明度：实时预览并落盘。
+    fn on_acrylic_opacity(&mut self, event: &SliderEvent, cx: &mut Context<Self>) {
+        let value = match event {
+            SliderEvent::Change(value) | SliderEvent::Release(value) => value.start(),
+        };
+        let percent = value.round() as u32;
+        // Change 与 Release 常带同一个值，去重避免重复重算调色板和写盘。
+        if percent == self.acrylic_opacity {
+            return;
+        }
+
+        self.acrylic_opacity = percent;
+        theme::set_acrylic_opacity(cx, percent);
+        self.save_acrylic_prefs();
+        cx.notify();
+    }
+
+    fn save_acrylic_prefs(&self) {
+        let mut prefs = Prefs::load(&self.core.state.config_dir);
+        prefs.acrylic = self.acrylic;
+        prefs.acrylic_opacity = self.acrylic_opacity;
+        prefs.save(&self.core.state.config_dir);
     }
 
     fn revert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -356,6 +416,7 @@ impl SettingsPage {
 
             dialog
                 .w(px(380.))
+                .bg(theme::dialog(cx))
                 .title(i18n::t("CONFIRM_SAVE_TITLE"))
                 .child(
                     h_flex()
@@ -410,9 +471,10 @@ impl SettingsPage {
         let weak = cx.weak_entity();
         let current = i18n::language();
 
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, _, cx| {
             dialog
                 .w(px(320.))
+                .bg(theme::dialog(cx))
                 .title(i18n::t("LANGUAGE"))
                 .child(
                     v_flex()
@@ -718,6 +780,74 @@ impl Render for SettingsPage {
                 .into_any_element(),
         );
 
+        // 外观：亚克力（毛玻璃）背景 + 不透明度
+        let appearance_card = section(
+            i18n::t("SETTINGS_APPEARANCE"),
+            i18n::t("SETTINGS_APPEARANCE_DESC"),
+            cx,
+            v_flex()
+                .w_full()
+                .gap_3()
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .child(i18n::t("ACRYLIC_BACKGROUND")),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme::text_muted(cx))
+                                        .child(if self.acrylic {
+                                            i18n::t("ACRYLIC_ON")
+                                        } else {
+                                            i18n::t("ACRYLIC_OFF")
+                                        }),
+                                ),
+                        )
+                        .child(
+                            Switch::new("acrylic-background")
+                                .checked(self.acrylic)
+                                .on_change(cx.listener(|this, checked, window, cx| {
+                                    this.toggle_acrylic(checked, window, cx)
+                                })),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap(px(4.))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .child(field_label(i18n::t("ACRYLIC_OPACITY"), cx))
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme::text_muted(cx))
+                                        .child(format!("{}%", self.acrylic_opacity)),
+                                ),
+                        )
+                        .child(Slider::new(&self.acrylic_slider).disabled(!self.acrylic))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme::text_muted(cx))
+                                .child(i18n::t("ACRYLIC_OPACITY_HINT")),
+                        ),
+                )
+                .into_any_element(),
+        );
+
         let mut content = v_flex()
             .w_full()
             .max_w(px(760.))
@@ -726,7 +856,8 @@ impl Render for SettingsPage {
             .child(proxy_card)
             .child(tls_card)
             .child(network_card)
-            .child(routing_card);
+            .child(routing_card)
+            .child(appearance_card);
 
         if let Some(error) = self.error.as_ref().or(validation_error.as_ref()) {
             content = content.child(
@@ -796,7 +927,6 @@ impl Render for SettingsPage {
                     .pb_3()
                     .border_t_1()
                     .border_color(theme::border_light(cx))
-                    .bg(cx.theme().background)
                     .child(
                         Button::new("settings-language")
                             .icon(Icon::default().path(mdi("translate")))

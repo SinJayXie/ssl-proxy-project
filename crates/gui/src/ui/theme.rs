@@ -1,17 +1,92 @@
 use gpui_kit::component::scroll::ScrollbarMode;
 use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode};
-use gpui_kit::{px, rgb, rgba, App, Hsla};
+use gpui_kit::{px, rgb, rgba, App, Hsla, WindowBackgroundAppearance};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+/// 亚克力背景不透明度的默认值与下限（百分比）。再低就只剩模糊，字看不清了。
+pub const DEFAULT_ACRYLIC_OPACITY: u32 = 72;
+pub const MIN_ACRYLIC_OPACITY: u32 = 30;
+
+/// 亚克力（毛玻璃）开关：调色板与 [`card`] 都按它输出半透明色，
+/// 窗口自身的模糊由 [`window_background`] + `Window::set_background_appearance` 负责。
+static ACRYLIC: AtomicBool = AtomicBool::new(false);
+/// 亚克力背景不透明度（百分比），只影响半透明表面色，不影响窗口模糊本身。
+static ACRYLIC_OPACITY: AtomicU32 = AtomicU32::new(DEFAULT_ACRYLIC_OPACITY);
+
+pub fn acrylic() -> bool {
+    ACRYLIC.load(Ordering::Relaxed)
+}
+
+/// 当前亚克力不透明度（30-100）。
+pub fn acrylic_opacity() -> u32 {
+    ACRYLIC_OPACITY
+        .load(Ordering::Relaxed)
+        .clamp(MIN_ACRYLIC_OPACITY, 100)
+}
+
+/// 当前亚克力不透明度（0.0-1.0），用于颜色 alpha。
+fn acrylic_alpha() -> f32 {
+    acrylic_opacity() as f32 / 100.0
+}
+
+/// 开启/关闭亚克力并立即重算调色板（`Theme::update` 会刷新所有窗口）。
+pub fn set_acrylic(cx: &mut App, enabled: bool) {
+    if ACRYLIC.swap(enabled, Ordering::Relaxed) == enabled {
+        return;
+    }
+    apply_palette(cx);
+}
+
+/// 调整亚克力背景不透明度（百分比）并立即重算调色板。
+pub fn set_acrylic_opacity(cx: &mut App, percent: u32) {
+    let percent = percent.clamp(MIN_ACRYLIC_OPACITY, 100);
+    if ACRYLIC_OPACITY.swap(percent, Ordering::Relaxed) == percent {
+        return;
+    }
+    apply_palette(cx);
+}
+
+/// 启动时一次性恢复开关与不透明度，避免连续重算两次调色板。
+pub fn restore_acrylic(cx: &mut App, enabled: bool, opacity: u32) {
+    ACRYLIC.store(enabled, Ordering::Relaxed);
+    ACRYLIC_OPACITY.store(opacity.clamp(MIN_ACRYLIC_OPACITY, 100), Ordering::Relaxed);
+    apply_palette(cx);
+}
+
+/// 平台窗口背景取值。只有 Windows（Win10 1809+ 走亚克力）与 macOS
+/// （`NSVisualEffectView` 毛玻璃）支持 `Blurred`，其它平台保持不透明，
+/// 否则窗口会变成没有内容的全透明。
+pub fn window_background(enabled: bool) -> WindowBackgroundAppearance {
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        if enabled {
+            WindowBackgroundAppearance::Blurred
+        } else {
+            WindowBackgroundAppearance::Opaque
+        }
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        let _ = enabled;
+        WindowBackgroundAppearance::Opaque
+    }
+}
 
 /// Apply the macOS-inspired palette used across the application.
 ///
 /// Light: content `#f5f5f7`, cards `#ffffff`, accent `#007aff`.
 /// Dark: content `#1e1e1e`, cards `#2c2c2e`, accent `#0a84ff`.
 pub fn apply(cx: &mut App, mode: ThemeMode) {
-    let dark = mode.is_dark();
     Theme::change(mode, None, cx);
     // 桌面端常显滚动条：GPUI 默认是 Scrolling（滚动时才淡入），
     // 这里改成 Always，避免用户以为没有滚动条。
     Theme::set_scrollbar_mode(ScrollbarMode::Always, cx);
+    apply_palette(cx);
+}
+
+/// 只按当前模式重算配色（模式不变时用），`Theme::update` 会刷新所有窗口。
+fn apply_palette(cx: &mut App) {
+    let dark = cx.theme().mode.is_dark();
 
     Theme::update(cx, move |theme| {
         // macOS controls are pill-ish: 6-7px on inputs/buttons, 12-14px on cards.
@@ -99,6 +174,15 @@ pub fn apply(cx: &mut App, mode: ThemeMode) {
             theme.scrollbar_thumb = rgba(0x000000_26).into();
             theme.scrollbar_thumb_hover = rgba(0x000000_40).into();
         }
+
+        // 亚克力：主表面退成半透明，让平台窗口背景的模糊透出来。
+        if ACRYLIC.load(Ordering::Relaxed) {
+            let alpha = acrylic_alpha();
+            theme.background = theme.background.opacity(alpha);
+            // 侧边栏/标题栏比内容区更深一档，保持层次。
+            theme.sidebar = theme.sidebar.opacity(alpha * 0.76);
+            theme.title_bar = theme.title_bar.opacity(alpha * 0.76);
+        }
     });
 }
 
@@ -108,19 +192,35 @@ pub fn is_dark(cx: &App) -> bool {
 
 /// White card surface used by panels and grouped rows.
 pub fn card(cx: &App) -> Hsla {
-    if is_dark(cx) {
+    let base: Hsla = if is_dark(cx) {
         rgb(0x2c2c2e).into()
     } else {
         rgb(0xffffff).into()
-    }
+    };
+    surface(base, 0.5 + acrylic_alpha() * 0.5)
 }
 
 pub fn card_hover(cx: &App) -> Hsla {
-    if is_dark(cx) {
+    let base: Hsla = if is_dark(cx) {
         rgb(0x323234).into()
     } else {
         rgb(0xfafafa).into()
+    };
+    surface(base, 0.55 + acrylic_alpha() * 0.5)
+}
+
+/// 亚克力开启时让表面色保留一点透明度，卡片的模糊感才不会被盖死。
+fn surface(base: Hsla, alpha: f32) -> Hsla {
+    if acrylic() {
+        base.opacity(alpha)
+    } else {
+        base
     }
+}
+
+/// 弹窗表面色：始终不透明。亚克力只作用于窗口背景，不能透到弹窗内容上。
+pub fn dialog(cx: &App) -> Hsla {
+    cx.theme().popover
 }
 
 /// Inset surface: chips, empty states, code blocks.

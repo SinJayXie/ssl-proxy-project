@@ -12,6 +12,16 @@ struct Entry {
 
 const CHANGELOG: &[Entry] = &[
     Entry {
+        version: "2.5.2",
+        date: "2026-11-13",
+        changes: &[
+            "Appearance: acrylic (blurred) window background on Windows 10/11 and macOS, switchable in Settings",
+            "Appearance: background opacity slider (30-100%); sidebar, title bar and cards fade along with it so the blur shows through",
+            "Appearance: dialogs and modal overlays stay fully opaque while acrylic is enabled",
+            "Settings: the footer action bar no longer paints its own background",
+        ],
+    },
+    Entry {
         version: "2.5.1",
         date: "2026-11-13",
         changes: &[

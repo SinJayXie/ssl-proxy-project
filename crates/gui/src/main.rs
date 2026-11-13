@@ -72,8 +72,11 @@ fn main() {
         .run(move |cx| {
             gpui_kit::init(cx);
             ui::theme::apply(cx, prefs.theme_mode());
+            // 亚克力是偏好项，跟随主题一起在启动时恢复。
+            ui::theme::restore_acrylic(cx, prefs.acrylic, prefs.acrylic_opacity);
 
             let options = WindowOptions {
+                window_background: ui::theme::window_background(prefs.acrylic),
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
                     size(px(900.), px(650.)),

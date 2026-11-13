@@ -75,7 +75,7 @@ if [ -n "$GUI_BIN" ] && command -v makensis >/dev/null 2>&1; then
   makensis /V2 "/DPRODUCT_VERSION=$GUI_VERSION" /DUSE_PAYLOAD \
     "/DPAYLOAD_EXE=$payload_dir/ssl-proxy-gui.exe" \
     "/DSOURCE_GEO=$GUI_CRATE/assets/GeoDB.dat" \
-    "/DICON_FILE=$ROOT/../ssl-proxy-client-tauri/src-tauri/icons/icon.ico" \
+    "/DICON_FILE=$ROOT/icons/icon.ico" \
     "/DOUT_FILE=$setup" \
     "$GUI_CRATE/installer/installer.nsi"
   echo "    客户端安装包: $setup"

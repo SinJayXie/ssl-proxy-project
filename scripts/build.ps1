@@ -88,7 +88,7 @@ if (-not $SkipClient) {
     }
 
     $sourceGeo = Join-Path $GuiCrate 'assets\GeoDB.dat'
-    $iconFile = [System.IO.Path]::GetFullPath((Join-Path $Root '..\ssl-proxy-client-tauri\src-tauri\icons\icon.ico'))
+    $iconFile = Join-Path $Root 'icons\icon.ico'
     if (-not (Test-Path $iconFile)) {
         throw "找不到安装包图标: $iconFile（可用 SSL_PROXY_ICON 环境变量指定）"
     }

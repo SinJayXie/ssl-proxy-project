@@ -9,7 +9,7 @@
 
 基于 Rust 的双端代理方案：一个原生 Windows 桌面客户端（GPUI）加一个 TLS 代理服务端，两者通过私有协议通信，对外表现得和普通 HTTPS 流量一致。
 
-- 客户端：`crates/gui`（包名 `ssl-proxy-gui`，安装后为 `ssl-proxy-client.exe`），版本 **2.5.1**
+- 客户端：`crates/gui`（包名 `ssl-proxy-gui`，安装后为 `ssl-proxy-client.exe`），版本 **2.5.2**
 - 服务端：`crates/svr`（`ssl-proxy-svr`），版本 **1.5.1**
 - 更新签名工具：`crates/update-signer`，负责发布清单的 Ed25519 签名
 - 许可证：[MIT](LICENSE)
@@ -111,7 +111,7 @@
 
 ### 1. 安装客户端
 
-运行 `SSLProxyClient_2.5.1_x64-setup.exe`（来自 `dist/client`，或 `version.json` 中的下载地址）。安装到 `%LOCALAPPDATA%\SSLProxyClient`，`GeoDB.dat` 会放在 exe 同目录，旧版本原地覆盖升级。首次启动需确认免责声明。
+运行 `SSLProxyClient_2.5.2_x64-setup.exe`（来自 `dist/client`，或 `version.json` 中的下载地址）。安装到 `%LOCALAPPDATA%\SSLProxyClient`，`GeoDB.dat` 会放在 exe 同目录，旧版本原地覆盖升级。首次启动需确认免责声明。
 
 ### 2. 让应用走本地代理
 

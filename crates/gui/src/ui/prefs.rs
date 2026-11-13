@@ -10,6 +10,12 @@ pub struct Prefs {
     pub lang: String,
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// 亚克力（毛玻璃）窗口背景，Windows 10/11 与 macOS 有效。
+    #[serde(default)]
+    pub acrylic: bool,
+    /// 亚克力背景不透明度（30-100），仅开启亚克力时生效。
+    #[serde(default = "default_acrylic_opacity")]
+    pub acrylic_opacity: u32,
     #[serde(default, rename = "lastUpdateCheck")]
     pub last_update_check: u64,
 }
@@ -22,11 +28,17 @@ fn default_theme() -> String {
     "dark".to_string()
 }
 
+fn default_acrylic_opacity() -> u32 {
+    crate::ui::theme::DEFAULT_ACRYLIC_OPACITY
+}
+
 impl Default for Prefs {
     fn default() -> Self {
         Self {
             lang: default_lang(),
             theme: default_theme(),
+            acrylic: false,
+            acrylic_opacity: default_acrylic_opacity(),
             last_update_check: 0,
         }
     }

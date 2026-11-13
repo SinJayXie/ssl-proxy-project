@@ -1,6 +1,6 @@
 use crate::core::types::{CountryCodeItem, RuleConfig};
 use crate::core::Core;
-use crate::ui::i18n;
+use crate::ui::{i18n, theme};
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -267,6 +267,7 @@ pub fn open_rule_dialog(
 
         dialog
             .w(px(380.))
+            .bg(theme::dialog(cx))
             .title(title.clone())
             .child(body)
             .footer(footer)

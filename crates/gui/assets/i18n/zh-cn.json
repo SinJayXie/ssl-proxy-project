@@ -50,6 +50,8 @@
   "SETTINGS_NETWORK_DESC": "绑定地址与 DNS 服务器，每行一个。",
   "SETTINGS_ROUTING": "路由",
   "SETTINGS_ROUTING_DESC": "这些地区的流量将直连，不走代理。",
+  "SETTINGS_APPEARANCE": "外观",
+  "SETTINGS_APPEARANCE_DESC": "本机窗口背景效果，修改后立即生效。",
   "UDP_MODE": "UDP 中继",
   "UDP_MODE_HINT": "关闭：拒绝 SOCKS5 UDP ASSOCIATE。仅直连：UDP 一律本机直连。跟随规则：UDP 按路由规则走代理（服务端不支持时自动降级直连）。",
   "UDP_MODE_OFF": "关闭",
@@ -132,5 +134,10 @@
   "SNI_NAME_HINT": "TLS 握手时发送的域名。留空则使用代理服务器地址",
   "MUX_ENABLED": "多路复用（TLS 复用）",
   "MUX_ENABLED_ON": "已开启（共享一条 TLS 隧道，降低握手延迟）",
-  "MUX_ENABLED_OFF": "已关闭（每个连接单独握手）"
+  "MUX_ENABLED_OFF": "已关闭（每个连接单独握手）",
+  "ACRYLIC_BACKGROUND": "亚克力背景",
+  "ACRYLIC_ON": "已开启（窗口毛玻璃，文字抗锯齿会略软）",
+  "ACRYLIC_OFF": "已关闭（纯色窗口背景）",
+  "ACRYLIC_OPACITY": "背景不透明度",
+  "ACRYLIC_OPACITY_HINT": "数值越低桌面透出越多，过低会影响文字可读性；需开启亚克力背景。"
 }

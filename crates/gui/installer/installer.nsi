@@ -37,9 +37,9 @@ XPStyle on
 !ifndef SOURCE_GEO
   !define SOURCE_GEO "..\assets\GeoDB.dat"
 !endif
-; Icons come from the Tauri client's icon set.
+; Icons live in the repo-root icons/ directory.
 !ifndef ICON_FILE
-  !define ICON_FILE "..\..\..\..\ssl-proxy-client-tauri\src-tauri\icons\icon.ico"
+  !define ICON_FILE "..\..\..\icons\icon.ico"
 !endif
 ; OutFile can be overridden by the unified build script with /DOUT_FILE=<abs path>.
 !ifndef OUT_FILE

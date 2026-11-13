@@ -23,7 +23,7 @@ fn main() {
         }
     }
 
-    // Windows 资源：exe 图标与版本信息，图标复用 Tauri 客户端的图标集。
+    // Windows 资源：exe 图标与版本信息，图标取自仓库根目录的 icons/。
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         embed_windows_resources(&out_dir, &manifest_dir);
     }
@@ -93,22 +93,22 @@ END
     }
 }
 
-/// Prefer `SSL_PROXY_ICON`, then the Tauri icon set resolved from the
-/// workspace layout (crates/gui -> crates -> workspace root -> parent).
+/// Prefer `SSL_PROXY_ICON`, then the shared icon at the workspace root
+/// (crates/gui -> crates -> <workspace>/icons/icon.ico).
 fn icon_path(manifest_dir: &Path) -> PathBuf {
     if let Some(path) = std::env::var_os("SSL_PROXY_ICON") {
         return PathBuf::from(path);
     }
 
-    if let Some(root) = manifest_dir.ancestors().nth(3) {
-        let candidate = root.join("ssl-proxy-client-tauri/src-tauri/icons/icon.ico");
+    if let Some(root) = manifest_dir.ancestors().nth(2) {
+        let candidate = root.join("icons/icon.ico");
         if candidate.exists() {
             return candidate;
         }
     }
 
-    // Development fallback for the pre-workspace layout.
-    manifest_dir.join("../ssl-proxy-client-tauri/src-tauri/icons/icon.ico")
+    // Fallback: resolve from the crate directory without walking the layout.
+    manifest_dir.join("../../icons/icon.ico")
 }
 
 /// `2.1.6` -> `[2, 1, 6]`；非数字段按 0 处理。
