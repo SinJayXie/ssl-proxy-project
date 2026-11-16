@@ -80,6 +80,9 @@ pub struct StackCore {
     pub tcp_flows: HashMap<SocketHandle, IpEndpoint>,
     /// UDP socket：端点 → handle。
     pub udp_flows: HashMap<IpEndpoint, SocketHandle>,
+    /// 已被 reaper 从 SocketSet 移除的 handle。流封装（SmolTcpStream 等）
+    /// 可能比 SocketSet 条目活得更久（tokio split 双持有），访问前必须检查。
+    removed_sockets: std::collections::HashSet<SocketHandle>,
     pub events: std::sync::mpsc::Sender<FlowEvent>,
     pub fake_map: FakeIpMap,
     pub cfg: TunConfig,
@@ -152,11 +155,12 @@ impl smoltcp::phy::TxToken for TxToken<'_> {
     }
 }
 
-/// 启动轮询线程，返回共享句柄。
+/// 启动轮询线程，返回共享句柄。`fake_map` 传入持久化恢复的映射表。
 pub fn spawn(
     device: TunDevice,
     cfg: TunConfig,
     events_tx: std::sync::mpsc::Sender<FlowEvent>,
+    fake_map: FakeIpMap,
 ) -> StackShared {
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     let shared = StackShared {
@@ -170,8 +174,9 @@ pub fn spawn(
             tcp_pending: HashMap::new(),
             tcp_flows: HashMap::new(),
             udp_flows: HashMap::new(),
+            removed_sockets: std::collections::HashSet::new(),
             events: events_tx,
-            fake_map: FakeIpMap::new(),
+            fake_map,
             cfg: cfg.clone(),
         })),
         wake_tx: wake_tx.clone(),
@@ -198,6 +203,10 @@ fn build_iface(mtu: u16, cfg: &TunConfig) -> Interface {
             .expect("push tun addr");
     });
     let _ = iface.routes_mut().add_default_ipv4_route(gateway);
+    // AnyIP：TUN 是路由设备，入站 IP 包的目标（fake-ip、真实公网 IP）
+    // 几乎都不是网卡自身地址 198.18.0.1/30。不开 AnyIP，smoltcp 会把
+    // 非"发给自己"的包全部丢弃——DNS 劫持与 fake-ip 出站就全都失灵。
+    iface.set_any_ip(true);
     iface
 }
 
@@ -393,6 +402,8 @@ pub fn reap_closed(core: &mut StackCore) {
     for h in dead_tcp {
         core.tcp_flows.remove(&h);
         core.sockets.remove(h);
+        // 流封装可能仍存活（tokio split 的另一半），记录避免其 drop/读写 panic。
+        core.removed_sockets.insert(h);
     }
 }
 
@@ -414,6 +425,11 @@ impl SmolTcpStream {
 impl Drop for SmolTcpStream {
     fn drop(&mut self) {
         let mut core = self.shared.lock();
+        // reaper 可能已移除该 socket（流封装比 SocketSet 条目活得久）。
+        if core.removed_sockets.contains(&self.handle) {
+            core.wakers.remove(&self.handle);
+            return;
+        }
         core.sockets.get_mut::<tcp::Socket>(self.handle).close();
         core.wakers.remove(&self.handle);
         self.shared.wake();
@@ -427,6 +443,9 @@ impl tokio::io::AsyncRead for SmolTcpStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let mut core = self.shared.lock();
+        if core.removed_sockets.contains(&self.handle) {
+            return Poll::Ready(Ok(())); // 已被回收 → EOF
+        }
         let sock = core.sockets.get_mut::<tcp::Socket>(self.handle);
         if sock.may_recv() {
             let mut tmp = [0u8; 8192];
@@ -456,6 +475,9 @@ impl tokio::io::AsyncWrite for SmolTcpStream {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let mut core = self.shared.lock();
+        if core.removed_sockets.contains(&self.handle) {
+            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
         let sock = core.sockets.get_mut::<tcp::Socket>(self.handle);
         if !sock.can_send() {
             core.register_waker(self.handle, cx);
@@ -486,6 +508,9 @@ impl tokio::io::AsyncWrite for SmolTcpStream {
         _cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
         let mut core = self.shared.lock();
+        if core.removed_sockets.contains(&self.handle) {
+            return Poll::Ready(Ok(()));
+        }
         core.sockets.get_mut::<tcp::Socket>(self.handle).close();
         drop(core);
         self.shared.wake();

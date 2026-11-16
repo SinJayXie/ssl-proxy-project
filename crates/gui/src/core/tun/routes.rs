@@ -19,16 +19,49 @@ pub struct RouteProgram {
     pub down: Vec<String>,
 }
 
-/// 默认排除网段（IPv4）：私网/链路本地/多播/CGNAT，不进 TUN。
-pub fn default_v4_excludes() -> Vec<String> {
+/// 无论如何都必须绕过 TUN 的地址（用户态协议栈无法处理或会自环）：
+/// loopback、链路本地（ARP/DHCP/云元数据）、多播（mDNS/SSDP）。
+pub fn always_excludes() -> Vec<String> {
+    vec![
+        "127.0.0.0/8".into(),
+        "169.254.0.0/16".into(),
+        "224.0.0.0/4".into(),
+    ]
+}
+
+/// 私网/CGNAT 网段：仅兼容模式（strict_route=false）在路由层绕过 TUN。
+/// strict 模式下这些流量必须进 TUN 经分流引擎判定（由 `outbound::decide_for_tun`
+/// 的 `must_direct_ip` 保证其 DIRECT，不会误走代理）。
+pub fn private_excludes() -> Vec<String> {
     vec![
         "10.0.0.0/8".into(),
         "172.16.0.0/12".into(),
         "192.168.0.0/16".into(),
-        "169.254.0.0/16".into(),
         "100.64.0.0/10".into(),
-        "224.0.0.0/4".into(),
     ]
+}
+
+/// 兼容模式的完整默认例外（= must + private）。
+pub fn default_v4_excludes() -> Vec<String> {
+    let mut out = always_excludes();
+    out.extend(private_excludes());
+    out
+}
+
+/// 按 strict_route 计算最终路由例外。
+///
+/// - `base`：代理节点 IP + 用户显式配置的 `route-exclude-address`（始终保留）；
+/// - 兼容模式追加私网段（局域网不进 TUN，性能好）；
+/// - 严格模式不追加私网段（所有流量进 TUN，杜绝绕过分流与 DNS 劫持）。
+pub fn effective_excludes(strict_route: bool, base: &[String]) -> Vec<String> {
+    let mut out = base.to_vec();
+    out.extend(always_excludes());
+    if !strict_route {
+        out.extend(private_excludes());
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// `prefix_len` → 子网掩码。
@@ -54,10 +87,11 @@ pub fn parse_v4_cidrs(cidrs: &[String]) -> Vec<(Ipv4Addr, u8)> {
 ///
 /// - `tun_gateway`：TUN 自身地址（198.18.0.1），默认路由下一跳；
 /// - `physical`：装路由**之前**探测的物理接口/网关；
-/// - `excludes`：需绕过 TUN 的网段（含代理节点 IP，来自
-///   [`super::route::build_route_excludes`] 与 [`default_v4_excludes`]）。
+/// - `excludes`：需绕过 TUN 的基集网段（代理节点 IP + 用户显式排除，来自
+///   [`super::route::build_route_excludes`]）；函数内部按 `tun.strict_route`
+///   调用 [`effective_excludes`] 决定是否追加私网段。
 pub fn build_program(
-    _tun: &TunConfig,
+    tun: &TunConfig,
     tun_if_index: u32,
     tun_gateway: Ipv4Addr,
     physical: &PhysicalRoute,
@@ -65,6 +99,8 @@ pub fn build_program(
 ) -> RouteProgram {
     let mut up = Vec::new();
     let mut down = Vec::new();
+    // 按 strict_route 决定私网段是否写例外（严格模式不写 → 私网流量也进 TUN）。
+    let excludes = effective_excludes(tun.strict_route, excludes);
 
     // 默认路由 → TUN。metric 100 低于所有例外路由（metric 1）。
     let default = format!(
@@ -76,7 +112,7 @@ pub fn build_program(
     ));
 
     // 例外：指向物理网关，metric 1 必胜 TUN 默认路由。
-    for (addr, prefix) in parse_v4_cidrs(excludes) {
+    for (addr, prefix) in parse_v4_cidrs(&excludes) {
         let mask = cidr_to_mask(prefix);
         up.push(format!(
             "route add {addr} mask {mask} {} metric 1 if {}",
@@ -164,5 +200,45 @@ mod tests {
         let e = default_v4_excludes();
         assert!(e.contains(&"192.168.0.0/16".to_string()));
         assert!(e.contains(&"100.64.0.0/10".to_string()));
+    }
+
+    #[test]
+    fn strict_route_excludes_private_but_keeps_must_excludes() {
+        let base = vec!["1.2.3.4/32".to_string()];
+        let strict = effective_excludes(true, &base);
+        let compat = effective_excludes(false, &base);
+
+        // 代理节点 IP 两种模式都排除（防自环）。
+        assert!(strict.contains(&"1.2.3.4/32".to_string()));
+        assert!(compat.contains(&"1.2.3.4/32".to_string()));
+        // 必须例外两种模式都有（协议栈无法处理）。
+        assert!(strict.contains(&"127.0.0.0/8".to_string()));
+        assert!(strict.contains(&"169.254.0.0/16".to_string()));
+        assert!(strict.contains(&"224.0.0.0/4".to_string()));
+        // 关键差异：严格模式不把私网段写成路由例外（流量进 TUN 经分流引擎）。
+        assert!(!strict.contains(&"192.168.0.0/16".to_string()));
+        assert!(!strict.contains(&"10.0.0.0/8".to_string()));
+        assert!(compat.contains(&"192.168.0.0/16".to_string()));
+        assert!(compat.contains(&"10.0.0.0/8".to_string()));
+    }
+
+    #[test]
+    fn program_honors_strict_route_flag() {
+        let strict = TunConfig {
+            strict_route: true,
+            ..Default::default()
+        };
+        let prog = build_program(&strict, 77, "198.18.0.1".parse().unwrap(), &physical(), &[]);
+        // 严格模式：私网不写例外 → 下表中没有 192.168.0.0 的 add。
+        assert!(!prog.up.iter().any(|c| c.contains("route add 192.168.0.0")));
+        // 必须例外仍在。
+        assert!(prog.up.iter().any(|c| c.contains("route add 127.0.0.0")));
+
+        let compat = TunConfig {
+            strict_route: false,
+            ..Default::default()
+        };
+        let prog = build_program(&compat, 77, "198.18.0.1".parse().unwrap(), &physical(), &[]);
+        assert!(prog.up.iter().any(|c| c.contains("route add 192.168.0.0")));
     }
 }

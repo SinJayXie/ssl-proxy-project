@@ -97,10 +97,25 @@ impl Core {
     /// `\"` escapes that cmd does not understand — `start` then receives a
     /// broken path ("打开路径失败"). The child is flagged with [`RELAUNCH_ENV`]
     /// so `main` waits for this process to release the single-instance mutex.
+    /// 应用退出前调用：停止 TUN 并回滚路由/网卡/快照（幂等）。
+    /// 所有退出路径（托盘、UI 退出按钮、更新安装后）都必须先走这里。
+    pub fn shutdown(&self) {
+        crate::core::tun::runner::stop_before_exit(&self.state.config_dir);
+    }
+
+    /// Restart the current executable. The caller is responsible for quitting
+    /// the current process afterwards.
+    ///
+    /// The new process is spawned directly instead of going through
+    /// `cmd /C ... start`, because Rust quotes the whole command line with
+    /// `\"` escapes that cmd does not understand — `start` then receives a
+    /// broken path ("打开路径失败"). The child is flagged with [`RELAUNCH_ENV`]
+    /// so `main` waits for this process to release the single-instance mutex.
     pub fn restart_process(&self) -> std::io::Result<()> {
         // 重启前先回滚 TUN 路由/网卡，避免半开状态遗留。
         crate::core::tun::runner::stop_before_exit(&self.state.config_dir);
         let exe = std::env::current_exe()?;
+
 
         let mut command = std::process::Command::new(&exe);
         command.env(RELAUNCH_ENV, "1");
@@ -612,6 +627,8 @@ async fn run_download_update(
         err.to_string()
     })?;
 
+    // 启动安装包前先关停 TUN（回滚路由/网卡），进程随后退出。
+    crate::core::tun::runner::stop_before_exit(&crate::platform::paths::config_dir());
     std::process::exit(0);
 }
 

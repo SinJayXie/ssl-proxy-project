@@ -18,7 +18,8 @@ pub struct TunDevice {
     /// 实际网卡名（如 "SSLProxy"），供路由/绑定使用。
     pub name: String,
     pub mtu: u16,
-    /// LUID 的低 32 位即接口索引（ifIndex），供直连出站绑定与 netsh 路由。
+    /// 接口索引（ifIndex，由 ConvertInterfaceLuidToIndex 转换得到），
+    /// 供直连出站绑定与 netsh 路由。
     pub if_index: u32,
     /// 保持 adapter/session 存活；drop 时网卡随之关闭。
     _keepalive: Option<Box<dyn Send>>,
@@ -58,11 +59,20 @@ mod imp {
         let adapter = wintun::Adapter::create(&dll, &cfg.device_name, "SSLProxy Tunnel", None)
             .map_err(|e| format!("创建 TUN 适配器失败（需管理员权限）: {e}"))?;
 
-        // 接口索引：直连出站绑定 + 路由命令都要用。LUID 低 32 位 = ifIndex。
-        let luid = unsafe { adapter.get_luid().Value };
-        let if_index = (luid & 0xFFFF_FFFF) as u32;
-        if if_index == 0 {
-            return Err("TUN 接口索引无效".into());
+        // 接口索引：直连出站绑定 + 路由命令都要用。
+        // LUID ≠ ifIndex，必须走系统 API ConvertInterfaceLuidToIndex 转换；
+        // 直接取 LUID 位域可能得到 0，会误判为无效。
+        // 注：wintun 内部用 windows 0.52 的 NET_LUID_LH，与本 crate 的 0.58
+        // 类型不同名，但同为 repr(C) u64 联合体——按值重建一份再传入。
+        let raw_luid = unsafe { adapter.get_luid().Value };
+        let mut if_index: u32 = 0;
+        let conv = unsafe {
+            use windows::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+            let luid = NET_LUID_LH { Value: raw_luid };
+            windows::Win32::NetworkManagement::IpHelper::ConvertInterfaceLuidToIndex(&luid, &mut if_index)
+        };
+        if conv.is_err() || if_index == 0 {
+            return Err(format!("TUN 接口索引无效（LUID→Index 转换失败: {conv:?}）").into());
         }
 
         // fake-ip 网关即 TUN 地址：198.18.0.1/30，网关指向自身（on-link）。

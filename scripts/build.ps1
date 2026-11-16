@@ -120,7 +120,8 @@ if (-not $SkipClient) {
     $manifestPath = Join-Path $Root 'version.json'
     $changelog = @()
     if (Test-Path $manifestPath) {
-        $existing = Get-Content $manifestPath -Raw | ConvertFrom-Json
+        # 必须按 UTF-8 读取：Get-Content 默认用系统 ANSI（GBK），会写坏中文 changelog
+        $existing = [System.IO.File]::ReadAllText($manifestPath, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json
         if ($existing.PSObject.Properties.Name -contains 'changelog') {
             $changelog = @($existing.changelog)
         }

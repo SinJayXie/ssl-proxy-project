@@ -1,12 +1,16 @@
 {
-    "version":  "2.5.2",
+    "version":  "2.6.0",
     "changelog":  [
-                      "Appearance: acrylic (blurred) window background on Windows 10/11 and macOS, switchable in Settings",
-                      "Appearance: background opacity slider (30-100%); sidebar, title bar and cards fade along with it so the blur shows through",
-                      "Appearance: dialogs and modal overlays stay fully opaque while acrylic is enabled",
-                      "Settings: the footer action bar no longer paints its own background"
+                      "TUN: WinTun virtual adapter with full data plane - fake-ip DNS hijack, smoltcp netstack, unified route engine (TCP/UDP)",
+                      "TUN: fail-closed guarantees - capability gating, route rollback on failure, crash recovery snapshot, exit-time cleanup",
+                      "TUN: fake-ip mapping persistence (fakeip.json) so apps' cached addresses resolve across restarts",
+                      "TUN: strict-route hardening - private/loopback targets forced DIRECT, DNS hijack required, direct DNS bound to physical NIC",
+                      "TUN: UDP proxy via TLS tunnel (FLAG_UDP frames, shared with SOCKS5 UDP ASSOCIATE)",
+                      "TUN: proxy tunnel dials pre-resolved server IP so its own DNS is never hijacked (loop prevention)",
+                      "Settings: new TUN panel with enable/strict-route/auto-route switches and tunable parameters",
+                      "Fix: LUID-to-ifIndex conversion via system API (was breaking adapter setup); smoltcp AnyIP mode for routed traffic; socket-recycle panic in mux forwarding"
                   ],
-    "downloadUrl":  "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.5.2_x64-setup.exe",
-    "sha256":  "9323dc9c5d67af95d338ea7538a940df8114653aabc4909cbef5017cd5321a80",
-    "signature":  "b09ccba93b08c1c3ede678396d338930d2f8dd505b7b8d8e203bf9c57107d48a5df6ce343a08100d7440268733d1b6794ba83c34de3ebdc3f5ab85b9536c3b0b"
+    "downloadUrl":  "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.6.0_x64-setup.exe",
+    "sha256":  "1f878a5128d85ebf78bca80c33368b4435f29cd4233ec720adc50b49d7154905",
+    "signature":  "f333988ba77d1a655d08213b8e3d60a7d97004cd355fce2fac94a83fc033c3faa9375c1378a3a5db47b3646646bb2ce02d0653b00d9465a95dc2bae3d0274d02"
 }

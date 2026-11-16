@@ -15,7 +15,9 @@
 
 use crate::core::proxy::connect::{connect_udp_tunnel, match_rules, resolve_and_connect};
 use crate::core::proxy::framing::{append_udp_frame, parse_udp_packet, read_frame, FLAG_UDP};
-use crate::core::proxy::route::{classify, Outbound as RouteOutbound, RouteInput};
+use crate::core::proxy::route::{
+    classify, DecisionReason, Outbound as RouteOutbound, RouteDecision, RouteInput,
+};
 use crate::core::proxy::tunnel::forward_target_stream;
 use crate::core::state::AppState;
 use crate::core::tun::dns::is_in_fake_ip_pool;
@@ -67,19 +69,97 @@ pub async fn handle_event(state: Arc<AppState>, shared: StackShared, ev: FlowEve
     }
 }
 
-/// fake-ip 反查目标域名；查不到时用 IP 字符串本身作为 host。
-fn host_of(shared: &StackShared, ip: IpAddr) -> String {
-    let core = shared.lock();
-    core.fake_map
-        .find_host_by_ip(&ip.to_string())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| ip.to_string())
+/// 已警告过“无映射”的 fake-ip（每次会话每 IP 只警告一次，防刷屏）。
+fn warned_no_mapping() -> &'static Mutex<std::collections::HashSet<IpAddr>> {
+    static S: once_cell::sync::Lazy<Mutex<std::collections::HashSet<IpAddr>>> =
+        once_cell::sync::Lazy::new(|| Mutex::new(std::collections::HashSet::new()));
+    &S
+}
+
+/// fake-ip 反查目标域名（fail-closed）：
+/// - 目标在 fake-ip 池内 → 必须查到映射，查不到返回 Err（可能是应用
+///   自身缓存了上个会话的 fake-ip；mihomo 同样拒绝，绝不按 IP 直连）；
+/// - 池外 → host 就是 IP 本身。
+fn host_of(shared: &StackShared, ip: IpAddr, fake_range: &str) -> Result<String, ()> {
+    if is_in_fake_ip_pool(&ip, fake_range) {
+        let core = shared.lock();
+        if let Some(host) = core.fake_map.find_host_by_ip(&ip.to_string()) {
+            return Ok(host.to_string());
+        }
+        drop(core);
+        if warned_no_mapping()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(ip)
+        {
+            log::warn!(
+                "TUN fake-ip {ip} 无映射（应用缓存了上个会话的 fake-ip），fail-closed 拒绝该流；映射持久化生效后不再出现"
+            );
+        }
+        return Err(());
+    }
+    Ok(ip.to_string())
+}
+
+/// 直连 DNS 查询：socket 绑定物理网卡（IP_UNICAST_IF）后向 `direct-nameservers`
+/// 发标准 A 查询。TUN strict-route 会把普通 socket 的 DNS 捕获进自身劫持
+/// （结果永远是 fake-ip），因此分流决策的解析必须走物理接口绕开 TUN。
+/// 结果复用全局 `dns_cache`，避免每个新流都发查询。
+async fn direct_dns_lookup(state: &Arc<AppState>, env: &OutboundEnv, domain: &str) -> Option<String> {
+    if let Some(ip) = state.dns_cache.read().await.get(domain) {
+        return Some(ip.clone());
+    }
+    let ns = env.nameservers.first()?.parse::<std::net::Ipv4Addr>().ok()?;
+    let if_idx = env.physical_if?;
+    let domain = domain.trim_end_matches('.').to_string();
+    let domain_for_query = domain.clone();
+
+    let ip = tokio::task::spawn_blocking(move || -> Option<String> {
+        let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+        bind_unicast_if(&sock, true, if_idx).ok()?;
+        sock.bind(&"0.0.0.0:0".parse::<SocketAddr>().ok()?.into()).ok()?;
+        sock.connect(&SocketAddr::from((ns, 53)).into()).ok()?;
+        sock.set_nonblocking(false).ok()?;
+
+        let mut query = trust_dns_proto::op::Message::new();
+        query.set_id(rand::random::<u16>());
+        query.set_message_type(trust_dns_proto::op::MessageType::Query);
+        query.set_op_code(trust_dns_proto::op::OpCode::Query);
+        query.set_recursion_desired(true);
+        query.add_query(trust_dns_proto::op::Query::query(
+            trust_dns_proto::rr::Name::from_ascii(domain_for_query.as_str()).ok()?,
+            trust_dns_proto::rr::RecordType::A,
+        ));
+        sock.send(query.to_vec().ok()?.as_slice()).ok()?;
+
+        let mut buf = vec![std::mem::MaybeUninit::<u8>::uninit(); 4096];
+        sock.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+        let n = sock.recv(&mut buf).ok()?;
+        let bytes: Vec<u8> = buf[..n]
+            .iter()
+            .map(|b| unsafe { b.assume_init() })
+            .collect();
+        let resp = trust_dns_proto::op::Message::from_vec(&bytes).ok()?;
+        resp.answers().iter().find_map(|a| {
+            a.data().and_then(|d| d.as_a()).map(|v4| v4.0.to_string())
+        })
+    })
+    .await
+    .ok()??;
+
+    state
+        .dns_cache
+        .write()
+        .await
+        .insert(domain, ip.clone());
+    Some(ip)
 }
 
 /// 统一决策（语义与 connect.rs 的 SOCKS/HTTP 路径一致）。
 /// 返回 Some(ip) 表示可直连；Proxy 无 IP（域名交给服务端解析）。
 async fn decide_for_tun(
     state: &Arc<AppState>,
+    env: &OutboundEnv,
     host: &str,
     fake_range: &str,
 ) -> Result<crate::core::proxy::route::RouteDecision, String> {
@@ -91,15 +171,30 @@ async fn decide_for_tun(
     let mut resolved = if host.parse::<IpAddr>().is_ok() {
         Some(host.to_string())
     } else {
-        crate::core::dns::lookup(state, host).await.ok()
+        direct_dns_lookup(state, env, host).await
     };
     // fail-closed 后备：解析结果落在 fake-ip 池内 = 被自身 DNS 劫持污染，
     // 禁止当作真实 IP 直连（会再次进入 TUN 形成环路）。
-    if let Some(ip) = resolved.as_ref().and_then(|s| s.parse::<IpAddr>().ok()) {
-        if is_in_fake_ip_pool(&ip, fake_range) {
-            log::warn!("TUN DNS 污染防护: {host} 解析到 fake-ip，按未解析处理");
-            resolved = None;
-        }
+    if let Some(ip) = resolved.as_ref().and_then(|s| s.parse::<IpAddr>().ok())
+        && is_in_fake_ip_pool(&ip, fake_range)
+    {
+        log::warn!("TUN DNS 污染防护: {host} 解析到 fake-ip，按未解析处理");
+        resolved = None;
+    }
+
+    // strict-route 安全不变量：私网/loopback/链路本地/CGNAT 目标必须 DIRECT，
+    // 绝不走代理（防代理端 SSRF）。兼容模式下这些目标由路由例外绕过 TUN，
+    // 不会走到这里；严格模式下它们进 TUN，必须在这里兜住。
+    // 该判定优先于 HOST/GEO 规则——即便规则写 PROXY，私网也不进隧道。
+    if let Some(ip) = resolved.as_ref().and_then(|s| s.parse::<IpAddr>().ok())
+        && crate::core::tun::route::must_direct_ip(&ip)
+    {
+        log::debug!("TUN strict-route: 私网/本地目标 {ip} 强制 DIRECT");
+        return Ok(RouteDecision {
+            outbound: RouteOutbound::Direct,
+            reason: DecisionReason::PrivateNetwork,
+            resolved_ip: resolved,
+        });
     }
 
     let geo_code = resolved
@@ -129,7 +224,11 @@ async fn handle_tcp(
     local: SocketAddr,
     env: OutboundEnv,
 ) {
-    let host = host_of(&shared, local.ip());
+    let fake_range = shared.lock().cfg.fake_ip_range.clone();
+    let host = match host_of(&shared, local.ip(), &fake_range) {
+        Ok(h) => h,
+        Err(()) => return, // host_of 已去重警告；drop stream → 关闭连接
+    };
     let port = local.port();
     let stream = SmolTcpStream::new(&shared, handle);
 
@@ -149,9 +248,7 @@ async fn handle_tcp(
         return;
     }
 
-    let fake_range = shared.lock().cfg.fake_ip_range.clone();
-
-    let decision = match decide_for_tun(&state, &host, &fake_range).await {
+    let decision = match decide_for_tun(&state, &env, &host, &fake_range).await {
         Ok(d) => d,
         Err(e) => {
             log::error!("TUN 决策失败 {host}:{port}: {e}");
@@ -166,7 +263,10 @@ async fn handle_tcp(
     if decision.is_direct() {
         let ip = match decision.resolved_ip {
             Some(ip) => ip,
-            None => return,
+            None => {
+                log::warn!("TUN 直连 {host}:{port} 无可用解析结果，放弃（不裸连）");
+                return;
+            }
         };
         match connect_direct(&ip, port, env.physical_if).await {
             Ok(target) => {
@@ -327,9 +427,12 @@ async fn handle_udp(
         return;
     }
 
-    let host = host_of(&shared, local.ip());
     let fake_range = shared.lock().cfg.fake_ip_range.clone();
-    let decision = match decide_for_tun(&state, &host, &fake_range).await {
+    let host = match host_of(&shared, local.ip(), &fake_range) {
+        Ok(h) => h,
+        Err(()) => return, // host_of 已去重警告
+    };
+    let decision = match decide_for_tun(&state, &env, &host, &fake_range).await {
         Ok(d) => d,
         Err(_) => return,
     };
@@ -406,8 +509,15 @@ async fn build_proxy_udp(state: &Arc<AppState>, host: &str) -> Option<UdpUpstrea
     if proxy_server.is_empty() {
         return None;
     }
+    // TUN 开启时系统 DNS 被劫持：TCP 目标用预解析 IP，TLS 身份仍按 sni。
+    let proxy_connect_addr = state
+        .proxy_resolved_ip
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .unwrap_or_else(|| proxy_server.clone());
     // 认证 head 以 host 参与 MAC、port=0 标记 UDP 隧道；真实目标在 FLAG_UDP 帧里。
-    match connect_udp_tunnel(&proxy_server, proxy_port, host, &password, skip_verify, &sni).await {
+    match connect_udp_tunnel(&proxy_connect_addr, proxy_port, host, &password, skip_verify, &sni).await {
         Ok(tls) => {
             let (r, w) = tokio::io::split(tls);
             Some(UdpUpstream::Proxy(r, w))

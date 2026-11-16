@@ -1,3 +1,4 @@
+use crate::core::tun::config::TunConfig;
 use crate::core::types::{AppConfig, UdpMode};
 use crate::core::Core;
 use crate::ui::assets::mdi;
@@ -166,6 +167,44 @@ impl SettingsInputs {
     }
 }
 
+/// TUN 卡片的可编辑字段。列表类字段用逗号/分号/换行分隔，保存时拆成 Vec<String>。
+struct TunInputs {
+    device_name: Entity<InputState>,
+    mtu: Entity<InputState>,
+    dns_hijack: Entity<InputState>,
+    route_exclude_address: Entity<InputState>,
+    fake_ip_range: Entity<InputState>,
+    fake_ip_range6: Entity<InputState>,
+    direct_nameservers: Entity<InputState>,
+}
+
+impl TunInputs {
+    fn new(config: &TunConfig, window: &mut Window, cx: &mut Context<SettingsPage>) -> Self {
+        let mut input = |value: &str, placeholder: &str| {
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .default_value(value.to_string())
+                    .placeholder(placeholder)
+            })
+        };
+        Self {
+            device_name: input(&config.device_name, "SSLProxy"),
+            mtu: input(&config.mtu.to_string(), "1500"),
+            dns_hijack: input(&config.dns_hijack.join(", "), "any:53"),
+            route_exclude_address: input(
+                &config.route_exclude_address.join(", "),
+                "192.168.0.0/16, 10.0.0.0/8",
+            ),
+            fake_ip_range: input(&config.fake_ip_range, "198.18.0.1/16"),
+            fake_ip_range6: input(&config.fake_ip_range6, "2001:2::0/64"),
+            direct_nameservers: input(
+                &config.direct_nameservers.join(", "),
+                "223.5.5.5, 119.29.29.29",
+            ),
+        }
+    }
+}
+
 pub struct SettingsPage {
     core: Arc<Core>,
     config: AppConfig,
@@ -173,6 +212,11 @@ pub struct SettingsPage {
     inputs: SettingsInputs,
     tls_skip: bool,
     mux_enabled: bool,
+    tun_inputs: TunInputs,
+    tun_enabled: bool,
+    tun_auto_route: bool,
+    tun_strict_route: bool,
+    tun_auto_detect_interface: bool,
     /// 亚克力窗口背景（偏好项，改动立即生效，不参与配置保存）。
     acrylic: bool,
     /// 亚克力背景不透明度（30-100）。
@@ -210,6 +254,11 @@ impl SettingsPage {
             inputs,
             tls_skip: config.danger_accept_invalid_certs,
             mux_enabled: config.mux_enabled,
+            tun_inputs: TunInputs::new(&config.tun, window, cx),
+            tun_enabled: config.tun.enable,
+            tun_auto_route: config.tun.auto_route,
+            tun_strict_route: config.tun.strict_route,
+            tun_auto_detect_interface: config.tun.auto_detect_interface,
             acrylic,
             acrylic_opacity,
             acrylic_slider,
@@ -225,6 +274,26 @@ impl SettingsPage {
 
     fn toggle_mux(&mut self, checked: &bool, cx: &mut Context<Self>) {
         self.mux_enabled = *checked;
+        cx.notify();
+    }
+
+    fn toggle_tun(&mut self, checked: &bool, cx: &mut Context<Self>) {
+        self.tun_enabled = *checked;
+        cx.notify();
+    }
+
+    fn toggle_tun_auto_route(&mut self, checked: &bool, cx: &mut Context<Self>) {
+        self.tun_auto_route = *checked;
+        cx.notify();
+    }
+
+    fn toggle_tun_strict_route(&mut self, checked: &bool, cx: &mut Context<Self>) {
+        self.tun_strict_route = *checked;
+        cx.notify();
+    }
+
+    fn toggle_tun_auto_detect_interface(&mut self, checked: &bool, cx: &mut Context<Self>) {
+        self.tun_auto_detect_interface = *checked;
         cx.notify();
     }
 
@@ -266,6 +335,11 @@ impl SettingsPage {
         self.inputs = SettingsInputs::new(&self.config, &self.countries, window, cx);
         self.tls_skip = self.config.danger_accept_invalid_certs;
         self.mux_enabled = self.config.mux_enabled;
+        self.tun_inputs = TunInputs::new(&self.config.tun, window, cx);
+        self.tun_enabled = self.config.tun.enable;
+        self.tun_auto_route = self.config.tun.auto_route;
+        self.tun_strict_route = self.config.tun.strict_route;
+        self.tun_auto_detect_interface = self.config.tun.auto_detect_interface;
         self.error = None;
         cx.notify();
     }
@@ -347,6 +421,51 @@ impl SettingsPage {
                 .unwrap_or(UdpMode::Off)
         };
 
+        let tun = TunConfig {
+            // stack 由后端决定（当前仅 smoltcp 可用），不在 UI 暴露。
+            stack: self.config.tun.stack,
+            enable: self.tun_enabled,
+            device_name: self
+                .tun_inputs
+                .device_name
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+            mtu: self
+                .tun_inputs
+                .mtu
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| i18n::t("VALIDATE_TUN"))?,
+            auto_route: self.tun_auto_route,
+            strict_route: self.tun_strict_route,
+            auto_detect_interface: self.tun_auto_detect_interface,
+            dns_hijack: parse_csv(&self.tun_inputs.dns_hijack.read(cx).value()),
+            route_exclude_address: parse_csv(
+                &self.tun_inputs.route_exclude_address.read(cx).value(),
+            ),
+            fake_ip_range: self
+                .tun_inputs
+                .fake_ip_range
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+            fake_ip_range6: self
+                .tun_inputs
+                .fake_ip_range6
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+            direct_nameservers: parse_csv(&self.tun_inputs.direct_nameservers.read(cx).value()),
+        };
+        tun.validate()
+            .map_err(|e| format!("{}: {}", i18n::t("VALIDATE_TUN"), e))?;
+
         Ok(AppConfig {
             socks_port,
             proxy_server,
@@ -359,8 +478,7 @@ impl SettingsPage {
             sni_name,
             mux_enabled: self.mux_enabled,
             udp_mode,
-            // TUN 暂无 UI 编辑控件：保存常规设置时原样保留，避免被重置。
-            tun: self.config.tun.clone(),
+            tun,
         })
     }
 
@@ -782,6 +900,135 @@ impl Render for SettingsPage {
                 .into_any_element(),
         );
 
+        // TUN：系统级流量接管（需管理员权限，保存后自动重启生效）
+        let tun_card = section(
+            i18n::t("SETTINGS_TUN"),
+            i18n::t("SETTINGS_TUN_DESC"),
+            cx,
+            v_flex()
+                .w_full()
+                .gap_3()
+                .child(switch_row(
+                    i18n::t("TUN_ENABLE"),
+                    if self.tun_enabled {
+                        i18n::t("TUN_ENABLE_ON")
+                    } else {
+                        i18n::t("TUN_ENABLE_OFF")
+                    },
+                    cx,
+                    Switch::new("tun-enable")
+                        .checked(self.tun_enabled)
+                        .on_change(cx.listener(|this, checked, _, cx| {
+                            this.toggle_tun(checked, cx)
+                        }))
+                        .into_any_element(),
+                ))
+                .child(switch_row(
+                    i18n::t("TUN_AUTO_ROUTE"),
+                    if self.tun_auto_route {
+                        i18n::t("TUN_GENERIC_ON")
+                    } else {
+                        i18n::t("TUN_GENERIC_OFF")
+                    },
+                    cx,
+                    Switch::new("tun-auto-route")
+                        .checked(self.tun_auto_route)
+                        .on_change(cx.listener(|this, checked, _, cx| {
+                            this.toggle_tun_auto_route(checked, cx)
+                        }))
+                        .into_any_element(),
+                ))
+                .child(switch_row(
+                    i18n::t("TUN_STRICT_ROUTE"),
+                    if self.tun_strict_route {
+                        i18n::t("TUN_STRICT_ROUTE_ON")
+                    } else {
+                        i18n::t("TUN_STRICT_ROUTE_OFF")
+                    },
+                    cx,
+                    Switch::new("tun-strict-route")
+                        .checked(self.tun_strict_route)
+                        .on_change(cx.listener(|this, checked, _, cx| {
+                            this.toggle_tun_strict_route(checked, cx)
+                        }))
+                        .into_any_element(),
+                ))
+                .child(switch_row(
+                    i18n::t("TUN_AUTO_DETECT_INTERFACE"),
+                    if self.tun_auto_detect_interface {
+                        i18n::t("TUN_GENERIC_ON")
+                    } else {
+                        i18n::t("TUN_GENERIC_OFF")
+                    },
+                    cx,
+                    Switch::new("tun-auto-detect-interface")
+                        .checked(self.tun_auto_detect_interface)
+                        .on_change(cx.listener(|this, checked, _, cx| {
+                            this.toggle_tun_auto_detect_interface(checked, cx)
+                        }))
+                        .into_any_element(),
+                ))
+                .child(
+                    h_flex()
+                        .items_start()
+                        .gap_3()
+                        .child(field(
+                            i18n::t("TUN_DEVICE_NAME"),
+                            None,
+                            cx,
+                            Input::new(&self.tun_inputs.device_name).into_any_element(),
+                        ))
+                        .child(field(
+                            i18n::t("TUN_MTU"),
+                            None,
+                            cx,
+                            Input::new(&self.tun_inputs.mtu).into_any_element(),
+                        )),
+                )
+                .child(
+                    h_flex()
+                        .items_start()
+                        .gap_3()
+                        .child(field(
+                            i18n::t("TUN_FAKE_IP_RANGE"),
+                            None,
+                            cx,
+                            Input::new(&self.tun_inputs.fake_ip_range).into_any_element(),
+                        ))
+                        .child(field(
+                            i18n::t("TUN_FAKE_IP_RANGE6"),
+                            None,
+                            cx,
+                            Input::new(&self.tun_inputs.fake_ip_range6).into_any_element(),
+                        )),
+                )
+                .child(field(
+                    i18n::t("TUN_DNS_HIJACK"),
+                    Some(i18n::t("TUN_DNS_HIJACK_HINT")),
+                    cx,
+                    Input::new(&self.tun_inputs.dns_hijack).into_any_element(),
+                ))
+                .child(field(
+                    i18n::t("TUN_ROUTE_EXCLUDE"),
+                    Some(i18n::t("TUN_ROUTE_EXCLUDE_HINT")),
+                    cx,
+                    Input::new(&self.tun_inputs.route_exclude_address).into_any_element(),
+                ))
+                .child(field(
+                    i18n::t("TUN_DIRECT_NAMESERVERS"),
+                    Some(i18n::t("TUN_DIRECT_NAMESERVERS_HINT")),
+                    cx,
+                    Input::new(&self.tun_inputs.direct_nameservers).into_any_element(),
+                ))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::text_muted(cx))
+                        .child(i18n::t("TUN_ADMIN_HINT")),
+                )
+                .into_any_element(),
+        );
+
         // 外观：亚克力（毛玻璃）背景 + 不透明度
         let appearance_card = section(
             i18n::t("SETTINGS_APPEARANCE"),
@@ -859,6 +1106,7 @@ impl Render for SettingsPage {
             .child(tls_card)
             .child(network_card)
             .child(routing_card)
+            .child(tun_card)
             .child(appearance_card);
 
         if let Some(error) = self.error.as_ref().or(validation_error.as_ref()) {
@@ -1041,6 +1289,36 @@ fn field_label(text: String, cx: &App) -> AnyElement {
         .text_color(theme::text_secondary(cx))
         .child(text)
         .into_any_element()
+}
+
+/// 统一的开关行：左侧标题 + 状态描述，右侧 Switch 控件。
+fn switch_row(label: String, hint: String, cx: &App, switch: AnyElement) -> AnyElement {
+    h_flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .child(
+            v_flex()
+                .gap(px(2.))
+                .child(div().text_size(px(13.)).child(label))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::text_muted(cx))
+                        .child(hint),
+                ),
+        )
+        .child(switch)
+        .into_any_element()
+}
+
+/// 把逗号/分号/换行分隔的输入拆成去空的配置列表。
+fn parse_csv(value: &str) -> Vec<String> {
+    value
+        .split([',', ';', '\n'])
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect()
 }
 
 fn current_language_label() -> &'static str {

@@ -16,22 +16,20 @@ fn main() {
     if let Some(profile_dir) = out_dir.ancestors().nth(3) {
         let source = manifest_dir.join("assets/GeoDB.dat");
         let destination = profile_dir.join("GeoDB.dat");
-        if source.exists() {
-            if let Err(err) = std::fs::copy(&source, &destination) {
-                println!("cargo:warning=failed to copy GeoDB.dat: {err}");
-            }
+        if source.exists()
+            && let Err(err) = std::fs::copy(&source, &destination)
+        {
+            println!("cargo:warning=failed to copy GeoDB.dat: {err}");
         }
 
         // TUN 数据面：把 WinTun 驱动 DLL 放到 exe 同目录（device.rs 运行时加载）。
         if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
             let dll = manifest_dir.join("assets/wintun/wintun.dll");
             println!("cargo:rerun-if-changed=assets/wintun/wintun.dll");
-            if dll.exists() {
-                if let Err(err) = std::fs::copy(&dll, profile_dir.join("wintun.dll")) {
-                    println!("cargo:warning=failed to copy wintun.dll: {err}");
-                }
-            } else {
+            if !dll.exists() {
                 println!("cargo:warning=assets/wintun/wintun.dll missing; TUN disabled at runtime");
+            } else if let Err(err) = std::fs::copy(&dll, profile_dir.join("wintun.dll")) {
+                println!("cargo:warning=failed to copy wintun.dll: {err}");
             }
         }
     }

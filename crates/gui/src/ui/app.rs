@@ -521,7 +521,10 @@ impl AppShell {
                 Button::new("error-quit")
                     .danger()
                     .label(i18n::t("QUIT_APP"))
-                    .on_click(|_, _, cx| cx.quit()),
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.core.shutdown();
+                        cx.quit();
+                    })),
             )
         } else {
             h_flex().justify_end().child(
@@ -962,6 +965,7 @@ fn now_ms() -> u64 {
 // ---------------- Dashboard ----------------
 
 struct DashboardPage {
+    core: Arc<Core>,
     info: ApiAppInfo,
     checking_update: bool,
     stats: StatsStore,
@@ -1030,6 +1034,7 @@ impl DashboardPage {
         });
 
         Self {
+            core,
             info,
             checking_update: false,
             stats,
@@ -1112,7 +1117,10 @@ impl Render for DashboardPage {
                                     .danger()
                                     .label(i18n::t("QUIT_APP"))
                                     .icon(Icon::default().path(mdi("exit-to-app")))
-                                    .on_click(|_, _, cx| cx.quit()),
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.core.shutdown();
+                                        cx.quit();
+                                    })),
                             ),
                     ),
             )

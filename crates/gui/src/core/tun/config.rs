@@ -130,6 +130,11 @@ impl TunConfig {
         for target in &self.dns_hijack {
             validate_dns_hijack(target).map_err(|e| format!("tun.dns-hijack {}: {}", target, e))?;
         }
+        // strict-route 把全部流量赶进 TUN。若不同时劫持 DNS，应用会先解析到
+        // 真实 IP，域名规则退化为 IP 规则，DNS 查询本身也可能绕过分流。
+        if self.strict_route && self.dns_hijack.is_empty() {
+            return Err("tun.strict-route requires non-empty tun.dns-hijack".to_string());
+        }
         Ok(())
     }
 }
@@ -243,6 +248,29 @@ mod tests {
         assert!(validate_dns_hijack("any:0").is_err());
         assert!(validate_dns_hijack("not-an-ip:53").is_err());
         assert!(validate_dns_hijack("any").is_err());
+    }
+
+    #[test]
+    fn strict_route_requires_dns_hijack() {
+        let cfg = TunConfig {
+            strict_route: true,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok(), "默认带 any:53，严格模式应合法");
+
+        let cfg = TunConfig {
+            strict_route: true,
+            dns_hijack: vec![],
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err(), "严格模式不劫持 DNS 会让域名规则失效");
+
+        let cfg = TunConfig {
+            strict_route: false,
+            dns_hijack: vec![],
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok(), "兼容模式允许不劫持 DNS");
     }
 
     #[test]

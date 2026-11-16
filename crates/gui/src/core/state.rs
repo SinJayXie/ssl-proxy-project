@@ -24,6 +24,10 @@ pub struct AppState {
     pub connection_id: Arc<RwLock<u32>>,
     pub error_pool: Arc<RwLock<Vec<AppError>>>,
     pub dns_resolver: TokioAsyncResolver,
+    /// TUN 启动时预解析的代理服务器 IP。TUN 开启后系统 DNS 被自身劫持，
+    /// 隧道 TCP 连接必须直接用该 IP（TLS/SNI 仍按配置域名校验）；
+    /// 未启用 TUN 时为 None，走原域名解析。
+    pub proxy_resolved_ip: std::sync::RwLock<Option<String>>,
     /// Directory of the executable (resources: GeoDB.dat)
     pub app_path: PathBuf,
     /// User data directory ($HOME/ssl-proxy-client): settings, rules, log, consent
@@ -83,6 +87,7 @@ impl AppState {
             connection_id: Arc::new(RwLock::new(0)),
             error_pool: Arc::new(RwLock::new(Vec::new())),
             dns_resolver,
+            proxy_resolved_ip: std::sync::RwLock::new(None),
             app_path,
             config_dir,
             geo_manager,

@@ -125,12 +125,19 @@ async fn start(
                 Err(e) => return Err(format!("解析代理服务器 {proxy_server} 失败: {e}")),
             }
         }
+        // 登记 TUN 启动前解析的 IP：TUN 开启后系统 DNS 被自身劫持，
+        // 隧道出站（connect_proxy / MUX / UDP 隧道）必须用该 IP 直连，
+        // TLS 证书校验仍按配置域名（sni_name）进行。
+        if let Ok(mut w) = state.proxy_resolved_ip.write() {
+            *w = proxy_ips.first().cloned();
+        }
     }
 
-    let mut exclude_list = build_route_excludes(&proxy_ips, &cfg.route_exclude_address);
-    exclude_list.extend(routes::default_v4_excludes());
-    exclude_list.sort();
-    exclude_list.dedup();
+    // 例外基集：代理节点 IP（防自环）+ 用户显式排除。
+    // 私网段是否例外由 routes::build_program 按 cfg.strict_route 决定：
+    // - 兼容模式：私网段绕过 TUN（局域网直连）；
+    // - 严格模式：私网段也进 TUN，由分流引擎的 must_direct_ip 判定直连。
+    let exclude_list = build_route_excludes(&proxy_ips, &cfg.route_exclude_address);
 
     // 2. 装路由之前探测物理网卡（此后默认路由指向 TUN，探测只会返回 TUN）。
     let probe_target: std::net::Ipv4Addr = proxy_ips
@@ -164,29 +171,99 @@ async fn start(
         return Err(format!("写入 TUN 路由快照失败（已回滚路由）: {e}"));
     }
 
-    // 5. 协议栈 + 事件泵。
+    // 5. 协议栈 + 事件泵。fake-ip 映射持久化恢复（应用缓存跨重启可反查）。
     let (ev_tx, ev_rx) = std::sync::mpsc::channel::<netstack::FlowEvent>();
-    let shared = netstack::spawn(tun_dev, cfg.clone(), ev_tx);
+    let fake_map = crate::core::tun::dns::FakeIpMap::load_from(&fakeip_path(&state.config_dir));
+    let shared = netstack::spawn(tun_dev, cfg.clone(), ev_tx, fake_map);
     let env = OutboundEnv::new(Some(phys.if_index), cfg.direct_nameservers.clone());
     spawn_event_pump(state.clone(), shared.clone(), ev_rx, env);
     spawn_reaper(shared.clone());
+    spawn_fakeip_saver(state.config_dir.clone(), shared.clone());
+
+    // 清理系统 DNS 缓存：上次 TUN 会话的 fake-ip 可能仍被 OS 缓存，
+    // 应用拿到缓存后不会重新查询，反查将失败（fail-closed 拒绝该流）。
+    flush_system_dns_cache();
 
     log::info!(
-        "TUN 数据面就绪: {} ifIndex={} gw={} 物理网关={}，排除 {} 条网段",
+        "TUN 数据面就绪: {} ifIndex={} gw={} 物理网关={}，strict-route={}，排除 {} 条基集网段",
         cfg.device_name,
         phys.if_index,
         tun_gateway,
         phys.gateway,
+        cfg.strict_route,
         exclude_list.len()
     );
     Ok((shared, program.down))
 }
 
+/// 清空 Windows 系统 DNS 缓存（TUN 启停时调用，防 fake-ip 残留缓存）。
+#[cfg(target_os = "windows")]
+fn flush_system_dns_cache() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    match std::process::Command::new("ipconfig")
+        .arg("/flushdns")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    {
+        Ok(_) => log::info!("已刷新系统 DNS 缓存"),
+        Err(e) => log::warn!("刷新系统 DNS 缓存失败（可能影响 fake-ip 反查）: {e}"),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn flush_system_dns_cache() {}
+
+/// fake-ip 持久化文件：config_dir/fakeip.json。
+fn fakeip_path(config_dir: &std::path::Path) -> std::path::PathBuf {
+    config_dir.join("fakeip.json")
+}
+
+/// 周期保存 fake-ip 映射（30s 防抖），崩溃时最多丢 30s 的新映射。
+fn spawn_fakeip_saver(config_dir: std::path::PathBuf, shared: netstack::StackShared) {
+    let rt = tokio::runtime::Handle::try_current().ok();
+    if let Some(rt) = rt {
+        rt.spawn(async move {
+            let path = fakeip_path(&config_dir);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let entries = shared.lock().fake_map.entries();
+                let path = path.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || {
+                    std::fs::write(
+                        path.with_extension("json.tmp"),
+                        serde_json::to_string(&entries)
+                            .unwrap_or_else(|_| "[]".to_string()),
+                    )
+                    .and_then(|_| std::fs::rename(
+                        path.with_extension("json.tmp"),
+                        &path,
+                    ))
+                })
+                .await
+                {
+                    log::warn!("保存 fake-ip 映射失败: {e:?}");
+                }
+            }
+        });
+    }
+}
+
 fn stop_inner(m: &mut TunManager, config_dir: Option<&std::path::Path>) {
+    // 停止前先落盘 fake-ip 映射，保证下次启动可反查应用残留缓存。
+    if let Some(shared) = &m.shared {
+        if let Some(dir) = config_dir {
+            if let Err(e) = shared.lock().fake_map.save_to(&fakeip_path(dir)) {
+                log::warn!("保存 fake-ip 映射失败: {e}");
+            }
+        }
+    }
     routes::execute(&m.down_cmds);
     m.down_cmds.clear();
     m.active_cfg = None;
     m.shared = None; // 丢弃共享句柄 → 通道关闭 → 协议栈线程退出 → 网卡关闭
+    // 停止后 fake-ip 不再可达，清缓存让应用尽快重新走真实 DNS。
+    flush_system_dns_cache();
     if let Some(dir) = config_dir {
         if let Err(e) = RouteSnapshot::clear(dir) {
             log::warn!("清理 TUN 路由快照失败: {e}");

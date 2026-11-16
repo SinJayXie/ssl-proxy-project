@@ -55,6 +55,44 @@ impl FakeIpMap {
         self.forward.is_empty()
     }
 
+    /// 导出全部映射（持久化用）。反查索引由 `restore` 重建。
+    pub fn entries(&self) -> Vec<(String, String)> {
+        self.forward.iter().map(|(d, ip)| (d.clone(), ip.clone())).collect()
+    }
+
+    /// 从持久化数据恢复映射（进程重启后应用缓存的 fake-ip 仍可反查）。
+    pub fn restore(&mut self, entries: &[(String, String)]) {
+        for (domain, ip) in entries {
+            self.insert(domain, ip);
+        }
+    }
+
+    /// 保存映射表到 `path`（JSON 数组 [[domain, ip], ...]）。
+    pub fn save_to(&self, path: &std::path::Path) -> std::io::Result<()> {
+        let json = serde_json::to_string(&self.entries())
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        // 原子写：先写临时文件再改名，避免崩溃时留下半截文件。
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    /// 从 `path` 加载映射表；文件不存在或损坏返回空表（首次启动是常态）。
+    pub fn load_from(path: &std::path::Path) -> FakeIpMap {
+        let mut map = FakeIpMap::new();
+        let Ok(json) = std::fs::read_to_string(path) else {
+            return map;
+        };
+        match serde_json::from_str::<Vec<(String, String)>>(&json) {
+            Ok(entries) => {
+                map.restore(&entries);
+                log::info!("已恢复 {} 条 fake-ip 映射", entries.len());
+            }
+            Err(e) => log::warn!("fake-ip 映射文件损坏，已忽略: {e}"),
+        }
+        map
+    }
+
     /// 从 v4 池分配一个未被占用的 fake-ip 并登记映射。
     ///
     /// 池形如 "198.18.0.1/16"（mihomo 默认）：跳过网络地址、.1（TUN 网关）
@@ -348,6 +386,34 @@ mod tests {
             resolve_fake_ip(&ip("198.18.1.100"), None, "198.18.0.1/16", &map),
             Ok(Some("example.com".to_string()))
         );
+    }
+
+    #[test]
+    fn fake_ip_persistence_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("ssl-proxy-fakeip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fakeip.json");
+
+        let mut map = FakeIpMap::new();
+        map.insert("example.com", "198.18.0.3");
+        map.insert("a.test.", "198.18.0.4");
+        map.save_to(&path).unwrap();
+
+        let mut loaded = FakeIpMap::load_from(&path);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.find_host_by_ip("198.18.0.3"), Some("example.com"));
+        // 尾点已归一化，恢复后按规范域名命中。
+        assert_eq!(loaded.find_host_by_ip("198.18.0.4"), Some("a.test"));
+        // 恢复后分配应跳过已占用地址。
+        let next = loaded.alloc_v4("b.test", "198.18.0.1/16").unwrap();
+        assert_eq!(next, "198.18.0.5");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fake_ip_load_missing_file_is_empty() {
+        let map = FakeIpMap::load_from(&std::env::temp_dir().join("ssl-proxy-no-such-fakeip.json"));
+        assert!(map.is_empty());
     }
 
     #[test]

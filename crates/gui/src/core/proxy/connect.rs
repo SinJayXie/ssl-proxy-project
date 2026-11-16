@@ -511,8 +511,15 @@ pub async fn resolve_and_connect(
         })
     } else if mux_enabled {
         // 复用模式：共享一条 TLS 隧道，只做一次 TCP + TLS 握手
+        // TUN 开启时系统 DNS 被劫持：TCP 目标用预解析 IP，TLS 身份仍按 sni。
+        let proxy_connect_addr = state
+            .proxy_resolved_ip
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| proxy_server.clone());
         let mux_cfg = MuxConfig {
-            server: proxy_server.clone(),
+            server: proxy_connect_addr,
             port: proxy_port,
             password: proxy_password.clone(),
             skip_verify: danger_accept_invalid_certs,
@@ -548,7 +555,14 @@ pub async fn resolve_and_connect(
             }
         }
     } else {
-        let conn = match connect_proxy(&proxy_server, proxy_port, host, port, &proxy_password, danger_accept_invalid_certs, &sni_name).await {
+        // TUN 开启时系统 DNS 被劫持：TCP 目标用预解析 IP，TLS 身份仍按 sni。
+        let proxy_connect_addr = state
+            .proxy_resolved_ip
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| proxy_server.clone());
+        let conn = match connect_proxy(&proxy_connect_addr, proxy_port, host, port, &proxy_password, danger_accept_invalid_certs, &sni_name).await {
             Ok(c) => c,
             Err(e) => {
                 log::error!("Proxy connection failed for {}:{}: {}", host, port, e);
