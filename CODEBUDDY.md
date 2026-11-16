@@ -42,13 +42,13 @@
 
 **配置与数据目录**：客户端默认 `%USERPROFILE%\ssl-proxy-client`，含 `setting.yaml`（camelCase，由 `AppConfig` 的 serde rename 决定）、`rules.yaml`、`consent.dat`（首次运行免责声明，接受后才启动代理）、`app.log`、`stats.json`、`ui.json`。调试环境变量：`SSL_PROXY_GUI_CONFIG_DIR`、`SSL_PROXY_GUI_MULTI_INSTANCE`、`SSL_PROXY_GUI_RELAUNCH`。服务端配置是独立的 kebab-case 体系，不要与客户端混淆。
 
-**TUN 现状（重要）**：已在 `tun` 分支实现（`c906034`/`e46f00c` 及后续阶段 C 提交），`core/tun/` 含 config/route/dns/lifecycle/device/netinfo/netstack/outbound/routes/runner/recovery 模块；依赖 `wintun 0.4`+`smoltcp 0.11`+`trust-dns-proto 0.23`，`assets/wintun/wintun.dll` 由 build.rs 复制到 exe 旁。分流决策统一在 `core/proxy/route.rs`（TCP/UDP/TUN 共用）。strict-route 已实现：`routes::effective_excludes` 按 `strict_route` 决定是否把私网段写成路由例外，`outbound::decide_for_tun` 用 `route::must_direct_ip` 保证私网/本地目标强制 DIRECT（防 SSRF），`TunConfig::validate` 要求严格模式必须配置 dns-hijack；默认仍为 `strict_route=false`（兼容模式）。设置页已有独立 TUN 卡片（`ui/pages/settings.rs` 的 `TunInputs` + `tun_card`），可开关并配置设备名/MTU/strict-route/DNS 劫持/排除网段，保存后自动 apply 并重启进程。**尚未实现**：Windows Service（SYSTEM 权限与守护）。设计研究见 `tun.md` 第 12 节与 `docs/tun-design.md`，关键结论如下：
+**TUN 现状（重要）**：已在 `tun` 分支实现并随 2.6.0 发布，`core/tun/` 含 config/route/dns/lifecycle/device/netinfo/netstack/outbound/routes/runner/recovery 模块；依赖 `wintun 0.4`+`smoltcp 0.11`+`trust-dns-proto 0.23`，`assets/wintun/wintun.dll` 由 build.rs 复制到 exe 旁、由 NSIS 安装包分发。分流决策统一在 `core/proxy/route.rs`（TCP/UDP/TUN 共用）。关键实现：`routes::effective_excludes` 按 `strict_route` 决定是否把私网段写成路由例外；`outbound::decide_for_tun` 用 `route::must_direct_ip` 强制私网/本地目标 DIRECT（防 SSRF）；`TunConfig::validate` 要求严格模式必须配置 dns-hijack。TUN 期间所有解析走 `dns::lookup` → `outbound::lookup_direct`（绑定物理网卡，避开自身劫持），fake-ip 映射写入 `fakeip.json`（1 秒内落盘）并可跨重启恢复；`netinfo::resolve_egress` 按目标实时解析出口（最长前缀 + 20s 缓存，排除 TUN）并同时绑定 `IP_UNICAST_IF` 与源地址。设置页有独立 TUN 卡片（`ui/pages/settings.rs`）。**尚未实现**：Windows Service（SYSTEM 权限与守护）、fake-ip LRU 淘汰、IPv6 数据面（AAAA 目前统一回 NODATA）。实现要点如下：
 
 - 路线：优先“Rust 控制面 + 外部 sing-tun 数据面”，再考虑纯 Rust（`tun-rs` + `netstack-smoltcp` + Wintun + Windows Service）。真正复杂的是 TCP 状态机、UDP NAT、DNS 劫持与路由恢复，不是规则匹配。
 - 分流：把 `connect.rs` 的字符串决策抽象为 `RouteDecision { Direct, Proxy, Reject }` + `Outbound` trait；DIRECT 必须新建原生 socket 走物理网卡（绑定 `IP_UNICAST_IF`/`IPV6_UNICAST_IF`），PROXY 才进入 TLS 隧道；出站 socket 不得被 TUN 二次捕获。
 - 路由：auto-route 指向 TUN，同时**必须**把代理服务器 IP 写例外/绑定物理出口，否则隧道自环；接口探测不得返回 TUN 自身，失败用无效值 fail-closed；退出/崩溃须原子化撤销路由与 DNS。
 - DNS（最高优先级）：TUN 与 DNS 必须成对上线。`any:53` 表示任意 IP 的 53，TCP/UDP 两条路径都劫持；fake-ip 查不到域名时拒绝连接而非按 IP 直连；代理节点域名用独立 nameserver 解析，避免“用代理解析代理域名”环路。
 - 权限：无管理员/Service 能力时强制关闭 TUN（fail-closed），不得半开残留路由。
-- 验证清单见 `tun.md` 第 9 节：直连绕过、代理出口 IP、DNS 泄漏、TUN 自环、权限失败、策略切换、协议边界、崩溃恢复。
+- 验证：`cargo test -p ssl-proxy-gui tun`（59 项）覆盖配置校验、路由生成、fake-ip、lifecycle、恢复等纯逻辑；真机需人工确认直连绕过、代理出口 IP、DNS 泄漏、TUN 自环、权限失败、策略切换、崩溃恢复。
 
 参考文档：`README.md`（快速开始、打包、配置参考）、`crates/svr/docs/ARCHITECTURE.md`（握手/帧/mux）、`crates/svr/docs/CONFIGURATION.md`、`docs/udp-design.md`。

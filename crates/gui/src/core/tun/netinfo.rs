@@ -45,6 +45,94 @@ pub fn next_hop_to_ipv4(raw: u32) -> std::net::Ipv4Addr {
     std::net::Ipv4Addr::from(u32::from_be(raw))
 }
 
+/// 路由表快照缓存时长（与 mihomo 的接口探测缓存一致）。
+#[cfg(target_os = "windows")]
+const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// 按目标地址解析直连出口（对应 mihomo 的 `FindInterfaceName`）。
+///
+/// 为什么不能只用启动时探测的那块网卡：TUN 开启后默认路由指向 TUN，
+/// 期间网卡/VPN 切换会让旧索引失效；同时多网卡场景下不同目标应走
+/// 各自网段对应的网卡。这里每 20 秒重建一次路由表快照：
+/// 1. 目标命中某网卡的具体网段（最长前缀）→ 用该网卡；
+/// 2. 否则用默认路由所在网卡；
+/// 3. 解析结果等于 TUN 本身 → 返回 None（fail-closed，绝不回环）。
+pub fn resolve_egress(
+    destination: std::net::Ipv4Addr,
+    tun_if_index: u32,
+) -> Option<PhysicalRoute> {
+    #[cfg(target_os = "windows")]
+    {
+        let routes = snapshot();
+        let dest_raw = u32::from(destination).to_be();
+
+        // 1) 最长前缀匹配（排除 TUN 与默认路由）
+        let mut best: Option<(u8, &imp::RouteEntry)> = None;
+        for route in routes.iter() {
+            if route.if_index == tun_if_index || route.mask == 0 {
+                continue;
+            }
+            if route.dest & route.mask != dest_raw & route.mask {
+                continue;
+            }
+            let prefix = route.mask.count_ones() as u8;
+            if best.map(|(p, _)| prefix > p).unwrap_or(true) {
+                best = Some((prefix, route));
+            }
+        }
+
+        // 2) 回退到默认路由（metric 最小）
+        let chosen = best.map(|(_, r)| r).or_else(|| {
+            routes
+                .iter()
+                .filter(|r| r.mask == 0 && r.if_index != tun_if_index)
+                .min_by_key(|r| r.metric)
+        })?;
+
+        if chosen.if_index == 0 {
+            return None;
+        }
+        Some(PhysicalRoute {
+            if_index: chosen.if_index,
+            gateway: next_hop_to_ipv4(chosen.next_hop),
+            local_ipv4: imp::local_ipv4_for_if(chosen.if_index),
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (destination, tun_if_index);
+        None
+    }
+}
+
+/// 默认出口（用于 DNS 与接口变化监控）。
+pub fn default_egress(tun_if_index: u32) -> Option<PhysicalRoute> {
+    // 8.8.8.8 只是取默认路由的探测目标，不发送任何流量。
+    resolve_egress(std::net::Ipv4Addr::new(8, 8, 8, 8), tun_if_index)
+}
+
+#[cfg(target_os = "windows")]
+fn snapshot() -> std::sync::Arc<Vec<imp::RouteEntry>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<(std::time::Instant, Arc<Vec<imp::RouteEntry>>)>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        Mutex::new((std::time::Instant::now() - SNAPSHOT_TTL, Arc::new(Vec::new())))
+    });
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.0.elapsed() >= SNAPSHOT_TTL || guard.1.is_empty() {
+        let fresh = Arc::new(imp::route_table());
+        *guard = (std::time::Instant::now(), fresh);
+    }
+    guard.1.clone()
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+fn snapshot() -> std::sync::Arc<Vec<()>> {
+    std::sync::Arc::new(Vec::new())
+}
+
 /// 安全不变量：探测结果不得是 TUN 自身（否则出站全部自环）。
 pub fn validate_physical(route: &PhysicalRoute, tun_if_index: u32) -> Result<(), String> {
     if route.if_index == tun_if_index {
@@ -63,6 +151,56 @@ pub fn validate_physical(route: &PhysicalRoute, tun_if_index: u32) -> Result<(),
 mod imp {
     use windows::Win32::NetworkManagement::IpHelper::GetBestRoute;
     use windows::Win32::NetworkManagement::IpHelper::MIB_IPFORWARDROW;
+
+    /// 一条 IPv4 路由（dest/mask/next_hop 均为网络字节序）。
+    pub(super) struct RouteEntry {
+        pub dest: u32,
+        pub mask: u32,
+        pub next_hop: u32,
+        pub if_index: u32,
+        pub metric: u32,
+    }
+
+    /// 读取完整 IPv4 路由表（GetIpForwardTable，含未持久化与系统路由）。
+    pub(super) fn route_table() -> Vec<RouteEntry> {
+        use windows::Win32::NetworkManagement::IpHelper::{GetIpForwardTable, MIB_IPFORWARDTABLE};
+
+        const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+        let mut size: u32 = 0;
+        let rc = unsafe { GetIpForwardTable(None, &mut size, false) };
+        if rc != ERROR_INSUFFICIENT_BUFFER {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; size as usize];
+        let rc = unsafe {
+            GetIpForwardTable(
+                Some(buf.as_mut_ptr() as *mut MIB_IPFORWARDTABLE),
+                &mut size,
+                false,
+            )
+        };
+        if rc != 0 {
+            return Vec::new();
+        }
+
+        // MIB_IPFORWARDTABLE = dwNumEntries + 变长 rows
+        let table = buf.as_ptr() as *const MIB_IPFORWARDTABLE;
+        let count = unsafe { (*table).dwNumEntries } as usize;
+        if count == 0 {
+            return Vec::new();
+        }
+        let rows_ptr = unsafe { std::ptr::addr_of!((*table).table) as *const MIB_IPFORWARDROW };
+        let rows = unsafe { std::slice::from_raw_parts(rows_ptr, count) };
+        rows.iter()
+            .map(|r| RouteEntry {
+                dest: r.dwForwardDest,
+                mask: r.dwForwardMask,
+                next_hop: r.dwForwardNextHop,
+                if_index: r.dwForwardIfIndex,
+                metric: r.dwForwardMetric1,
+            })
+            .collect()
+    }
 
     /// 返回 (ifIndex, gateway u32 network-order)。
     pub(super) fn get_best_route(dest: u32) -> Option<(u32, u32)> {

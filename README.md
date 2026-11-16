@@ -9,7 +9,7 @@
 
 A two-part Rust proxy suite: a native Windows desktop client built with GPUI and a TLS proxy server, talking to each other over a private protocol that is designed to look like ordinary HTTPS traffic.
 
-- Client: `crates/gui` (package `ssl-proxy-gui`, installed as `ssl-proxy-client.exe`) — version **2.5.2**
+- Client: `crates/gui` (package `ssl-proxy-gui`, installed as `ssl-proxy-client.exe`) — version **2.6.0**
 - Server: `crates/svr` (`ssl-proxy-svr`) — version **1.5.1**
 - Update signer: `crates/update-signer` — Ed25519 manifest signing tool
 - License: [MIT](LICENSE)
@@ -43,6 +43,7 @@ A two-part Rust proxy suite: a native Windows desktop client built with GPUI and
 - **Native desktop client.** GPUI + gpui-kit UI with dashboard, interactive 7-day traffic chart, connection list, rule editor, rule tester, live logs, tray integration and instant theme / language switching.
 - **Verified updates.** Installers are checked against SHA-256 **and** an Ed25519 signature before they are allowed to run; downgrades and non-HTTPS manifests are rejected.
 - **UDP relay.** Optional SOCKS5 UDP ASSOCIATE with `off` / `direct` / `proxy` modes; the server side is opt-in and rate-limited.
+- **TUN mode (Windows).** A WinTun adapter with a userland smoltcp stack takes over the whole machine: fake-IP DNS hijack, TCP/UDP proxying, strict-route with fail-closed rollback, crash recovery and per-destination egress selection.
 
 ## Features
 
@@ -74,6 +75,17 @@ A two-part Rust proxy suite: a native Windows desktop client built with GPUI and
 - `off` — UDP is rejected entirely (UDP ASSOCIATE replies *command not supported*)
 - `direct` — every datagram goes out locally, even if a proxy rule matches
 - `proxy` — follows the rule chain; requires `udp.enabled: true` on the server and matching versions (capability negotiation falls back to direct with a log warning)
+
+**TUN mode (Windows)**
+
+- WinTun virtual adapter (`SSLProxy`) driven by a userland smoltcp stack, so applications that ignore the system proxy are covered too
+- Fake-IP DNS hijack on `:53` (TCP and UDP); unknown fake-IPs fail closed instead of leaking a plain-IP connection
+- Strict-route mode: every packet enters TUN, private / loopback targets are forced DIRECT inside the stack, and a non-empty `dns-hijack` is required
+- Fail-closed lifecycle: route install failure, missing WinTun driver or missing admin rights roll back and leave no half-open state; a route snapshot recovers from crashes
+- Direct egress re-resolves the physical interface per destination (longest-prefix match, 20 s cache) and binds both `IP_UNICAST_IF` and the source address, so traffic can never loop back into TUN
+- Fake-IP mappings survive restarts (`fakeip.json`, written within a second of allocation) and can be cleared from Settings
+- QUIC / HTTP3 works: UDP sessions are tracked per application source endpoint, so concurrent QUIC connections never cross-talk
+- Settings → TUN panel exposes enable, strict-route, auto-route, device name, MTU, fake-IP pools, DNS hijack list, route exclusions, direct nameservers and a fake-IP cache reset
 
 **UI**
 
@@ -110,7 +122,7 @@ A two-part Rust proxy suite: a native Windows desktop client built with GPUI and
 
 ### 1. Install the client
 
-Run `SSLProxyClient_2.5.2_x64-setup.exe` (from `dist/client`, or the download URL in `version.json`). It installs to `%LOCALAPPDATA%\SSLProxyClient`, ships `GeoDB.dat` next to the executable and upgrades older versions in place. Accept the first-run disclaimer.
+Run `SSLProxyClient_2.6.0_x64-setup.exe` (from `dist/client`, or the download URL in `version.json`). It installs to `%LOCALAPPDATA%\SSLProxyClient`, ships `GeoDB.dat` and `wintun.dll` next to the executable and upgrades older versions in place. Accept the first-run disclaimer. TUN mode additionally needs administrator rights.
 
 ### 2. Point applications at the local proxy
 
@@ -165,7 +177,7 @@ See [crates/svr/docs/ARCHITECTURE.md](crates/svr/docs/ARCHITECTURE.md) for the h
 .
 ├─ crates/
 │  ├─ gui/                  Windows client (GPUI + gpui-kit)
-│  │  ├─ src/core/          proxy core, geo, stats, state, tun (design stub)
+│  │  ├─ src/core/          proxy core, geo, stats, state, tun (WinTun data plane)
 │  │  ├─ src/ui/            shell, pages, components, theme, i18n
 │  │  ├─ src/platform/      tray, single instance, logging, paths
 │  │  ├─ installer/         NSIS installer script
@@ -178,7 +190,7 @@ See [crates/svr/docs/ARCHITECTURE.md](crates/svr/docs/ARCHITECTURE.md) for the h
 │  │  ├─ tests/e2e.rs       end-to-end tests
 │  │  └─ docs/              architecture and configuration reference
 │  └─ update-signer/        Ed25519 signing / verification tool for releases
-├─ docs/                    design notes (UDP, TUN)
+├─ docs/                    design notes (UDP)
 ├─ scripts/
 │  ├─ build.ps1             One-step build + packaging (Windows)
 │  ├─ build.sh              One-step build + packaging (Linux / macOS; MSYS delegates to build.ps1)
@@ -269,8 +281,9 @@ Defaults to `%USERPROFILE%\ssl-proxy-client` (shared with the legacy Tauri clien
 
 | File | Purpose |
 | --- | --- |
-| `setting.yaml` | Proxy, TLS/SNI, bind addresses, DNS, direct regions, mux, UDP mode (camelCase) |
+| `setting.yaml` | Proxy, TLS/SNI, bind addresses, DNS, direct regions, mux, UDP mode, TUN (camelCase) |
 | `rules.yaml` | HOST / GEO routing rules |
+| `fakeip.json` | TUN fake-IP mappings, kept across restarts so cached client addresses stay resolvable |
 | `consent.dat` | First-run disclaimer acknowledgement |
 | `app.log` | Runtime log |
 | `stats.json` | Traffic statistics |
@@ -381,12 +394,10 @@ Version sources:
 | [crates/svr/docs/ARCHITECTURE.md](crates/svr/docs/ARCHITECTURE.md) | Service layout, request flow, protocol v3 handshake, framing, mux |
 | [crates/svr/docs/CONFIGURATION.md](crates/svr/docs/CONFIGURATION.md) | Every configuration key, merge priority and defaults |
 | [docs/udp-design.md](docs/udp-design.md) | UDP relay design: frames, sessions, negotiation and fallbacks |
-| [docs/tun-design.md](docs/tun-design.md) | Windows TUN research (design study, not implemented) |
 | `crates/gui/specs/gpui-refactor/` | Client specs and acceptance checklists |
 
 ## Roadmap
 
-- TUN mode on Windows (Wintun + auto-route + fake-IP DNS) — design study only, see [docs/tun-design.md](docs/tun-design.md)
 - Further UDP session reuse and diagnostics
 
 ## Contributing

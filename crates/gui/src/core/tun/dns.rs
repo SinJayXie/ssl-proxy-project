@@ -231,10 +231,10 @@ pub fn answer_query(
     payload: &[u8],
     map: &mut FakeIpMap,
     pool_v4: &str,
-    pool_v6: &str,
+    _pool_v6: &str,
 ) -> DnsAnswerResult {
     use trust_dns_proto::op::{Message, MessageType, OpCode, ResponseCode};
-    use trust_dns_proto::rr::rdata::{A, AAAA};
+    use trust_dns_proto::rr::rdata::A;
     use trust_dns_proto::rr::{RData, Record, RecordType};
 
     let query = Message::from_vec(payload).map_err(|e| format!("DNS 报文解析失败: {e}"))?;
@@ -263,9 +263,10 @@ pub fn answer_query(
                 None => None, // 池耗尽：该类型无应答（NODATA），不回退真实 IP
             },
             RecordType::AAAA => {
-                // v6 池合法才分配；禁用 IPv6 时返回空（NODATA）。
-                let v6 = fake_ipv6_for(name.to_string(), pool_v6, map);
-                v6.map(|v| Record::from_rdata(name.clone(), 1, RData::AAAA(AAAA(v))))
+                // 数据面只实现 IPv4（netstack 只解析 IPv4 包、路由也只装 IPv4）。
+                // 返回 fake IPv6 会让客户端优先尝试必然失败的 IPv6（QUIC/HTTP3
+                // 尤其明显），因此统一回 NODATA，等价于 mihomo 的 ipv6: false。
+                None
             }
             _ => None,
         };
@@ -278,6 +279,8 @@ pub fn answer_query(
 }
 
 /// 为域名分配固定 fake IPv6（同域名重复查询返回同一地址）。
+/// 保留实现以备后续 IPv6 数据面；当前 AAAA 统一回 NODATA。
+#[allow(dead_code)]
 fn fake_ipv6_for(domain: String, pool_v6: &str, map: &mut FakeIpMap) -> Option<std::net::Ipv6Addr> {
     let (base, prefix) = pool_v6.split_once('/')?;
     if prefix.parse::<u32>().ok()? < 64 {

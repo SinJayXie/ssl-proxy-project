@@ -9,7 +9,7 @@
 
 基于 Rust 的双端代理方案：一个原生 Windows 桌面客户端（GPUI）加一个 TLS 代理服务端，两者通过私有协议通信，对外表现得和普通 HTTPS 流量一致。
 
-- 客户端：`crates/gui`（包名 `ssl-proxy-gui`，安装后为 `ssl-proxy-client.exe`），版本 **2.5.2**
+- 客户端：`crates/gui`（包名 `ssl-proxy-gui`，安装后为 `ssl-proxy-client.exe`），版本 **2.6.0**
 - 服务端：`crates/svr`（`ssl-proxy-svr`），版本 **1.5.1**
 - 更新签名工具：`crates/update-signer`，负责发布清单的 Ed25519 签名
 - 许可证：[MIT](LICENSE)
@@ -43,6 +43,7 @@
 - **原生桌面客户端**：GPUI + gpui-kit，运行概览、7 天交互式流量图、连接列表、规则编辑、规则测试器、实时日志、系统托盘，主题与语言即时切换。
 - **安全更新**：安装包在运行前同时校验 SHA-256 与 Ed25519 签名，拒绝降级包与非 HTTPS 清单。
 - **UDP 转发**：SOCKS5 UDP ASSOCIATE 支持 `off` / `direct` / `proxy` 三种模式，服务端默认关闭、按会话限速。
+- **TUN 模式（Windows）**：WinTun 虚拟网卡 + 用户态 smoltcp 协议栈接管整机流量，支持 fake-IP DNS 劫持、TCP/UDP 代理、严格路由与 fail-closed 回滚、崩溃恢复以及按目标选择出口网卡。
 
 ## 功能
 
@@ -75,6 +76,17 @@
 - `off`：完全不转发 UDP，SOCKS5 UDP ASSOCIATE 回复「命令不支持」
 - `direct`：所有 UDP 一律本机直连，命中代理规则也强制直连
 - `proxy`：按规则链决定直连或经隧道转发；需要服务端 `udp.enabled: true` 且两端版本配套（通过能力字节协商，旧服务端自动降级为直连并写日志）
+
+**TUN 模式（Windows）**
+
+- WinTun 虚拟网卡（`SSLProxy`）配合用户态 smoltcp 协议栈，覆盖不遵守系统代理的应用
+- `:53` DNS 劫持（TCP 与 UDP）；查不到映射的 fake-IP 一律 fail-closed 拒绝，不会退化成裸 IP 直连
+- 严格路由：所有流量进 TUN，私网 / 回环目标在协议栈内强制 DIRECT，且必须配置非空 `dns-hijack`
+- fail-closed 生命周期：路由安装失败、缺少 WinTun 驱动或管理员权限都会完整回滚，不留半开状态；路由快照支持崩溃恢复
+- 直连出口按目标实时解析（最长前缀匹配 + 20 秒缓存），同时绑定 `IP_UNICAST_IF` 与源地址，杜绝流量绕回 TUN
+- fake-IP 映射持久化（`fakeip.json`，分配后 1 秒内落盘），重启后浏览器缓存的地址仍可反查，可在设置页一键清空
+- 支持 QUIC / HTTP3：UDP 会话按「socket + 应用源端点」隔离，并发 QUIC 连接不会串包
+- 设置页 TUN 面板：开关、严格路由、自动路由、网卡名、MTU、fake-IP 池、DNS 劫持列表、路由排除、直连 DNS 与 fake-IP 缓存清理
 
 **界面**
 
@@ -111,7 +123,7 @@
 
 ### 1. 安装客户端
 
-运行 `SSLProxyClient_2.5.2_x64-setup.exe`（来自 `dist/client`，或 `version.json` 中的下载地址）。安装到 `%LOCALAPPDATA%\SSLProxyClient`，`GeoDB.dat` 会放在 exe 同目录，旧版本原地覆盖升级。首次启动需确认免责声明。
+运行 `SSLProxyClient_2.6.0_x64-setup.exe`（来自 `dist/client`，或 `version.json` 中的下载地址）。安装到 `%LOCALAPPDATA%\SSLProxyClient`，`GeoDB.dat` 与 `wintun.dll` 会放在 exe 同目录，旧版本原地覆盖升级。首次启动需确认免责声明；TUN 模式还需要管理员权限。
 
 ### 2. 让应用走本地代理
 
@@ -166,7 +178,7 @@ static-sources:
 .
 ├─ crates/
 │  ├─ gui/                  Windows 客户端（GPUI + gpui-kit）
-│  │  ├─ src/core/          代理核心、GeoIP、统计、状态、tun（仅设计占位）
+│  │  ├─ src/core/          代理核心、GeoIP、统计、状态、tun（WinTun 数据面）
 │  │  ├─ src/ui/            外壳、页面、组件、主题、i18n
 │  │  ├─ src/platform/      托盘、单实例、日志、路径
 │  │  ├─ installer/         NSIS 安装包脚本
@@ -179,7 +191,7 @@ static-sources:
 │  │  ├─ tests/e2e.rs       端到端测试
 │  │  └─ docs/              架构与配置文档
 │  └─ update-signer/        发布清单的 Ed25519 签名 / 校验工具
-├─ docs/                    设计文档（UDP、TUN）
+├─ docs/                    设计文档（UDP）
 ├─ scripts/
 │  ├─ build.ps1             一键构建 + 打包（Windows）
 │  ├─ build.sh              一键构建 + 打包（Linux / macOS；MSYS 委托 build.ps1）
@@ -270,8 +282,9 @@ wsl -d Ubuntu-22.04 -e bash /mnt/e/myProjects/ssl-proxy-project/scripts/build-sv
 
 | 文件 | 说明 |
 | --- | --- |
-| `setting.yaml` | 代理、TLS/SNI、绑定地址、DNS、直连地区、mux、UDP 模式（camelCase） |
+| `setting.yaml` | 代理、TLS/SNI、绑定地址、DNS、直连地区、mux、UDP 模式、TUN（camelCase） |
 | `rules.yaml` | HOST / GEO 路由规则 |
+| `fakeip.json` | TUN fake-IP 映射，跨重启保留，保证客户端缓存的地址仍可反查 |
 | `consent.dat` | 首次使用免责声明确认标记 |
 | `app.log` | 运行日志 |
 | `stats.json` | 流量统计 |
@@ -382,12 +395,10 @@ udp:
 | [crates/svr/docs/ARCHITECTURE.md](crates/svr/docs/ARCHITECTURE.md) | 服务分层、请求流程、协议 v3 握手、分帧、mux |
 | [crates/svr/docs/CONFIGURATION.md](crates/svr/docs/CONFIGURATION.md) | 全部配置项、合并优先级与默认值 |
 | [docs/udp-design.md](docs/udp-design.md) | UDP relay 设计：帧格式、会话、协商与降级 |
-| [docs/tun-design.md](docs/tun-design.md) | Windows TUN 方案研究（仅设计，未实施） |
 | `crates/gui/specs/gpui-refactor/` | 客户端规格与验收清单 |
 
 ## 后续规划
 
-- Windows TUN 模式（Wintun + 自动路由 + fake-IP DNS）——目前仅为方案研究，见 [docs/tun-design.md](docs/tun-design.md)
 - UDP 会话复用与诊断能力的进一步完善
 
 ## 贡献

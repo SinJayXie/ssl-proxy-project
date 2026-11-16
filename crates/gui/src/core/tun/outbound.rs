@@ -41,6 +41,8 @@ static UDP_SESSION_GEN: AtomicU64 = AtomicU64::new(1);
 pub struct OutboundEnv {
     /// 物理网卡 ifIndex（None = 未绑定，仅用于非 Windows/测试）。
     pub physical_if: Option<u32>,
+    /// TUN 网卡 ifIndex：解析直连出口时必须排除，否则会把流量送回 TUN。
+    pub tun_if: Option<u32>,
     /// 物理网卡 IPv4 地址：直连 socket 显式绑定源地址，避免取到 TUN 地址。
     pub physical_ip: Option<std::net::Ipv4Addr>,
     /// 直连解析用 DNS 服务器（绑定物理网卡查询）。
@@ -52,11 +54,13 @@ pub struct OutboundEnv {
 impl OutboundEnv {
     pub fn new(
         physical_if: Option<u32>,
+        tun_if: Option<u32>,
         physical_ip: Option<std::net::Ipv4Addr>,
         nameservers: Vec<String>,
     ) -> Self {
         Self {
             physical_if,
+            tun_if,
             physical_ip,
             nameservers,
             udp_sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -284,7 +288,7 @@ async fn handle_tcp(
                 return;
             }
         };
-        match connect_direct(&ip, port, env.physical_if, env.physical_ip).await {
+        match connect_direct(&ip, port, &env).await {
             Ok(target) => {
                 let mut target = target;
                 let mut stream = stream;
@@ -357,14 +361,32 @@ async fn serve_tcp_dns(
 async fn connect_direct(
     ip: &str,
     port: u16,
-    if_index: Option<u32>,
-    local_ip: Option<std::net::Ipv4Addr>,
+    env: &OutboundEnv,
 ) -> std::io::Result<tokio::net::TcpStream> {
-    let ip = ip.to_string();
+    let addr: SocketAddr = format!("{ip}:{port}")
+        .parse()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    // 每个目标重新解析出口（对应 mihomo 的 FindInterfaceName）：
+    // 网卡/VPN 切换后旧索引会失效，固定索引会让直连全部超时。
+    let egress = match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            crate::core::tun::netinfo::resolve_egress(v4, env.tun_if.unwrap_or(0))
+        }
+        std::net::IpAddr::V6(_) => None,
+    };
+    match egress {
+        Some(e) if Some(e.if_index) != env.physical_if => log::info!(
+            "TUN 直连出口切换: {addr} → ifIndex={} 源地址={:?}",
+            e.if_index,
+            e.local_ipv4
+        ),
+        Some(e) => log::debug!("TUN 直连出口: {addr} → ifIndex={}", e.if_index),
+        None => log::debug!("TUN 直连出口: {addr} → 沿用探测网卡 {:?}", env.physical_if),
+    }
+    let if_index = egress.map(|e| e.if_index).or(env.physical_if);
+    let local_ip = egress.and_then(|e| e.local_ipv4).or(env.physical_ip);
+
     let std_stream = tokio::task::spawn_blocking(move || {
-        let addr: SocketAddr = format!("{ip}:{port}")
-            .parse()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
         let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         if let Some(idx) = if_index {
@@ -480,7 +502,7 @@ async fn handle_udp(
         RouteOutbound::Direct => {
             match decision.resolved_ip.as_deref().and_then(|ip| {
                 format!("{ip}:{port}").parse::<SocketAddr>().ok()
-                    .and_then(|dst| connect_direct_udp(env.physical_if, env.physical_ip).map(|s| (s, dst)))
+                    .and_then(|dst| connect_direct_udp(dst, &env).map(|s| (s, dst)))
             }) {
                 Some((s, dst)) => (UdpUpstream::Direct(s), dst),
                 None => {
@@ -559,10 +581,16 @@ async fn build_proxy_udp(state: &Arc<AppState>, host: &str) -> Option<UdpUpstrea
 }
 
 /// 绑定物理网卡的直连 UDP socket（直连出站专用）。
-fn connect_direct_udp(
-    if_index: Option<u32>,
-    local_ip: Option<std::net::Ipv4Addr>,
-) -> Option<tokio::net::UdpSocket> {
+fn connect_direct_udp(dst: SocketAddr, env: &OutboundEnv) -> Option<tokio::net::UdpSocket> {
+    let egress = match dst.ip() {
+        std::net::IpAddr::V4(v4) => {
+            crate::core::tun::netinfo::resolve_egress(v4, env.tun_if.unwrap_or(0))
+        }
+        std::net::IpAddr::V6(_) => None,
+    };
+    let if_index = egress.map(|e| e.if_index).or(env.physical_if);
+    let local_ip = egress.and_then(|e| e.local_ipv4).or(env.physical_ip);
+
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
     if let Some(idx) = if_index {
         bind_unicast_if(&sock, true, idx).ok()?;

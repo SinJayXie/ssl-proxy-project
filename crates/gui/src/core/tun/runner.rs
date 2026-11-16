@@ -153,6 +153,7 @@ async fn start(
     // 3. 打开网卡（无管理员权限在这里快速失败）。
     let tun_dev = device::open(cfg)?;
     netinfo::validate_physical(&phys, tun_dev.if_index)?;
+    let tun_if_index = tun_dev.if_index;
 
     // 4. 路由：失败立即回滚。
     let tun_gateway: std::net::Ipv4Addr = cfg
@@ -178,7 +179,12 @@ async fn start(
     let (ev_tx, ev_rx) = std::sync::mpsc::channel::<netstack::FlowEvent>();
     let fake_map = crate::core::tun::dns::FakeIpMap::load_from(&fakeip_path(&state.config_dir));
     let shared = netstack::spawn(tun_dev, cfg.clone(), ev_tx, fake_map);
-    let env = OutboundEnv::new(Some(phys.if_index), phys.local_ipv4, cfg.direct_nameservers.clone());
+    let env = OutboundEnv::new(
+        Some(phys.if_index),
+        Some(tun_if_index),
+        phys.local_ipv4,
+        cfg.direct_nameservers.clone(),
+    );
     // 登记 DNS 绕行参数：TUN 期间所有解析都必须走物理网卡，否则会被
     // 自身劫持应答成 fake-ip，污染缓存并让分流退化为直连。
     if let Ok(mut w) = state.tun_dns_bypass.write() {
@@ -192,6 +198,7 @@ async fn start(
     spawn_event_pump(state.clone(), shared.clone(), ev_rx, env);
     spawn_reaper(shared.clone());
     spawn_fakeip_saver(state.config_dir.clone(), shared.clone());
+    spawn_egress_monitor(state.clone(), tun_if_index);
 
     // 清理系统 DNS 缓存：上次 TUN 会话的 fake-ip 可能仍被 OS 缓存，
     // 应用拿到缓存后不会重新查询，反查将失败（fail-closed 拒绝该流）。
@@ -397,6 +404,48 @@ pub fn clear_fakeip(state: &AppState) -> Result<usize, String> {
     }
     flush_system_dns_cache_async();
     Ok(cleared)
+}
+
+/// 每 15s 复查默认出口：网卡/VPN 切换后更新 DNS 绕行参数并记录日志。
+///
+/// 直连出站本身按目标实时解析（netinfo::resolve_egress），这里只负责
+/// 让 DNS 查询与日志跟上变化，避免出现「直连已切换、DNS 还绑旧网卡」。
+fn spawn_egress_monitor(state: Arc<AppState>, tun_if_index: u32) {
+    let rt = tokio::runtime::Handle::try_current().ok();
+    if let Some(rt) = rt {
+        rt.spawn(async move {
+            let mut last = netinfo::default_egress(tun_if_index);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let current = netinfo::default_egress(tun_if_index);
+                let changed = match (last, current) {
+                    (Some(a), Some(b)) => {
+                        a.if_index != b.if_index || a.local_ipv4 != b.local_ipv4
+                    }
+                    (None, None) => false,
+                    _ => true,
+                };
+                if !changed {
+                    continue;
+                }
+                // PhysicalRoute 是 Copy，这里保留值语义用于下一次比较。
+                log::info!(
+                    "TUN 默认出口变化: ifIndex={:?} 源地址={:?}",
+                    current.map(|r| r.if_index),
+                    current.and_then(|r| r.local_ipv4)
+                );
+                last = current;
+                if let Some(route) = current {
+                    if let Ok(mut guard) = state.tun_dns_bypass.write() {
+                        if let Some(bypass) = guard.as_mut() {
+                            bypass.if_index = route.if_index;
+                            bypass.local_ipv4 = route.local_ipv4;
+                        }
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// 周期回收关闭/超时的 socket，并每 10s 打一条心跳（泄漏/卡死排查）。

@@ -11,6 +11,6 @@
                       "Fix: LUID-to-ifIndex conversion via system API (was breaking adapter setup); smoltcp AnyIP mode for routed traffic; socket-recycle panic in mux forwarding"
                   ],
     "downloadUrl":  "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.6.0_x64-setup.exe",
-    "sha256":  "26cebd63a065df4927f57d2480d135db868c1bddd9467c66915c0bf3c4a985cd",
-    "signature":  "e1ac2d60e0b23a87eabff350ad3a36ae17f377ab1770d8ed9486ed1f8935be02a46a2c73af5f3b0c74bcf704a463efc4d88a1f62ce1d8c2e0eeb7b416cd2070b"
+    "sha256":  "27196f60cb901e68490a9becf9bc637e9737d68e8b937c556c615fb54a1c61af",
+    "signature":  "9caa2f9f9bb0d053d3795da6021c380b2e7ec7918d92c246a6a3c7d350ff044470b7b3b812c6c3024ecb81b36bc747640996e1a8b8fc96ebbaab6db94dcf3406"
 }
