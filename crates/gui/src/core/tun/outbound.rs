@@ -6,29 +6,53 @@
 //!   确保出站包不被 TUN 二次捕获（防自环）；
 //! - DIRECT 域名解析走**绑定物理网卡的直连 DNS**，绝不经过自身劫持
 //!   （否则解析结果永远是 fake-ip，形成解析环路）；
-//! - 解析结果落在 fake-ip 池内一律视为"未解析"（fail-closed 后备）。
+//! - 解析结果落在 fake-ip 池内一律视为"未解析"（fail-closed 后备）；
+//! - UDP PROXY 复用已有的 `connect_udp_tunnel` + FLAG_UDP 帧格式进入 TLS 隧道，
+//!   与 SOCKS5 UDP ASSOCIATE 共用同一套服务端能力协商与帧协议。
 //!
-//! 已知边界（阶段 C 计划）：TUN 的 UDP 代理路径尚未接入隧道，仅支持直连。
+//! UDP 会话按 smoltcp socket handle 复用：首包建立出站（直连 socket / TLS 隧道）
+//! 并注册到会话表，后续报文经 channel 交给同一会话，避免每包重建隧道。
 
-use crate::core::proxy::connect::{match_rules, resolve_and_connect};
-use crate::core::proxy::route::{classify, RouteInput};
+use crate::core::proxy::connect::{connect_udp_tunnel, match_rules, resolve_and_connect};
+use crate::core::proxy::framing::{append_udp_frame, parse_udp_packet, read_frame, FLAG_UDP};
+use crate::core::proxy::route::{classify, Outbound as RouteOutbound, RouteInput};
 use crate::core::proxy::tunnel::forward_target_stream;
 use crate::core::state::AppState;
 use crate::core::tun::dns::is_in_fake_ip_pool;
-use smoltcp::iface::SocketHandle;
 use crate::core::tun::netstack::{FlowEvent, SmolTcpStream, SmolUdpSocket, StackShared};
+use smoltcp::iface::SocketHandle;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+
+/// UDP 出站会话：后续应用报文通过 `tx` 交给已建立的会话任务。
+type UdpSessionMap = Arc<Mutex<HashMap<SocketHandle, (u64, mpsc::Sender<Vec<u8>>)>>>;
+static UDP_SESSION_GEN: AtomicU64 = AtomicU64::new(1);
 
 /// 运行时环境：物理接口索引与直连 DNS 服务器（由 runner 探测后传入）。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OutboundEnv {
     /// 物理网卡 ifIndex（None = 未绑定，仅用于非 Windows/测试）。
     pub physical_if: Option<u32>,
     /// 直连解析用 DNS 服务器（绑定物理网卡查询）。
     pub nameservers: Vec<String>,
+    /// 已建立的 UDP 会话（按 socket handle 复用，避免每包重建隧道）。
+    udp_sessions: UdpSessionMap,
+}
+
+impl OutboundEnv {
+    pub fn new(physical_if: Option<u32>, nameservers: Vec<String>) -> Self {
+        Self {
+            physical_if,
+            nameservers,
+            udp_sessions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
 }
 
 /// 事件入口：由 runner 的事件循环调用。
@@ -107,8 +131,25 @@ async fn handle_tcp(
 ) {
     let host = host_of(&shared, local.ip());
     let port = local.port();
-    let fake_range = shared.lock().cfg.fake_ip_range.clone();
     let stream = SmolTcpStream::new(&shared, handle);
+
+    // DNS 劫持（TCP:53）：与 UDP 路径成对上线，防止 TCP DNS 泄漏真实查询。
+    // TCP DNS 帧 = 2 字节大端长度 + DNS 报文；应答同样加长度前缀。
+    // 配置在独立作用域取出，确保 MutexGuard 不跨越 await。
+    let (hijack, fake4, fake6) = {
+        let core = shared.lock();
+        (
+            core.cfg.dns_hijack.clone(),
+            core.cfg.fake_ip_range.clone(),
+            core.cfg.fake_ip_range6.clone(),
+        )
+    };
+    if port == 53 && crate::core::tun::dns::should_hijack_dns(&local.ip(), 53, &hijack) {
+        serve_tcp_dns(stream, shared, fake4, fake6, host).await;
+        return;
+    }
+
+    let fake_range = shared.lock().cfg.fake_ip_range.clone();
 
     let decision = match decide_for_tun(&state, &host, &fake_range).await {
         Ok(d) => d,
@@ -147,6 +188,52 @@ async fn handle_tcp(
             forward_target_stream(stream, result.target, result.id, state).await;
         }
         None => log::error!("TUN 代理出站失败 {host}:{port}"),
+    }
+}
+
+/// TCP:53 DNS 劫持应答：逐条读取「2 字节长度 + DNS 报文」，
+/// 用 fake-ip 池应答并登记映射，绝不转发真实 DNS 查询。
+async fn serve_tcp_dns(
+    mut stream: SmolTcpStream,
+    shared: StackShared,
+    pool_v4: String,
+    pool_v6: String,
+    host: String,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut len_buf = [0u8; 2];
+    loop {
+        if stream.read_exact(&mut len_buf).await.is_err() {
+            break;
+        }
+        let len = u16::from_be_bytes(len_buf) as usize;
+        if len == 0 || len > 65535 {
+            break;
+        }
+        let mut payload = vec![0u8; len];
+        if stream.read_exact(&mut payload).await.is_err() {
+            break;
+        }
+
+        // 持锁仅做映射登记，不跨 await。
+        let answer = {
+            let mut core = shared.lock();
+            crate::core::tun::dns::answer_query(&payload, &mut core.fake_map, &pool_v4, &pool_v6)
+        };
+        let Ok(resp) = answer else {
+            log::debug!("TUN TCP DNS 查询无法应答（fail-closed）: {host}");
+            break;
+        };
+        if resp.len() > u16::MAX as usize {
+            break;
+        }
+        let mut framed = Vec::with_capacity(resp.len() + 2);
+        framed.extend_from_slice(&(resp.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&resp);
+        if stream.write_all(&framed).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -207,7 +294,13 @@ fn bind_unicast_if(_sock: &Socket, _ipv4: bool, _if_index: u32) -> std::io::Resu
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// 一个 UDP 流的出站形态：直连 socket 或 TLS 隧道（非 mux）。
+enum UdpUpstream {
+    Direct(tokio::net::UdpSocket),
+    Proxy(tokio::io::ReadHalf<tokio_native_tls::TlsStream<tokio::net::TcpStream>>,
+          tokio::io::WriteHalf<tokio_native_tls::TlsStream<tokio::net::TcpStream>>),
+}
+
 async fn handle_udp(
     state: Arc<AppState>,
     shared: StackShared,
@@ -217,73 +310,174 @@ async fn handle_udp(
     payload: Vec<u8>,
     env: OutboundEnv,
 ) {
-    let host = host_of(&shared, local.ip());
     let port = local.port();
-    let fake_range = shared.lock().cfg.fake_ip_range.clone();
-    let smol = SmolUdpSocket::new(&shared, handle);
-
     // DNS：轮询线程已劫持应答；到达这里的 53 包都是未劫持目标，丢弃防泄漏。
     if port == 53 {
         log::debug!("TUN UDP:53 未命中劫持规则，丢弃 {remote}");
         return;
     }
 
+    // 会话复用：命中则把报文交给已有会话，不重建隧道/socket。
+    let tx = {
+        let sessions = env.udp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.get(&handle).map(|(_, tx)| tx.clone())
+    };
+    if let Some(tx) = tx {
+        let _ = tx.try_send(payload);
+        return;
+    }
+
+    let host = host_of(&shared, local.ip());
+    let fake_range = shared.lock().cfg.fake_ip_range.clone();
     let decision = match decide_for_tun(&state, &host, &fake_range).await {
         Ok(d) => d,
         Err(_) => return,
     };
-    if !decision.is_direct() {
-        // 阶段 C：UDP 代理路径复用 udp_relay 隧道会话。
-        log::warn!("TUN UDP 代理暂未接入，丢弃 {host}:{port}（仅支持直连）");
+    if decision.outbound == RouteOutbound::Reject {
         return;
     }
-    let ip = match decision.resolved_ip {
-        Some(ip) => ip,
-        None => return,
-    };
 
-    let sock = match connect_direct_udp(env.physical_if) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!("TUN 直连 UDP socket 失败: {e}");
-            return;
+    // 首包：建立出站。先占位注册 channel，避免建隧道期间并发包重建会话。
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
+    let generation = UDP_SESSION_GEN.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut sessions = env.udp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+        if sessions.contains_key(&handle) {
+            return; // 并发首包已被另一任务接管
         }
-    };
-    let dst: SocketAddr = match format!("{ip}:{port}").parse() {
-        Ok(a) => a,
-        Err(_) => return,
-    };
-    if sock.send_to(&payload, dst).await.is_err() {
-        return;
+        sessions.insert(handle, (generation, tx.clone()));
     }
 
-    // NAT 泵：真实服务端回复 → 伪装回 fake-ip 源发回应用。
-    let mut buf = vec![0u8; 65535];
-    let idle = Duration::from_secs(60);
-    loop {
-        tokio::select! {
-            r = sock.recv_from(&mut buf) => {
-                match r {
-                    Ok((n, _from)) => {
-                        if smol.send_to(&buf[..n], remote).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+    let (upstream, dst) = match decision.outbound {
+        RouteOutbound::Direct => {
+            match decision.resolved_ip.as_deref().and_then(|ip| {
+                format!("{ip}:{port}").parse::<SocketAddr>().ok()
+                    .and_then(|dst| connect_direct_udp(env.physical_if).map(|s| (s, dst)))
+            }) {
+                Some((s, dst)) => (UdpUpstream::Direct(s), dst),
+                None => {
+                    unregister_udp_session(&env, handle, generation);
+                    return;
                 }
             }
-            _ = tokio::time::sleep(idle) => break,
+        }
+        RouteOutbound::Proxy => {
+            match build_proxy_udp(&state, &host).await {
+                Some(u) => (u, local), // 代理路径真实目标由 FLAG_UDP 帧携带，dst.port() = 目标端口
+                None => {
+                    unregister_udp_session(&env, handle, generation);
+                    return;
+                }
+            }
+        }
+        RouteOutbound::Reject => unreachable!(),
+    };
+
+    if tx.send(payload).await.is_err() {
+        unregister_udp_session(&env, handle, generation);
+        return;
+    }
+
+    let smol = SmolUdpSocket::new(&shared, handle);
+    let env2 = env.clone();
+    tokio::spawn(async move {
+        pump_udp(smol, remote, dst, upstream, rx, host).await;
+        unregister_udp_session(&env2, handle, generation);
+    });
+}
+
+fn unregister_udp_session(env: &OutboundEnv, handle: SocketHandle, generation: u64) {
+    let mut sessions = env.udp_sessions.lock().unwrap_or_else(|e| e.into_inner());
+    if sessions.get(&handle).map(|(g, _)| *g) == Some(generation) {
+        sessions.remove(&handle);
+    }
+}
+
+/// 建立 UDP 代理隧道：复用 SOCKS5 UDP 的能力协商（port=0 + UDP 扩展位）。
+async fn build_proxy_udp(state: &Arc<AppState>, host: &str) -> Option<UdpUpstream> {
+    let config = state.config.read().await;
+    let proxy_server = config.proxy_server.clone();
+    let proxy_port = config.proxy_port;
+    let password = config.proxy_password.clone();
+    let skip_verify = config.danger_accept_invalid_certs;
+    let sni = config.sni_name.clone();
+    drop(config);
+
+    if proxy_server.is_empty() {
+        return None;
+    }
+    // 认证 head 以 host 参与 MAC、port=0 标记 UDP 隧道；真实目标在 FLAG_UDP 帧里。
+    match connect_udp_tunnel(&proxy_server, proxy_port, host, &password, skip_verify, &sni).await {
+        Ok(tls) => {
+            let (r, w) = tokio::io::split(tls);
+            Some(UdpUpstream::Proxy(r, w))
+        }
+        Err(e) => {
+            log::error!("TUN UDP 代理隧道失败 {host}: {:?}", e);
+            None
         }
     }
 }
 
-/// 绑定物理网卡的 UDP socket（直连出站专用）。
-fn connect_direct_udp(if_index: Option<u32>) -> std::io::Result<tokio::net::UdpSocket> {
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+/// 绑定物理网卡的直连 UDP socket（直连出站专用）。
+fn connect_direct_udp(if_index: Option<u32>) -> Option<tokio::net::UdpSocket> {
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
     if let Some(idx) = if_index {
-        bind_unicast_if(&sock, true, idx)?;
+        bind_unicast_if(&sock, true, idx).ok()?;
     }
-    sock.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into())?;
-    sock.set_nonblocking(true)?;
-    Ok(tokio::net::UdpSocket::from_std(std::net::UdpSocket::from(sock))?)
+    sock.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into()).ok()?;
+    sock.set_nonblocking(true).ok()?;
+    tokio::net::UdpSocket::from_std(std::net::UdpSocket::from(sock)).ok()
+}
+
+/// UDP 会话泵：应用报文 → 出站；出站回包 → 伪装成 fake-ip 源发回应用。
+async fn pump_udp(
+    smol: SmolUdpSocket,
+    remote: SocketAddr,
+    dst: SocketAddr,
+    upstream: UdpUpstream,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    host: String,
+) {
+    let mut buf = vec![0u8; 65535];
+    let idle = Duration::from_secs(60);
+    match upstream {
+        UdpUpstream::Direct(sock) => loop {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(data) => { if sock.send_to(&data, dst).await.is_err() { break; } }
+                    None => break,
+                },
+                r = sock.recv_from(&mut buf) => match r {
+                    Ok((n, _)) => { if smol.send_to(&buf[..n], remote).await.is_err() { break; } }
+                    Err(_) => break,
+                },
+                _ = tokio::time::sleep(idle) => break,
+            }
+        },
+        UdpUpstream::Proxy(mut reader, mut writer) => loop {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(data) => {
+                        let mut frame = Vec::with_capacity(data.len() + 300);
+                        if append_udp_frame(&mut frame, 1, &host, dst.port(), &data) {
+                            if writer.write_all(&frame).await.is_err() { break; }
+                        }
+                    }
+                    None => break,
+                },
+                frame = read_frame(&mut reader, &mut buf) => match frame {
+                    Ok(FLAG_UDP) => {
+                        if let Some(pkt) = parse_udp_packet(&buf) {
+                            if smol.send_to(&pkt.dgram, remote).await.is_err() { break; }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                },
+                _ = tokio::time::sleep(idle) => break,
+            }
+        },
+    }
+    log::debug!("TUN UDP 会话结束 {host}:{remote}");
 }

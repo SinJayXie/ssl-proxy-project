@@ -25,6 +25,7 @@ pub mod lifecycle;
 pub mod netinfo;
 pub mod netstack;
 pub mod outbound;
+pub mod recovery;
 pub mod route;
 pub mod routes;
 pub mod runner;

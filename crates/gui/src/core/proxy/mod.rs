@@ -1,5 +1,5 @@
 pub mod connect;
-mod framing;
+pub mod framing;
 mod http;
 mod mux;
 pub mod route;

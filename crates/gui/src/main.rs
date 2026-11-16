@@ -155,14 +155,19 @@ fn main() {
 
             // Tray thread cannot touch GPUI state; it sets a flag that we poll.
             #[cfg(windows)]
-            cx.spawn(async move |cx| loop {
-                smol::Timer::after(Duration::from_millis(250)).await;
-                if platform::tray::QUIT_REQUESTED.swap(false, Ordering::Relaxed) {
-                    cx.update(|cx| cx.quit());
-                    break;
-                }
-            })
-            .detach();
+            {
+                let quit_core = core.clone();
+                cx.spawn(async move |cx| loop {
+                    smol::Timer::after(Duration::from_millis(250)).await;
+                    if platform::tray::QUIT_REQUESTED.swap(false, Ordering::Relaxed) {
+                        // 正常退出：同步回滚 TUN 路由与快照（异常退出由下次启动自检兜底）。
+                        crate::core::tun::runner::stop_before_exit(&quit_core.state.config_dir);
+                        cx.update(|cx| cx.quit());
+                        break;
+                    }
+                })
+                .detach();
+            }
 
             let _ = window_handle;
         });

@@ -49,7 +49,8 @@ impl Core {
         };
 
         let core = Self { state, runtime };
-        // 配置若持久化了 tun.enable=true，重启进程后在这里恢复 TUN。
+        // 崩溃恢复：先撤销上次异常退出残留的路由，再按当前配置决定是否启用 TUN。
+        crate::core::tun::runner::recover_on_startup(&core.state.config_dir);
         core.apply_tun();
         core
     }
@@ -57,6 +58,8 @@ impl Core {
     pub fn handle(&self) -> Handle {
         self.runtime.handle().clone()
     }
+
+
 
     /// 按当前配置对齐 TUN 状态（启动时 / 保存配置后调用）。
     pub fn apply_tun(&self) {
@@ -96,7 +99,7 @@ impl Core {
     /// so `main` waits for this process to release the single-instance mutex.
     pub fn restart_process(&self) -> std::io::Result<()> {
         // 重启前先回滚 TUN 路由/网卡，避免半开状态遗留。
-        crate::core::tun::runner::stop_before_exit();
+        crate::core::tun::runner::stop_before_exit(&self.state.config_dir);
         let exe = std::env::current_exe()?;
 
         let mut command = std::process::Command::new(&exe);

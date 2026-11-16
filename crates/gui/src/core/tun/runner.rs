@@ -11,6 +11,7 @@ use crate::core::state::AppState;
 use crate::core::tun::config::TunConfig;
 use crate::core::tun::netinfo;
 use crate::core::tun::outbound::{self, OutboundEnv};
+use crate::core::tun::recovery::RouteSnapshot;
 use crate::core::tun::route::build_route_excludes;
 use crate::core::tun::routes;
 use crate::core::tun::{device, netstack};
@@ -19,6 +20,8 @@ use std::sync::{Arc, Mutex};
 
 /// 进程内唯一 TUN 实例（TUN 网卡天然单例）。
 pub struct TunManager {
+    /// 当前生效配置（用于热重载 Equal 判定：未变则不重建网卡）。
+    active_cfg: Option<TunConfig>,
     shared: Option<netstack::StackShared>,
     down_cmds: Vec<String>,
 }
@@ -26,36 +29,59 @@ pub struct TunManager {
 static MANAGER: OnceCell<Mutex<TunManager>> = OnceCell::new();
 
 fn manager() -> &'static Mutex<TunManager> {
-    MANAGER.get_or_init(|| Mutex::new(TunManager { shared: None, down_cmds: vec![] }))
+    MANAGER.get_or_init(|| Mutex::new(TunManager {
+        active_cfg: None,
+        shared: None,
+        down_cmds: vec![],
+    }))
 }
 
 /// 按当前配置对齐 TUN 状态（保存配置 / 启动时调用）。
 ///
 /// 注意：不持有 `MutexGuard` 跨 await——启动的异步步骤（DNS 解析、
 /// netstack 启动）在锁外执行，完成后短暂加锁登记。
+/// 判定热重载动作，供 apply 使用（纯逻辑，便于单测）。
+fn decide_action(enabled: bool, running: bool, cfg_changed: bool) -> Action {
+    match (enabled, running) {
+        (true, false) => Action::Start,
+        (false, true) => Action::Stop,
+        // 已运行且配置变化 → 重建；配置未变 → 只刷新状态，不碰网卡。
+        (true, true) if cfg_changed => Action::Restart,
+        _ => Action::None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Start,
+    Stop,
+    Restart,
+    None,
+}
+
 pub async fn apply(state: Arc<AppState>) {
     let cfg = state.config.read().await.tun.clone();
+    let config_dir = state.config_dir.clone();
 
-    // 决策阶段（持锁，无 await）。
-    enum Action {
-        Start,
-        Stop,
-        None,
-    }
+    // 决策 + 先停止（持锁，无 await）。
     let action = {
         let m = manager();
-        let g = m.lock().unwrap_or_else(|e| e.into_inner());
-        if cfg.enable && g.shared.is_none() {
-            Action::Start
-        } else if !cfg.enable && g.shared.is_some() {
-            Action::Stop
-        } else {
-            Action::None
+        let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+        let running = g.shared.is_some();
+        let cfg_changed = g
+            .active_cfg
+            .as_ref()
+            .map(|active| !active.equal(&cfg))
+            .unwrap_or(false);
+        let action = decide_action(cfg.enable, running, cfg_changed);
+        if matches!(action, Action::Stop | Action::Restart) {
+            stop_inner(&mut g, Some(&config_dir));
         }
+        action
     };
 
     match action {
-        Action::Start => match start(state, &cfg).await {
+        Action::Start | Action::Restart => match start(state, &cfg).await {
             Ok((shared, down)) => {
                 let m = manager();
                 let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -64,18 +90,17 @@ pub async fn apply(state: Arc<AppState>) {
                     routes::execute(&down);
                     return;
                 }
+                g.active_cfg = Some(cfg.clone());
                 g.shared = Some(shared);
                 g.down_cmds = down;
-                log::info!("TUN 已启用");
+                log::info!(
+                    "TUN 已启用{}",
+                    if action == Action::Restart { "（配置已变更，重建完成）" } else { "" }
+                );
             }
             Err(e) => log::error!("TUN 启动失败（已回滚）: {e}"),
         },
-        Action::Stop => {
-            let m = manager();
-            let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
-            stop_inner(&mut g);
-            log::info!("TUN 已停止，路由已回滚");
-        }
+        Action::Stop => log::info!("TUN 已停止，路由已回滚"),
         Action::None => {}
     }
 }
@@ -132,13 +157,17 @@ async fn start(
         return Err(format!("安装路由失败: {:?}", failures));
     }
 
+    // 路由已生效：立刻写崩溃恢复快照（即使后续崩溃也能在下次启动清理）。
+    let snapshot = RouteSnapshot::new(std::process::id(), cfg.device_name.clone(), program.down.clone());
+    if let Err(e) = snapshot.save(&state.config_dir) {
+        routes::execute(&program.down);
+        return Err(format!("写入 TUN 路由快照失败（已回滚路由）: {e}"));
+    }
+
     // 5. 协议栈 + 事件泵。
     let (ev_tx, ev_rx) = std::sync::mpsc::channel::<netstack::FlowEvent>();
     let shared = netstack::spawn(tun_dev, cfg.clone(), ev_tx);
-    let env = OutboundEnv {
-        physical_if: Some(phys.if_index),
-        nameservers: cfg.direct_nameservers.clone(),
-    };
+    let env = OutboundEnv::new(Some(phys.if_index), cfg.direct_nameservers.clone());
     spawn_event_pump(state.clone(), shared.clone(), ev_rx, env);
     spawn_reaper(shared.clone());
 
@@ -153,21 +182,47 @@ async fn start(
     Ok((shared, program.down))
 }
 
-fn stop_inner(m: &mut TunManager) {
+fn stop_inner(m: &mut TunManager, config_dir: Option<&std::path::Path>) {
     routes::execute(&m.down_cmds);
     m.down_cmds.clear();
+    m.active_cfg = None;
     m.shared = None; // 丢弃共享句柄 → 通道关闭 → 协议栈线程退出 → 网卡关闭
+    if let Some(dir) = config_dir {
+        if let Err(e) = RouteSnapshot::clear(dir) {
+            log::warn!("清理 TUN 路由快照失败: {e}");
+        }
+    }
 }
 
 /// 进程退出/重启前的同步回滚（不经 tokio，保证顺序执行）。
-pub fn stop_before_exit() {
+pub fn stop_before_exit(config_dir: &std::path::Path) {
     let mut m = match manager().lock() {
         Ok(g) => g,
         Err(e) => e.into_inner(),
     };
     if m.shared.is_some() {
-        stop_inner(&mut m);
+        stop_inner(&mut m, Some(config_dir));
         log::info!("TUN 已在进程重启前停止");
+    }
+}
+
+/// 启动自检：回滚上次异常退出残留的 TUN 路由（崩溃恢复）。
+/// 在 Core 构造后、apply_tun 之前调用，避免残留路由干扰物理网卡探测。
+pub fn recover_on_startup(config_dir: &std::path::Path) {
+    match crate::core::tun::recovery::pending_rollback(config_dir) {
+        Ok(Some(cmds)) => {
+            let failures = routes::execute(&cmds);
+            if failures.is_empty() {
+                log::info!("TUN 崩溃恢复完成：已撤销上次残留路由");
+            } else {
+                log::error!("TUN 崩溃恢复部分失败: {:?}", failures);
+            }
+            if let Err(e) = RouteSnapshot::clear(config_dir) {
+                log::warn!("清理残留 TUN 路由快照失败: {e}");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => log::error!("读取 TUN 路由快照失败（跳过崩溃恢复）: {e}"),
     }
 }
 
@@ -218,5 +273,19 @@ mod tests {
         let m = manager().lock().unwrap();
         assert!(m.shared.is_none());
         assert!(m.down_cmds.is_empty());
+    }
+
+    #[test]
+    fn hot_reload_decision_matrix() {
+        // 未启用 + 未运行 → 无操作
+        assert_eq!(decide_action(false, false, false), Action::None);
+        // 启用 + 未运行 → 首次启动
+        assert_eq!(decide_action(true, false, false), Action::Start);
+        // 未启用 + 运行中 → 停止
+        assert_eq!(decide_action(false, true, false), Action::Stop);
+        // 运行中 + 配置未变 → 无操作（不重建网卡）
+        assert_eq!(decide_action(true, true, false), Action::None);
+        // 运行中 + 配置变化 → 重建
+        assert_eq!(decide_action(true, true, true), Action::Restart);
     }
 }

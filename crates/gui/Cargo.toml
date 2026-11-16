@@ -40,6 +40,22 @@ hmac = "0.12"
 sha2 = "0.10"
 ring = "0.17"
 
+# ---- TUN 数据面（阶段 B）----
+# 用户态协议栈：TCP/UDP 终结与 NAT；medium-ip 直接收发 IP 包。
+smoltcp = { version = "0.11", default-features = false, features = [
+    "std",
+    "log",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-udp",
+] }
+# DNS 报文解析/构造（fake-ip 应答）；与 trust-dns-resolver 0.23 同族。
+trust-dns-proto = "0.23"
+# 直连出站绑定物理网卡（bind_device_by_index → IP_UNICAST_IF），防 TUN 自环。
+socket2 = { version = "0.6", features = ["all"] }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_System_Threading",
@@ -47,7 +63,12 @@ windows = { version = "0.58", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
 ] }
+# WinTun 用户态网卡驱动绑定；运行时需 wintun.dll 位于 exe 同目录。
+wintun = "0.4"
 tray-icon = "0.26"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
