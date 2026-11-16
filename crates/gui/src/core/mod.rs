@@ -48,11 +48,22 @@ impl Core {
             Arc::new(AppState::new(app_path, config_dir))
         };
 
-        Self { state, runtime }
+        let core = Self { state, runtime };
+        // 配置若持久化了 tun.enable=true，重启进程后在这里恢复 TUN。
+        core.apply_tun();
+        core
     }
 
     pub fn handle(&self) -> Handle {
         self.runtime.handle().clone()
+    }
+
+    /// 按当前配置对齐 TUN 状态（启动时 / 保存配置后调用）。
+    pub fn apply_tun(&self) {
+        let state = self.state.clone();
+        self.runtime.spawn(async move {
+            crate::core::tun::runner::apply(state).await;
+        });
     }
 
     // ---------- Lifecycle ----------
@@ -84,6 +95,8 @@ impl Core {
     /// broken path ("打开路径失败"). The child is flagged with [`RELAUNCH_ENV`]
     /// so `main` waits for this process to release the single-instance mutex.
     pub fn restart_process(&self) -> std::io::Result<()> {
+        // 重启前先回滚 TUN 路由/网卡，避免半开状态遗留。
+        crate::core::tun::runner::stop_before_exit();
         let exe = std::env::current_exe()?;
 
         let mut command = std::process::Command::new(&exe);
@@ -237,6 +250,8 @@ impl Core {
             std::fs::write(&path, content).map_err(|err| err.to_string())?;
             *state.config.write().await = config;
             log::info!("Config saved to {:?}", path);
+            // TUN 状态跟随配置（enable 开/关）。
+            crate::core::tun::runner::apply(state.clone()).await;
             Ok(true)
         })
     }

@@ -21,6 +21,19 @@ fn main() {
                 println!("cargo:warning=failed to copy GeoDB.dat: {err}");
             }
         }
+
+        // TUN 数据面：把 WinTun 驱动 DLL 放到 exe 同目录（device.rs 运行时加载）。
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+            let dll = manifest_dir.join("assets/wintun/wintun.dll");
+            println!("cargo:rerun-if-changed=assets/wintun/wintun.dll");
+            if dll.exists() {
+                if let Err(err) = std::fs::copy(&dll, profile_dir.join("wintun.dll")) {
+                    println!("cargo:warning=failed to copy wintun.dll: {err}");
+                }
+            } else {
+                println!("cargo:warning=assets/wintun/wintun.dll missing; TUN disabled at runtime");
+            }
+        }
     }
 
     // Windows 资源：exe 图标与版本信息，图标取自仓库根目录的 icons/。

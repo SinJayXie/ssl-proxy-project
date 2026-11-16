@@ -133,15 +133,20 @@ pub async fn forward_bidirectional<R1, W1, R2, W2>(
 }
 
 /// Forward bidirectional using TargetStream
-pub async fn forward_target_stream(
-    mut client: TcpStream,
+///
+/// client 已泛型化：SOCKS5/HTTP 路径传 `TcpStream`，TUN 数据面传
+/// `SmolTcpStream`（协议转发逻辑单一来源，见 TUN 设计方案）。
+pub async fn forward_target_stream<C>(
+    client: C,
     target: TargetStream,
     id: u32,
     state: Arc<AppState>,
-) {
+) where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     match target {
         TargetStream::Direct(mut t) => {
-            let (cr, cw) = client.split();
+            let (cr, cw) = tokio::io::split(client);
             let (tr, tw) = t.split();
             forward_bidirectional(cr, cw, tr, tw, id, state).await;
         }
@@ -157,13 +162,15 @@ pub async fn forward_target_stream(
 /// 走代理时使用：上行分帧 + padding；下行握手阶段解帧，收到 RAW 标记后裸透传。
 ///
 /// 这样外层 TLS 的 record 长度不再与内层 TLS 一一对应，同时大流量方向几乎零开销。
-pub async fn forward_padded_bidirectional(
-    mut client: TcpStream,
+pub async fn forward_padded_bidirectional<C>(
+    client: C,
     target: TlsStream<TcpStream>,
     id: u32,
     state: Arc<AppState>,
-) {
-    let (mut cr, mut cw) = client.split();
+) where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut cr, mut cw) = tokio::io::split(client);
     let (mut tr, mut tw) = tokio::io::split(target);
 
     let up = Arc::new(AtomicU64::new(0));
@@ -274,13 +281,15 @@ pub async fn forward_padded_bidirectional(
 }
 
 /// Mux 模式：这条连接与其他流共享同一条已认证的 TLS 隧道。
-pub async fn forward_mux_bidirectional(
-    mut client: TcpStream,
+pub async fn forward_mux_bidirectional<C>(
+    client: C,
     stream: MuxStream,
     id: u32,
     state: Arc<AppState>,
-) {
-    let (mut cr, mut cw) = client.split();
+) where
+    C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut cr, mut cw) = tokio::io::split(client);
     let (mut reader, writer) = stream.split();
 
     let up = Arc::new(AtomicU64::new(0));

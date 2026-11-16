@@ -19,6 +19,12 @@
 #![allow(dead_code)]
 
 pub mod config;
+pub mod device;
 pub mod dns;
 pub mod lifecycle;
+pub mod netinfo;
+pub mod netstack;
+pub mod outbound;
 pub mod route;
+pub mod routes;
+pub mod runner;

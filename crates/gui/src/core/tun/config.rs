@@ -65,6 +65,8 @@ pub struct TunConfig {
     pub fake_ip_range: String,
     /// fake-ip IPv6 池；IPv6 关闭或不可用时清空。
     pub fake_ip_range6: String,
+    /// TUN 直连出站的专用解析 DNS（绑定物理网卡查询，绕开自身劫持）。
+    pub direct_nameservers: Vec<String>,
 }
 
 /// 默认 fake-ip 段，与 mihomo 一致：网关 198.18.0.1，DNS 198.18.0.2。
@@ -85,6 +87,7 @@ impl Default for TunConfig {
             route_exclude_address: Vec::new(),
             fake_ip_range: DEFAULT_FAKE_IP_RANGE.to_string(),
             fake_ip_range6: DEFAULT_FAKE_IP_RANGE6.to_string(),
+            direct_nameservers: vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()],
         }
     }
 }

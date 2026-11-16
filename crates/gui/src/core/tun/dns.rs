@@ -15,6 +15,8 @@ use std::net::IpAddr;
 pub struct FakeIpMap {
     forward: HashMap<String, String>,
     reverse: HashMap<String, String>,
+    /// 下一次分配的 fake-ip 序号（v4 池内偏移，从 .3 起：.1 网关、.2 DNS）。
+    next_v4: u32,
 }
 
 impl FakeIpMap {
@@ -51,6 +53,38 @@ impl FakeIpMap {
 
     pub fn is_empty(&self) -> bool {
         self.forward.is_empty()
+    }
+
+    /// 从 v4 池分配一个未被占用的 fake-ip 并登记映射。
+    ///
+    /// 池形如 "198.18.0.1/16"（mihomo 默认）：跳过网络地址、.1（TUN 网关）
+    /// 与 .2（DNS 语义），从游标线性扫描；池容量上限 /8，耗尽返回 None
+    /// （调用方应回 NODATA，绝不回退真实 IP）。
+    pub fn alloc_v4(&mut self, domain: &str, pool: &str) -> Option<String> {
+        let (base, prefix) = pool.split_once('/')?;
+        let prefix: u32 = prefix.parse().ok()?;
+        let base: std::net::Ipv4Addr = base.parse().ok()?;
+        if prefix < 8 {
+            return None;
+        }
+        let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+        let base_u32 = u32::from(base) & mask;
+        let capacity = 1u32 << (32 - prefix).min(24);
+        let usable = capacity.saturating_sub(4);
+        if usable == 0 {
+            return None;
+        }
+        for i in 0..usable {
+            let offset = (self.next_v4 + i) % usable;
+            let ip = std::net::Ipv4Addr::from(base_u32 + 3 + offset);
+            let ip_str = ip.to_string();
+            if !self.reverse.contains_key(&ip_str) {
+                self.insert(domain, &ip_str);
+                self.next_v4 = offset + 1;
+                return Some(ip_str);
+            }
+        }
+        None
     }
 }
 
@@ -144,6 +178,85 @@ pub fn resolve_fake_ip(
     } else {
         Ok(None)
     }
+}
+
+/// DNS 应答结果。`Err` 表示不是可应答的标准查询（调用方应丢弃该包，
+/// 绝不转发真实 IP——fail-closed）。
+pub type DnsAnswerResult = Result<Vec<u8>, String>;
+
+/// 解析标准 DNS 查询并返回 fake-ip 应答（A/AAAA；其余类型返回空 NoError，
+/// 避免 SERVFAIL 触发应用回退到真实 DNS 造成泄漏）。
+///
+/// 对应 mihomo fake-ip DNS 行为：所有经 TUN 劫持的 :53 查询由本进程应答，
+/// 应用拿到的永远是 fake-ip，后续连接经反查进入统一决策引擎。
+pub fn answer_query(
+    payload: &[u8],
+    map: &mut FakeIpMap,
+    pool_v4: &str,
+    pool_v6: &str,
+) -> DnsAnswerResult {
+    use trust_dns_proto::op::{Message, MessageType, OpCode, ResponseCode};
+    use trust_dns_proto::rr::rdata::{A, AAAA};
+    use trust_dns_proto::rr::{RData, Record, RecordType};
+
+    let query = Message::from_vec(payload).map_err(|e| format!("DNS 报文解析失败: {e}"))?;
+    let header = query.header();
+    if header.message_type() != MessageType::Query || header.op_code() != OpCode::Query {
+        return Err("非标准查询（可能是响应或通知），忽略".into());
+    }
+
+    let mut resp = Message::new();
+    resp.set_id(header.id());
+    resp.set_message_type(MessageType::Response);
+    resp.set_op_code(OpCode::Query);
+    resp.set_recursion_desired(header.recursion_desired());
+    resp.set_recursion_available(true);
+    resp.set_response_code(ResponseCode::NoError);
+
+    for q in query.queries() {
+        resp.add_query(q.clone());
+        let name = q.name().clone();
+        let record = match q.query_type() {
+            RecordType::A => match map.alloc_v4(&name.to_string(), pool_v4) {
+                Some(ip) => ip
+                    .parse::<std::net::Ipv4Addr>()
+                    .ok()
+                    .map(|v4| Record::from_rdata(name.clone(), 1, RData::A(A(v4)))),
+                None => None, // 池耗尽：该类型无应答（NODATA），不回退真实 IP
+            },
+            RecordType::AAAA => {
+                // v6 池合法才分配；禁用 IPv6 时返回空（NODATA）。
+                let v6 = fake_ipv6_for(name.to_string(), pool_v6, map);
+                v6.map(|v| Record::from_rdata(name.clone(), 1, RData::AAAA(AAAA(v))))
+            }
+            _ => None,
+        };
+        if let Some(r) = record {
+            resp.add_answer(r);
+        }
+    }
+
+    resp.to_vec().map_err(|e| format!("DNS 应答编码失败: {e}"))
+}
+
+/// 为域名分配固定 fake IPv6（同域名重复查询返回同一地址）。
+fn fake_ipv6_for(domain: String, pool_v6: &str, map: &mut FakeIpMap) -> Option<std::net::Ipv6Addr> {
+    let (base, prefix) = pool_v6.split_once('/')?;
+    if prefix.parse::<u32>().ok()? < 64 {
+        return None;
+    }
+    let base: std::net::Ipv6Addr = base.parse().ok()?;
+    if let Some(existing) = map.get_ip_by_host(&domain) {
+        return existing.parse::<std::net::Ipv6Addr>().ok();
+    }
+    // 用域名哈希在 /64 内稳定取址（无持久化池，重启换址可接受：反查表同步重建）。
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&domain, &mut h);
+    let host = std::hash::Hasher::finish(&h) as u128 & ((1u128 << 64) - 1);
+    let ip = std::net::Ipv6Addr::from((u128::from(base) & !(u128::MAX >> 64)) | host);
+    let s = ip.to_string();
+    map.insert(&domain, &s);
+    Some(ip)
 }
 
 #[cfg(test)]
@@ -241,5 +354,68 @@ mod tests {
     fn unspecified_ip_is_not_loopback_for_bind_check() {
         // 显式记录：未指定地址判定由 route::should_bind_physical_interface 处理。
         assert_eq!(Ipv4Addr::UNSPECIFIED.to_string(), "0.0.0.0");
+    }
+
+    #[test]
+    fn fake_ip_alloc_skips_gateway_and_dns_and_roundtrips() {
+        let mut map = FakeIpMap::new();
+        let pool = "198.18.0.1/16";
+        let a = map.alloc_v4("a.com", pool).unwrap();
+        let b = map.alloc_v4("b.com", pool).unwrap();
+        // .1 网关、.2 DNS 语义，分配从 .3 起。
+        assert_eq!(a, "198.18.0.3");
+        assert_eq!(b, "198.18.0.4");
+        assert_eq!(map.find_host_by_ip("198.18.0.3"), Some("a.com"));
+    }
+
+    #[test]
+    fn fake_ip_alloc_is_unique() {
+        let mut map = FakeIpMap::new();
+        let pool = "198.18.0.1/24";
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..20 {
+            let ip = map.alloc_v4(&format!("d{i}.com"), pool).unwrap();
+            assert!(seen.insert(ip.clone()), "重复分配 {ip}");
+        }
+    }
+
+    #[test]
+    fn dns_query_answered_with_fake_ip() {
+        use trust_dns_proto::op::{Message, MessageType, OpCode, Query};
+        use trust_dns_proto::rr::{Name, RecordType};
+
+        let mut map = FakeIpMap::new();
+        let mut q = Message::new();
+        q.set_id(0x1234);
+        q.set_message_type(MessageType::Query);
+        q.set_op_code(OpCode::Query);
+        q.set_recursion_desired(true);
+        q.add_query(Query::query(Name::from_ascii("example.com.").unwrap(), RecordType::A));
+        let payload = q.to_vec().unwrap();
+
+        let resp = answer_query(&payload, &mut map, "198.18.0.1/16", "2001:2::0/64").unwrap();
+        let parsed = trust_dns_proto::op::Message::from_vec(&resp).unwrap();
+        assert_eq!(parsed.header().id(), 0x1234);
+        assert_eq!(parsed.header().response_code(), trust_dns_proto::op::ResponseCode::NoError);
+        let answers = parsed.answers();
+        assert_eq!(answers.len(), 1);
+        let fake = answers[0]
+            .data()
+            .and_then(|d| d.as_a())
+            .unwrap()
+            .0
+            .to_string();
+        assert!(fake.starts_with("198.18."), "应为 fake-ip 段: {fake}");
+        assert_eq!(map.find_host_by_ip(&fake), Some("example.com"));
+    }
+
+    #[test]
+    fn dns_response_is_not_answered_again() {
+        // 响应报文绝不能再"应答"，防止劫持环路。
+        use trust_dns_proto::op::{Message, MessageType};
+        let mut m = Message::new();
+        m.set_message_type(MessageType::Response);
+        let payload = m.to_vec().unwrap();
+        assert!(answer_query(&payload, &mut FakeIpMap::new(), "198.18.0.1/16", "").is_err());
     }
 }

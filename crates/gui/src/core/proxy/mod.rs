@@ -4,7 +4,7 @@ mod http;
 mod mux;
 pub mod route;
 mod socks5;
-mod tunnel;
+pub mod tunnel;
 mod udp_relay;
 
 use crate::state::AppState;
