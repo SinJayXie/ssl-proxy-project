@@ -174,6 +174,16 @@ impl AppState {
                             _ => UdpMode::Off,
                         };
                     }
+                    // TUN 配置用 serde 直接解析（新字段，带 default，旧文件缺此段时保持默认关闭）。
+                    if let Some(v) = yaml.get("tun") {
+                        match serde_yaml::from_value::<crate::core::tun::config::TunConfig>(v.clone())
+                        {
+                            Ok(tun) => config.tun = tun,
+                            Err(e) => {
+                                log::warn!("Invalid tun config in setting.yaml: {}; using defaults", e)
+                            }
+                        }
+                    }
                     return config;
                 }
             }
@@ -265,6 +275,38 @@ mod tests {
         // Missing key keeps the default (off).
         fs::write(&path, "socksPort: 1080\n").unwrap();
         assert_eq!(AppState::load_config(&dir).udp_mode, UdpMode::Off);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// TUN config must round-trip through `setting.yaml`; old configs without
+    /// the `tun` section keep the safe default (disabled).
+    #[test]
+    fn load_config_reads_tun_settings() {
+        let dir = std::env::temp_dir().join(format!("ssl-proxy-tun-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("setting.yaml");
+
+        fs::write(
+            &path,
+            "tun:\n  enable: true\n  stack: gvisor\n  strictRoute: true\n  routeExcludeAddress:\n    - 10.0.0.0/8\n",
+        )
+        .unwrap();
+        let config = AppState::load_config(&dir);
+        assert!(config.tun.enable);
+        assert_eq!(config.tun.stack, crate::core::tun::config::TunStack::Gvisor);
+        assert!(config.tun.strict_route);
+        assert_eq!(config.tun.route_exclude_address, vec!["10.0.0.0/8".to_string()]);
+        // 未显式写入的字段使用默认值。
+        assert_eq!(config.tun.fake_ip_range, "198.18.0.1/16");
+
+        // Missing section keeps TUN disabled.
+        fs::write(&path, "socksPort: 1080\n").unwrap();
+        assert!(!AppState::load_config(&dir).tun.enable);
+
+        // Invalid section falls back to defaults (never enables TUN accidentally).
+        fs::write(&path, "tun:\n  mtu: \"not-a-number\"\n").unwrap();
+        assert!(!AppState::load_config(&dir).tun.enable);
 
         let _ = fs::remove_dir_all(&dir);
     }

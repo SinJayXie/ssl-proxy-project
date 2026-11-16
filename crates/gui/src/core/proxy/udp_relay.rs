@@ -185,16 +185,17 @@ pub fn decide_udp_route(
     directs: &[String],
     udp_mode: UdpMode,
 ) -> bool {
-    if !has_upstream {
-        return true;
-    }
-    if udp_mode != UdpMode::Proxy {
-        return true;
-    }
-    if let Some(mode) = rule_mode {
-        return mode.eq_ignore_ascii_case("DIRECT");
-    }
-    geo_code == "PRIVATE" || directs.iter().any(|d| d.eq_ignore_ascii_case(geo_code))
+    // 委托给与 TCP / TUN 共用的决策引擎；UDP 的 off/direct 模式映射为强制直连。
+    // resolved_ip 不参与此纯函数（由 resolve_udp_route 单独处理解析失败分支）。
+    super::route::classify(&super::route::RouteInput {
+        has_upstream,
+        rule_mode,
+        geo_code,
+        directs,
+        resolved_ip: Some("resolved"), // 占位：表示"已解析"，与本函数的既有语义一致
+        force_direct: udp_mode != UdpMode::Proxy,
+    })
+    .is_direct()
 }
 
 /// 为 UDP 目标做完整路由决策：DNS 解析（复用 `dns.rs`）+ GEO + 规则链

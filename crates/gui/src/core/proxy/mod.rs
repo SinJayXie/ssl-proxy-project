@@ -2,6 +2,7 @@ pub mod connect;
 mod framing;
 mod http;
 mod mux;
+pub mod route;
 mod socks5;
 mod tunnel;
 mod udp_relay;

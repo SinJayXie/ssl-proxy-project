@@ -423,25 +423,27 @@ pub async fn resolve_and_connect(
             numeric: 0,
         });
 
-    // Determine if direct connection.
+    // Determine route via the shared decision engine (also used by UDP and future TUN data plane).
     // Priority: no proxy → direct; rules.yaml → first match wins; config.directs → fallback.
     // 没有解析结果时无法直连，即使规则命中 DIRECT 也回退到代理（可用性优先）。
-    let is_direct = if proxy_server.is_empty() {
-        // No upstream proxy configured — force direct
-        true
-    } else {
+    let route = {
         let rules = state.rules.read().await;
-        if let Some(mode) = match_rules(host, &geo_info.alpha2_code, &rules) {
-            drop(rules);
-            mode == "DIRECT" && resolved_ip.is_some()
-        } else {
-            drop(rules);
-            // Fall back to legacy config.directs (regions from settings, case-insensitive)
-            resolved_ip.is_some()
-                && (geo_info.alpha2_code == "PRIVATE"
-                    || directs.iter().any(|d| d.eq_ignore_ascii_case(&geo_info.alpha2_code)))
-        }
+        let mode = match_rules(host, &geo_info.alpha2_code, &rules);
+        super::route::classify(&super::route::RouteInput {
+            has_upstream: !proxy_server.is_empty(),
+            rule_mode: mode.as_deref(),
+            geo_code: &geo_info.alpha2_code,
+            directs: &directs,
+            resolved_ip: resolved_ip.as_deref(),
+            force_direct: false,
+        })
     };
+    // 无上游且解析失败：决策为 Reject，保持改动前 "return None" 的行为。
+    if route.outbound == super::route::Outbound::Reject {
+        log::error!("No upstream proxy and DNS lookup failed for {}: rejecting", host);
+        return None;
+    }
+    let is_direct = route.is_direct();
 
     // Generate connection ID
     let id = {

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::tun::config::TunConfig;
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiAppInfo {
@@ -110,6 +112,9 @@ pub struct AppConfig {
     /// SOCKS5 UDP ASSOCIATE relay mode: `off` (default) | `direct` | `proxy`.
     #[serde(default)]
     pub udp_mode: UdpMode,
+    /// Windows TUN settings. Disabled by default so existing installs are unaffected.
+    #[serde(default)]
+    pub tun: TunConfig,
 }
 
 fn default_true() -> bool {
@@ -130,6 +135,7 @@ impl Default for AppConfig {
             sni_name: String::new(),
             mux_enabled: true,
             udp_mode: UdpMode::Off,
+            tun: TunConfig::default(),
         }
     }
 }

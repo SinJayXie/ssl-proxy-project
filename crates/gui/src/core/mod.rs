@@ -4,6 +4,7 @@ pub mod geo_sdk;
 pub mod proxy;
 pub mod state;
 pub mod stats;
+pub mod tun;
 pub mod types;
 
 use crate::core::state::AppState;

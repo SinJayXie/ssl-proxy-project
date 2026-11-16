@@ -359,6 +359,8 @@ impl SettingsPage {
             sni_name,
             mux_enabled: self.mux_enabled,
             udp_mode,
+            // TUN 暂无 UI 编辑控件：保存常规设置时原样保留，避免被重置。
+            tun: self.config.tun.clone(),
         })
     }
 
