@@ -88,6 +88,10 @@ if (-not $SkipClient) {
     }
 
     $sourceGeo = Join-Path $GuiCrate 'assets\GeoDB.dat'
+    $wintunDll = Join-Path $GuiCrate 'assets\wintun\wintun.dll'
+    if (-not (Test-Path $wintunDll)) {
+        throw "找不到 WinTun 驱动: $wintunDll（TUN 模式依赖它，缺失时安装后无法启用 TUN）"
+    }
     $iconFile = Join-Path $Root 'icons\icon.ico'
     if (-not (Test-Path $iconFile)) {
         throw "找不到安装包图标: $iconFile（可用 SSL_PROXY_ICON 环境变量指定）"
@@ -97,6 +101,7 @@ if (-not $SkipClient) {
     Write-Host "==> makensis（客户端 $guiVersion）"
     & $Makensis /V2 "/DPRODUCT_VERSION=$guiVersion" "/DUSE_PAYLOAD" `
         "/DPAYLOAD_EXE=$payloadExe" "/DSOURCE_GEO=$sourceGeo" `
+        "/DWINTUN_DLL=$wintunDll" `
         "/DICON_FILE=$iconFile" "/DOUT_FILE=$setup" `
         (Join-Path $GuiCrate 'installer\installer.nsi')
     if ($LASTEXITCODE -ne 0) { throw "makensis 失败（退出码 $LASTEXITCODE）" }

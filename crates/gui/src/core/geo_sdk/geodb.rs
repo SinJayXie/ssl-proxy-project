@@ -110,6 +110,10 @@ fn parse_data(data: &[u8]) -> Result<ParsedHeader, GeoDBError> {
     let index_entries =
         u32::from_be_bytes(index_and_footer[footer_offset..].try_into().unwrap()) as usize;
     let index_data = &index_and_footer[..footer_offset];
+    // 索引条目数来自文件本身，必须先校验长度再切片，避免损坏文件触发越界 panic。
+    if index_data.len() < index_entries.saturating_mul(8) {
+        return Err(GeoDBError::Truncated);
+    }
 
     let index: Vec<(u32, usize)> = (0..index_entries)
         .map(|i| {

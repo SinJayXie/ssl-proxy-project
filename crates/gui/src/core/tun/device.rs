@@ -7,6 +7,7 @@
 //! 运行时依赖 `wintun.dll`（wintun.net，需与 exe 同目录或 PATH 中）。
 
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// 已打开的 TUN 设备。丢弃 `keepalive` 前必须先完成路由回滚（runner 负责）。
@@ -21,8 +22,12 @@ pub struct TunDevice {
     /// 接口索引（ifIndex，由 ConvertInterfaceLuidToIndex 转换得到），
     /// 供直连出站绑定与 netsh 路由。
     pub if_index: u32,
-    /// 保持 adapter/session 存活；drop 时网卡随之关闭。
-    _keepalive: Option<Box<dyn Send>>,
+    /// 读线程停止信号。协议栈退出时置位，否则无流量时读线程永远不会
+    /// 察觉通道已关闭，会一直轮询并持有 Session（线程泄漏 + CPU 空转）。
+    pub stop: Arc<AtomicBool>,
+    /// 保持 adapter/session 存活；必须由协议栈持有到线程退出后再 drop，
+    /// 否则网卡会话在读写线程仍用 Arc 引用时就提前析构。
+    pub keepalive: Option<Box<dyn Send>>,
 }
 
 /// 打开 TUN 设备失败的原因（fail-closed：调用方必须放弃启用，不得半开）。
@@ -54,7 +59,7 @@ mod imp {
                 _ => unsafe { wintun::load() },
             }
         }
-        .map_err(|e| format!("加载 wintun.dll 失败: {e}"))?;
+        .map_err(|e| format!("加载 wintun.dll 失败（应位于 exe 同目录）: {e}"))?;
 
         let adapter = wintun::Adapter::create(&dll, &cfg.device_name, "SSLProxy Tunnel", None)
             .map_err(|e| format!("创建 TUN 适配器失败（需管理员权限）: {e}"))?;
@@ -92,21 +97,27 @@ mod imp {
         let (in_tx, in_rx) = channel::<Vec<u8>>(); // TUN → 协议栈
         let (out_tx, out_rx) = channel::<Vec<u8>>(); // 协议栈 → TUN
 
-        // 读线程：网卡 → 通道。try_receive 非阻塞轮询，通道关闭即干净退出。
+        // 读线程：网卡 → 通道。显式 stop 信号保证协议栈退出后线程一定结束
+        //（只依赖 send 失败会在"停用后无流量"时永久空转，泄漏 Session）。
+        let stop = Arc::new(AtomicBool::new(false));
         {
             let session = session.clone();
+            let stop = stop.clone();
             std::thread::Builder::new()
                 .name("tun-rx".into())
-                .spawn(move || loop {
-                    match session.try_receive() {
-                        Ok(Some(pkt)) => {
-                            let bytes = pkt.bytes().to_vec();
-                            if in_tx.send(bytes).is_err() {
-                                break;
+                .spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        match session.try_receive() {
+                            Ok(Some(pkt)) => {
+                                let bytes = pkt.bytes().to_vec();
+                                if in_tx.send(bytes).is_err() {
+                                    break;
+                                }
                             }
+                            // 1ms 空转：200µs 会造成每秒 5000 次唤醒抢 CPU。
+                            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(1)),
+                            Err(_) => break, // 会话已关闭
                         }
-                        Ok(None) => std::thread::sleep(std::time::Duration::from_micros(200)),
-                        Err(_) => break, // 会话已关闭
                     }
                 })
                 .map_err(|e| format!("启动 TUN 读线程失败: {e}"))?;
@@ -119,12 +130,26 @@ mod imp {
                 .name("tun-tx".into())
                 .spawn(move || {
                     for pkt in out_rx {
-                        let len = pkt.len().min(u16::MAX as usize) as u16;
+                        // 只发送能完整放入 ring slot 的包：allocate_send_packet
+                        // 的长度与 pkt 不一致时 copy_from_slice 会 panic。
+                        let Some(len) = u16::try_from(pkt.len()).ok() else {
+                            log::debug!("丢弃超长出站包: {} 字节", pkt.len());
+                            continue;
+                        };
                         let mut send = match session.allocate_send_packet(len) {
                             Ok(p) => p,
                             Err(_) => break,
                         };
-                        send.bytes_mut().copy_from_slice(&pkt);
+                        let dst = send.bytes_mut();
+                        if dst.len() < pkt.len() {
+                            log::debug!(
+                                "丢弃出站包: 需要 {} 字节，ring slot 仅 {}",
+                                pkt.len(),
+                                dst.len()
+                            );
+                            continue;
+                        }
+                        dst[..pkt.len()].copy_from_slice(&pkt);
                         session.send_packet(send);
                     }
                 })
@@ -137,7 +162,8 @@ mod imp {
             name: cfg.device_name.clone(),
             mtu: cfg.mtu,
             if_index,
-            _keepalive: Some(Box::new(Keepalive { _adapter: adapter, _session: session })),
+            stop,
+            keepalive: Some(Box::new(Keepalive { _adapter: adapter, _session: session })),
         })
     }
 

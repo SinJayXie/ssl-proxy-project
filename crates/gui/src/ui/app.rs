@@ -63,8 +63,6 @@ pub struct AppShell {
     changelog: Entity<ChangelogPage>,
     about: Entity<AboutPage>,
     show_consent: bool,
-    consent_scrolled: bool,
-    consent_scroll: ScrollHandle,
     show_errors: bool,
     errors: Vec<AppError>,
     show_update: bool,
@@ -75,7 +73,6 @@ pub struct AppShell {
     update_info: Option<CheckUpdateResult>,
     downloading: bool,
     download_percent: u32,
-    _consent_watch: Task<()>,
     _lang_watch: Task<()>,
     _update_watch: Task<()>,
 }
@@ -99,30 +96,6 @@ impl AppShell {
         let settings = cx.new(|cx| SettingsPage::new(core.clone(), window, cx));
         let changelog = cx.new(|_| ChangelogPage::new());
         let about = cx.new(|_| AboutPage::new());
-
-        let consent_scroll = ScrollHandle::new();
-        let watch_scroll = consent_scroll.clone();
-        let consent_watch = cx.spawn(async move |this, cx| loop {
-            smol::Timer::after(Duration::from_millis(200)).await;
-
-            if this.upgrade().is_none() {
-                break;
-            }
-
-            let max = watch_scroll.max_offset().y;
-            let offset = watch_scroll.offset().y;
-            if max > px(0.) && (max - offset) < px(8.) {
-                let updated = this.update(cx, |shell, cx| {
-                    if shell.show_consent && !shell.consent_scrolled {
-                        shell.consent_scrolled = true;
-                        cx.notify();
-                    }
-                });
-                if updated.is_err() {
-                    break;
-                }
-            }
-        });
 
         let mut seen_revision = i18n::revision();
         let lang_watch = cx.spawn(async move |this, cx| loop {
@@ -214,8 +187,6 @@ impl AppShell {
             changelog,
             about,
             show_consent: false,
-            consent_scrolled: false,
-            consent_scroll,
             show_errors: false,
             errors: Vec::new(),
             show_update: false,
@@ -224,7 +195,6 @@ impl AppShell {
             update_info: None,
             downloading: false,
             download_percent: 0,
-            _consent_watch: consent_watch,
             _lang_watch: lang_watch,
             _update_watch: update_watch,
         };
@@ -311,7 +281,6 @@ impl AppShell {
         }
 
         self.show_consent = false;
-        self.consent_scrolled = false;
         cx.notify();
 
         let core = self.core.clone();
@@ -380,7 +349,6 @@ impl AppShell {
 
     fn consent_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let language = i18n::language();
-        let scrolled = self.consent_scrolled;
 
         v_flex()
             .flex_1()
@@ -436,7 +404,6 @@ impl AppShell {
                             .id("consent-text")
                             .h(px(180.))
                             .pr_4()
-                            .track_scroll(&self.consent_scroll)
                             .overflow_y_scrollbar()
                             .text_sm()
                             .text_color(theme::text_muted(cx))
@@ -455,7 +422,6 @@ impl AppShell {
                             .child(
                                 Button::new("consent-agree")
                                     .primary()
-                                    .disabled(!scrolled)
                                     .label(i18n::t("CONSENT_AGREE"))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.agree_consent(cx)

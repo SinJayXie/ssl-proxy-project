@@ -33,7 +33,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
 /// UDP 出站会话：后续应用报文通过 `tx` 交给已建立的会话任务。
-type UdpSessionMap = Arc<Mutex<HashMap<SocketHandle, (u64, mpsc::Sender<Vec<u8>>)>>>;
+type UdpSessionMap = Arc<Mutex<HashMap<(SocketHandle, SocketAddr), (u64, mpsc::Sender<Vec<u8>>)>>>;
 static UDP_SESSION_GEN: AtomicU64 = AtomicU64::new(1);
 
 /// 运行时环境：物理接口索引与直连 DNS 服务器（由 runner 探测后传入）。
@@ -41,6 +41,8 @@ static UDP_SESSION_GEN: AtomicU64 = AtomicU64::new(1);
 pub struct OutboundEnv {
     /// 物理网卡 ifIndex（None = 未绑定，仅用于非 Windows/测试）。
     pub physical_if: Option<u32>,
+    /// 物理网卡 IPv4 地址：直连 socket 显式绑定源地址，避免取到 TUN 地址。
+    pub physical_ip: Option<std::net::Ipv4Addr>,
     /// 直连解析用 DNS 服务器（绑定物理网卡查询）。
     pub nameservers: Vec<String>,
     /// 已建立的 UDP 会话（按 socket handle 复用，避免每包重建隧道）。
@@ -48,9 +50,14 @@ pub struct OutboundEnv {
 }
 
 impl OutboundEnv {
-    pub fn new(physical_if: Option<u32>, nameservers: Vec<String>) -> Self {
+    pub fn new(
+        physical_if: Option<u32>,
+        physical_ip: Option<std::net::Ipv4Addr>,
+        nameservers: Vec<String>,
+    ) -> Self {
         Self {
             physical_if,
+            physical_ip,
             nameservers,
             udp_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -102,22 +109,31 @@ fn host_of(shared: &StackShared, ip: IpAddr, fake_range: &str) -> Result<String,
 }
 
 /// 直连 DNS 查询：socket 绑定物理网卡（IP_UNICAST_IF）后向 `direct-nameservers`
-/// 发标准 A 查询。TUN strict-route 会把普通 socket 的 DNS 捕获进自身劫持
-/// （结果永远是 fake-ip），因此分流决策的解析必须走物理接口绕开 TUN。
-/// 结果复用全局 `dns_cache`，避免每个新流都发查询。
-async fn direct_dns_lookup(state: &Arc<AppState>, env: &OutboundEnv, domain: &str) -> Option<String> {
-    if let Some(ip) = state.dns_cache.read().await.get(domain) {
+/// 发标准 A 查询。TUN 会劫持任何走默认路由的 :53 查询（包括程序自身解析器），
+/// 因此 TUN 期间**所有**解析都要走这里；缓存命中的 fake-ip 视为未命中。
+pub async fn lookup_direct(state: &Arc<AppState>, domain: &str) -> Option<String> {
+    let bypass = state.tun_dns_bypass.read().ok().and_then(|g| g.clone())?;
+    let cached = state.dns_cache.read().await.get(domain).cloned();
+    let cached = cached.filter(|ip| {
+        !ip.parse::<IpAddr>()
+            .map(|addr| is_in_fake_ip_pool(&addr, &bypass.fake_ip_range))
+            .unwrap_or(false)
+    });
+    if let Some(ip) = cached {
         return Some(ip.clone());
     }
-    let ns = env.nameservers.first()?.parse::<std::net::Ipv4Addr>().ok()?;
-    let if_idx = env.physical_if?;
+    let ns = bypass.nameservers.first()?.parse::<std::net::Ipv4Addr>().ok()?;
+    let if_idx = bypass.if_index;
+    let local_ip = bypass
+        .local_ipv4
+        .unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
     let domain = domain.trim_end_matches('.').to_string();
     let domain_for_query = domain.clone();
 
     let ip = tokio::task::spawn_blocking(move || -> Option<String> {
         let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
         bind_unicast_if(&sock, true, if_idx).ok()?;
-        sock.bind(&"0.0.0.0:0".parse::<SocketAddr>().ok()?.into()).ok()?;
+        sock.bind(&SocketAddr::from((local_ip, 0)).into()).ok()?;
         sock.connect(&SocketAddr::from((ns, 53)).into()).ok()?;
         sock.set_nonblocking(false).ok()?;
 
@@ -159,7 +175,7 @@ async fn direct_dns_lookup(state: &Arc<AppState>, env: &OutboundEnv, domain: &st
 /// 返回 Some(ip) 表示可直连；Proxy 无 IP（域名交给服务端解析）。
 async fn decide_for_tun(
     state: &Arc<AppState>,
-    env: &OutboundEnv,
+    // 解析统一走 lookup_direct（读取 state.tun_dns_bypass），不再需要 env。
     host: &str,
     fake_range: &str,
 ) -> Result<crate::core::proxy::route::RouteDecision, String> {
@@ -171,7 +187,7 @@ async fn decide_for_tun(
     let mut resolved = if host.parse::<IpAddr>().is_ok() {
         Some(host.to_string())
     } else {
-        direct_dns_lookup(state, env, host).await
+        lookup_direct(state, host).await
     };
     // fail-closed 后备：解析结果落在 fake-ip 池内 = 被自身 DNS 劫持污染，
     // 禁止当作真实 IP 直连（会再次进入 TUN 形成环路）。
@@ -248,7 +264,7 @@ async fn handle_tcp(
         return;
     }
 
-    let decision = match decide_for_tun(&state, &env, &host, &fake_range).await {
+    let decision = match decide_for_tun(&state, &host, &fake_range).await {
         Ok(d) => d,
         Err(e) => {
             log::error!("TUN 决策失败 {host}:{port}: {e}");
@@ -268,7 +284,7 @@ async fn handle_tcp(
                 return;
             }
         };
-        match connect_direct(&ip, port, env.physical_if).await {
+        match connect_direct(&ip, port, env.physical_if, env.physical_ip).await {
             Ok(target) => {
                 let mut target = target;
                 let mut stream = stream;
@@ -342,6 +358,7 @@ async fn connect_direct(
     ip: &str,
     port: u16,
     if_index: Option<u32>,
+    local_ip: Option<std::net::Ipv4Addr>,
 ) -> std::io::Result<tokio::net::TcpStream> {
     let ip = ip.to_string();
     let std_stream = tokio::task::spawn_blocking(move || {
@@ -352,6 +369,11 @@ async fn connect_direct(
         let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
         if let Some(idx) = if_index {
             bind_unicast_if(&sock, addr.is_ipv4(), idx)?;
+        }
+        // 源地址必须显式绑定物理网卡地址：只设 IP_UNICAST_IF 时 Windows
+        // 仍可能按主路由表把源地址取成 TUN 的 198.18.0.1，包出去后无法回程。
+        if let (Some(local), true) = (local_ip, addr.is_ipv4()) {
+            sock.bind(&SocketAddr::from((local, 0)).into())?;
         }
         sock.set_tcp_nodelay(true)?;
         sock.set_nonblocking(false)?;
@@ -411,6 +433,9 @@ async fn handle_udp(
     env: OutboundEnv,
 ) {
     let port = local.port();
+    // 会话按 (socket, 应用源端点) 区分：同一目标 fake-ip 可能被多个 QUIC
+    // 连接同时使用，只按 socket 复用会把回包错发给另一个源端口。
+    let key = (handle, remote);
     // DNS：轮询线程已劫持应答；到达这里的 53 包都是未劫持目标，丢弃防泄漏。
     if port == 53 {
         log::debug!("TUN UDP:53 未命中劫持规则，丢弃 {remote}");
@@ -420,7 +445,7 @@ async fn handle_udp(
     // 会话复用：命中则把报文交给已有会话，不重建隧道/socket。
     let tx = {
         let sessions = env.udp_sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.get(&handle).map(|(_, tx)| tx.clone())
+        sessions.get(&key).map(|(_, tx)| tx.clone())
     };
     if let Some(tx) = tx {
         let _ = tx.try_send(payload);
@@ -432,7 +457,7 @@ async fn handle_udp(
         Ok(h) => h,
         Err(()) => return, // host_of 已去重警告
     };
-    let decision = match decide_for_tun(&state, &env, &host, &fake_range).await {
+    let decision = match decide_for_tun(&state, &host, &fake_range).await {
         Ok(d) => d,
         Err(_) => return,
     };
@@ -445,21 +470,21 @@ async fn handle_udp(
     let generation = UDP_SESSION_GEN.fetch_add(1, Ordering::Relaxed);
     {
         let mut sessions = env.udp_sessions.lock().unwrap_or_else(|e| e.into_inner());
-        if sessions.contains_key(&handle) {
+        if sessions.contains_key(&key) {
             return; // 并发首包已被另一任务接管
         }
-        sessions.insert(handle, (generation, tx.clone()));
+        sessions.insert(key, (generation, tx.clone()));
     }
 
     let (upstream, dst) = match decision.outbound {
         RouteOutbound::Direct => {
             match decision.resolved_ip.as_deref().and_then(|ip| {
                 format!("{ip}:{port}").parse::<SocketAddr>().ok()
-                    .and_then(|dst| connect_direct_udp(env.physical_if).map(|s| (s, dst)))
+                    .and_then(|dst| connect_direct_udp(env.physical_if, env.physical_ip).map(|s| (s, dst)))
             }) {
                 Some((s, dst)) => (UdpUpstream::Direct(s), dst),
                 None => {
-                    unregister_udp_session(&env, handle, generation);
+                    unregister_udp_session(&env, key, generation);
                     return;
                 }
             }
@@ -468,7 +493,7 @@ async fn handle_udp(
             match build_proxy_udp(&state, &host).await {
                 Some(u) => (u, local), // 代理路径真实目标由 FLAG_UDP 帧携带，dst.port() = 目标端口
                 None => {
-                    unregister_udp_session(&env, handle, generation);
+                    unregister_udp_session(&env, key, generation);
                     return;
                 }
             }
@@ -477,7 +502,7 @@ async fn handle_udp(
     };
 
     if tx.send(payload).await.is_err() {
-        unregister_udp_session(&env, handle, generation);
+        unregister_udp_session(&env, key, generation);
         return;
     }
 
@@ -485,14 +510,18 @@ async fn handle_udp(
     let env2 = env.clone();
     tokio::spawn(async move {
         pump_udp(smol, remote, dst, upstream, rx, host).await;
-        unregister_udp_session(&env2, handle, generation);
+        unregister_udp_session(&env2, key, generation);
     });
 }
 
-fn unregister_udp_session(env: &OutboundEnv, handle: SocketHandle, generation: u64) {
+fn unregister_udp_session(
+    env: &OutboundEnv,
+    key: (SocketHandle, SocketAddr),
+    generation: u64,
+) {
     let mut sessions = env.udp_sessions.lock().unwrap_or_else(|e| e.into_inner());
-    if sessions.get(&handle).map(|(g, _)| *g) == Some(generation) {
-        sessions.remove(&handle);
+    if sessions.get(&key).map(|(g, _)| *g) == Some(generation) {
+        sessions.remove(&key);
     }
 }
 
@@ -530,12 +559,17 @@ async fn build_proxy_udp(state: &Arc<AppState>, host: &str) -> Option<UdpUpstrea
 }
 
 /// 绑定物理网卡的直连 UDP socket（直连出站专用）。
-fn connect_direct_udp(if_index: Option<u32>) -> Option<tokio::net::UdpSocket> {
+fn connect_direct_udp(
+    if_index: Option<u32>,
+    local_ip: Option<std::net::Ipv4Addr>,
+) -> Option<tokio::net::UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
     if let Some(idx) = if_index {
         bind_unicast_if(&sock, true, idx).ok()?;
     }
-    sock.bind(&"0.0.0.0:0".parse::<SocketAddr>().unwrap().into()).ok()?;
+    // 与 TCP 同理：显式绑定物理网卡源地址，避免回包路由到 TUN。
+    let local = local_ip.unwrap_or(std::net::Ipv4Addr::UNSPECIFIED);
+    sock.bind(&SocketAddr::from((local, 0)).into()).ok()?;
     sock.set_nonblocking(true).ok()?;
     tokio::net::UdpSocket::from_std(std::net::UdpSocket::from(sock)).ok()
 }

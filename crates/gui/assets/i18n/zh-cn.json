@@ -162,6 +162,11 @@
   "TUN_ROUTE_EXCLUDE_HINT": "逗号分隔的 CIDR，这些网段绕过 TUN，例如 192.168.0.0/16",
   "TUN_DIRECT_NAMESERVERS": "直连 DNS 服务器",
   "TUN_DIRECT_NAMESERVERS_HINT": "逗号分隔。用于解析直连目标，避免 TUN 解析环路。",
+  "TUN_CLEAR_FAKEIP": "清空 fake-ip 缓存",
+  "TUN_CLEAR_FAKEIP_HINT": "清除内存映射与 fakeip.json，并刷新系统 DNS 缓存。已建立的连接不受影响。",
+  "TUN_CLEAR_FAKEIP_BUTTON": "清空",
+  "TUN_CLEAR_FAKEIP_DONE": "已清空 {n} 条 fake-ip 映射",
+  "TUN_CLEAR_FAKEIP_FAILED": "清空失败: {error}",
   "TUN_ADMIN_HINT": "需要管理员权限；权限不足时 TUN 会 fail-closed 自动关闭。",
   "VALIDATE_TUN": "TUN 配置无效"
 }

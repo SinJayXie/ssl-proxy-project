@@ -274,6 +274,13 @@ impl Core {
         })
     }
 
+    /// 清空 fake-ip 映射（内存 + 持久化文件），返回清理的条数。
+    pub fn clear_fakeip(&self) -> JoinHandle<Result<usize, String>> {
+        let state = self.state.clone();
+        self.runtime
+            .spawn(async move { crate::core::tun::runner::clear_fakeip(&state) })
+    }
+
     pub fn test_rule(&self, host: String) -> JoinHandle<Result<TestRuleResult, String>> {
         let state = self.state.clone();
         self.runtime.spawn(async move { run_test_rule(state, host).await })

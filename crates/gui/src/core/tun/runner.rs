@@ -76,6 +76,9 @@ pub async fn apply(state: Arc<AppState>) {
         let action = decide_action(cfg.enable, running, cfg_changed);
         if matches!(action, Action::Stop | Action::Restart) {
             stop_inner(&mut g, Some(&config_dir));
+            if let Ok(mut w) = state.tun_dns_bypass.write() {
+                *w = None;
+            }
         }
         action
     };
@@ -175,7 +178,17 @@ async fn start(
     let (ev_tx, ev_rx) = std::sync::mpsc::channel::<netstack::FlowEvent>();
     let fake_map = crate::core::tun::dns::FakeIpMap::load_from(&fakeip_path(&state.config_dir));
     let shared = netstack::spawn(tun_dev, cfg.clone(), ev_tx, fake_map);
-    let env = OutboundEnv::new(Some(phys.if_index), cfg.direct_nameservers.clone());
+    let env = OutboundEnv::new(Some(phys.if_index), phys.local_ipv4, cfg.direct_nameservers.clone());
+    // 登记 DNS 绕行参数：TUN 期间所有解析都必须走物理网卡，否则会被
+    // 自身劫持应答成 fake-ip，污染缓存并让分流退化为直连。
+    if let Ok(mut w) = state.tun_dns_bypass.write() {
+        *w = Some(crate::core::state::TunDnsBypass {
+            if_index: phys.if_index,
+            local_ipv4: phys.local_ipv4,
+            nameservers: cfg.direct_nameservers.clone(),
+            fake_ip_range: cfg.fake_ip_range.clone(),
+        });
+    }
     spawn_event_pump(state.clone(), shared.clone(), ev_rx, env);
     spawn_reaper(shared.clone());
     spawn_fakeip_saver(state.config_dir.clone(), shared.clone());
@@ -192,6 +205,11 @@ async fn start(
         phys.gateway,
         cfg.strict_route,
         exclude_list.len()
+    );
+    log::info!(
+        "TUN 物理出口: ifIndex={} 源地址={:?}",
+        phys.if_index,
+        phys.local_ipv4
     );
     Ok((shared, program.down))
 }
@@ -214,20 +232,47 @@ fn flush_system_dns_cache() {
 #[cfg(not(target_os = "windows"))]
 fn flush_system_dns_cache() {}
 
+/// 后台刷新 DNS 缓存（不阻塞调用线程）。
+///
+/// 退出路径（托盘/UI 退出按钮）跑在 GPUI 主线程上，`ipconfig /flushdns`
+/// 可能耗时 1~3 秒，同步调用会让窗口看上去卡死。
+#[cfg(target_os = "windows")]
+fn flush_system_dns_cache_async() {
+    std::thread::Builder::new()
+        .name("flush-dns".into())
+        .spawn(flush_system_dns_cache)
+        .ok();
+}
+
+#[cfg(not(target_os = "windows"))]
+fn flush_system_dns_cache_async() {}
+
 /// fake-ip 持久化文件：config_dir/fakeip.json。
 fn fakeip_path(config_dir: &std::path::Path) -> std::path::PathBuf {
     config_dir.join("fakeip.json")
 }
 
-/// 周期保存 fake-ip 映射（30s 防抖），崩溃时最多丢 30s 的新映射。
+/// 近实时保存 fake-ip 映射：每秒检查一次，只有新增映射时才落盘。
+///
+/// 浏览器会长时间缓存 fake-ip，若映射丢失（进程被强杀/重启）连接会被
+/// fail-closed 拒绝（浏览器报 ERR_CONNECTION_CLOSED），因此尽可能缩短
+/// 「已分配但未落盘」的窗口。
 fn spawn_fakeip_saver(config_dir: std::path::PathBuf, shared: netstack::StackShared) {
     let rt = tokio::runtime::Handle::try_current().ok();
     if let Some(rt) = rt {
         rt.spawn(async move {
             let path = fakeip_path(&config_dir);
+            let mut saved_len = usize::MAX;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                let entries = shared.lock().fake_map.entries();
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let (entries, len) = {
+                    let core = shared.lock();
+                    (core.fake_map.entries(), core.fake_map.len())
+                };
+                if len == saved_len {
+                    continue;
+                }
+                saved_len = len;
                 let path = path.clone();
                 if let Err(e) = tokio::task::spawn_blocking(move || {
                     std::fs::write(
@@ -262,8 +307,8 @@ fn stop_inner(m: &mut TunManager, config_dir: Option<&std::path::Path>) {
     m.down_cmds.clear();
     m.active_cfg = None;
     m.shared = None; // 丢弃共享句柄 → 通道关闭 → 协议栈线程退出 → 网卡关闭
-    // 停止后 fake-ip 不再可达，清缓存让应用尽快重新走真实 DNS。
-    flush_system_dns_cache();
+    // 停止后 fake-ip 不再可达，清缓存让应用尽快重新走真实 DNS（后台执行，不阻塞退出）。
+    flush_system_dns_cache_async();
     if let Some(dir) = config_dir {
         if let Err(e) = RouteSnapshot::clear(dir) {
             log::warn!("清理 TUN 路由快照失败: {e}");
@@ -327,7 +372,34 @@ fn spawn_event_pump(
         .expect("spawn tun event pump");
 }
 
-/// 周期回收关闭的 socket。
+/// 清空 fake-ip 映射：内存表 + 持久化文件，并刷新系统 DNS 缓存。
+///
+/// 应用缓存的旧 fake-ip 会因此反查失败（fail-closed 拒绝），
+/// 刷新 DNS 缓存可促使其尽快重新查询。
+pub fn clear_fakeip(state: &AppState) -> Result<usize, String> {
+    let cleared = {
+        let m = manager();
+        let g = m.lock().unwrap_or_else(|e| e.into_inner());
+        match &g.shared {
+            Some(shared) => {
+                let n = shared.lock().fake_map.len();
+                shared.clear_fake_map();
+                n
+            }
+            None => 0,
+        }
+    };
+    let path = fakeip_path(&state.config_dir);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("删除 {:?} 失败: {e}", path)),
+    }
+    flush_system_dns_cache_async();
+    Ok(cleared)
+}
+
+/// 周期回收关闭/超时的 socket，并每 10s 打一条心跳（泄漏/卡死排查）。
 fn spawn_reaper(shared: netstack::StackShared) {
     let rt = tokio::runtime::Handle::try_current().ok();
     if let Some(rt) = rt {
@@ -336,6 +408,8 @@ fn spawn_reaper(shared: netstack::StackShared) {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 let mut core = shared.lock();
                 netstack::reap_closed(&mut core);
+                let (pending, flows, udp, queued) = core.stats();
+                log::info!("TUN 心跳: 半开={pending} TCP={flows} UDP={udp} 待处理包={queued}");
             }
         });
     }

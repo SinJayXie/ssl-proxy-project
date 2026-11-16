@@ -162,6 +162,11 @@
   "TUN_ROUTE_EXCLUDE_HINT": "Comma-separated CIDRs that bypass TUN, e.g. 192.168.0.0/16",
   "TUN_DIRECT_NAMESERVERS": "Direct DNS Servers",
   "TUN_DIRECT_NAMESERVERS_HINT": "Comma-separated. Used to resolve direct targets without a TUN loop.",
+  "TUN_CLEAR_FAKEIP": "Clear fake-ip cache",
+  "TUN_CLEAR_FAKEIP_HINT": "Clears the in-memory map and fakeip.json, then flushes the system DNS cache. Established connections are unaffected.",
+  "TUN_CLEAR_FAKEIP_BUTTON": "Clear",
+  "TUN_CLEAR_FAKEIP_DONE": "Cleared {n} fake-ip mappings",
+  "TUN_CLEAR_FAKEIP_FAILED": "Clear failed: {error}",
   "TUN_ADMIN_HINT": "Administrator rights are required. Without them TUN fails closed and stays off.",
   "VALIDATE_TUN": "Invalid TUN settings"
 }

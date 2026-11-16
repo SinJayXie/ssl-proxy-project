@@ -37,6 +37,10 @@ XPStyle on
 !ifndef SOURCE_GEO
   !define SOURCE_GEO "..\assets\GeoDB.dat"
 !endif
+; WinTun driver DLL: the TUN data plane loads it from the exe directory at runtime.
+!ifndef WINTUN_DLL
+  !define WINTUN_DLL "..\assets\wintun\wintun.dll"
+!endif
 ; Icons live in the repo-root icons/ directory.
 !ifndef ICON_FILE
   !define ICON_FILE "..\..\..\icons\icon.ico"
@@ -112,6 +116,7 @@ Section "Install" SEC_MAIN
 
   File "/oname=${PRODUCT_EXE}" "${PAYLOAD_EXE}"
   File "/oname=GeoDB.dat" "${SOURCE_GEO}"
+  File "/oname=wintun.dll" "${WINTUN_DLL}"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
   ; Start-menu + desktop shortcuts are always (re)created, so upgrades keep a
@@ -139,6 +144,7 @@ Section "Uninstall"
 
   Delete "$INSTDIR\${PRODUCT_EXE}"
   Delete "$INSTDIR\GeoDB.dat"
+  Delete "$INSTDIR\wintun.dll"
   Delete "$INSTDIR\uninstall.exe"
   Delete "$SMPROGRAMS\${PRODUCT_NAME}.lnk"
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"

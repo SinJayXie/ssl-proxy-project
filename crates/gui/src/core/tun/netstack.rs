@@ -59,6 +59,16 @@ impl StackShared {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// 清空内存中的 fake-ip 映射（设置页"清空 fake-ip"按钮）。
+    /// 已建立的连接不受影响，新查询会重新分配地址。
+    pub fn clear_fake_map(&self) {
+        let mut core = self.lock();
+        let n = core.fake_map.len();
+        core.fake_map = FakeIpMap::new();
+        drop(core);
+        log::info!("已清空 {n} 条 fake-ip 映射");
+    }
+
     /// 请求立即轮询一次（写入数据后调用）。
     pub fn wake(&self) {
         let _ = self.wake_tx.send(());
@@ -76,21 +86,60 @@ pub struct StackCore {
     queue: VecDeque<Vec<u8>>,
     /// 已按目的端点建好监听的 TCP socket（等待握手）。
     tcp_pending: HashMap<IpEndpoint, SocketHandle>,
+    /// 半开连接建立时间，用于回收客户端放弃的握手（否则永久占用 SocketSet）。
+    pending_at: HashMap<SocketHandle, std::time::Instant>,
     /// 已完成握手、事件已发出的 TCP 流。
     pub tcp_flows: HashMap<SocketHandle, IpEndpoint>,
     /// UDP socket：端点 → handle。
     pub udp_flows: HashMap<IpEndpoint, SocketHandle>,
+    /// UDP socket 最近一次收包时间，用于回收空闲会话。
+    udp_at: HashMap<SocketHandle, std::time::Instant>,
     /// 已被 reaper 从 SocketSet 移除的 handle。流封装（SmolTcpStream 等）
     /// 可能比 SocketSet 条目活得更久（tokio split 双持有），访问前必须检查。
     removed_sockets: std::collections::HashSet<SocketHandle>,
+    /// handle → socket 类型。smoltcp 会复用索引，旧流封装持有的 handle 可能
+    /// 指向新 socket；类型不匹配时 `get_mut::<Tcp>` 会 panic（release 静默退出），
+    /// 因此访问前必须核对类型。
+    kinds: HashMap<SocketHandle, SocketKind>,
+    /// WinTun adapter/session 的所有权标记，协议栈析构时才关闭网卡。
+    keepalive: Option<Box<dyn Send>>,
     pub events: std::sync::mpsc::Sender<FlowEvent>,
     pub fake_map: FakeIpMap,
     pub cfg: TunConfig,
 }
 
+/// SocketSet 中该 handle 当前承载的协议类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SocketKind {
+    Tcp,
+    Udp,
+}
+
 impl StackCore {
     fn register_waker(&mut self, handle: SocketHandle, cx: &Context<'_>) {
         self.wakers.entry(handle).or_default().push(cx.waker().clone());
+    }
+
+    /// 该 handle 当前是否仍是一个**可访问的 TCP socket**。
+    fn tcp_live(&self, handle: SocketHandle) -> bool {
+        !self.removed_sockets.contains(&handle)
+            && self.kinds.get(&handle) == Some(&SocketKind::Tcp)
+    }
+
+    /// 该 handle 当前是否仍是一个**可访问的 UDP socket**。
+    fn udp_live(&self, handle: SocketHandle) -> bool {
+        !self.removed_sockets.contains(&handle)
+            && self.kinds.get(&handle) == Some(&SocketKind::Udp)
+    }
+
+    /// (半开 TCP, 活跃 TCP, UDP) 数量，用于运行期诊断（泄漏/卡顿排查）。
+    pub fn stats(&self) -> (usize, usize, usize, usize) {
+        (
+            self.tcp_pending.len(),
+            self.tcp_flows.len(),
+            self.udp_flows.len(),
+            self.queue.len(),
+        )
     }
 
     fn wake_all(&mut self) {
@@ -163,6 +212,7 @@ pub fn spawn(
     fake_map: FakeIpMap,
 ) -> StackShared {
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
+    let stop = device.stop.clone();
     let shared = StackShared {
         inner: Arc::new(Mutex::new(StackCore {
             iface: build_iface(device.mtu, &cfg),
@@ -172,9 +222,14 @@ pub fn spawn(
             rx: device.rx,
             queue: VecDeque::new(),
             tcp_pending: HashMap::new(),
+            pending_at: HashMap::new(),
             tcp_flows: HashMap::new(),
             udp_flows: HashMap::new(),
+            udp_at: HashMap::new(),
             removed_sockets: std::collections::HashSet::new(),
+            kinds: HashMap::new(),
+            // 网卡会话由协议栈持有：线程退出、StackCore 析构后才关闭。
+            keepalive: device.keepalive,
             events: events_tx,
             fake_map,
             cfg: cfg.clone(),
@@ -185,7 +240,11 @@ pub fn spawn(
     let loop_shared = shared.clone();
     std::thread::Builder::new()
         .name("tun-stack".into())
-        .spawn(move || poll_loop(loop_shared, wake_rx))
+        .spawn(move || {
+            poll_loop(loop_shared, wake_rx);
+            // 协议栈退出即停止读线程，避免其继续空转并持有网卡会话。
+            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        })
         .expect("spawn tun stack thread");
     shared
 }
@@ -244,10 +303,15 @@ fn poll_loop(shared: StackShared, wake_rx: std::sync::mpsc::Receiver<()>) {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
         let mut core = shared.lock();
-        while let Ok(pkt) = core.rx.try_recv() {
-            if core.queue.len() < 512 {
-                prepare_inbound(&mut core, &pkt);
-                core.queue.push_back(pkt);
+        // 背压：队列满时停止取包（留在通道里），而不是取出来后静默丢弃
+        // ——丢弃会让 TCP 直接卡住重传。
+        while core.queue.len() < 512 {
+            match core.rx.try_recv() {
+                Ok(pkt) => {
+                    prepare_inbound(&mut core, &pkt);
+                    core.queue.push_back(pkt);
+                }
+                Err(_) => break,
             }
         }
 
@@ -255,7 +319,14 @@ fn poll_loop(shared: StackShared, wake_rx: std::sync::mpsc::Receiver<()>) {
             let StackCore { iface, queue, device_tx, sockets, cfg, .. } = &mut *core;
             let mtu = cfg.mtu as usize;
             let mut dev = CoreDevice { rx_queue: queue, tx: device_tx, mtu };
+            let started = std::time::Instant::now();
             let _ = iface.poll(now(), &mut dev, sockets);
+            // 单次 poll 超过 200ms 说明协议栈被拖住（socket 泄漏/包风暴），
+            // 这是整机卡死的直接前兆，必须留证据。
+            let spent = started.elapsed();
+            if spent > Duration::from_millis(200) {
+                log::warn!("TUN 协议栈单次 poll 耗时 {spent:?}");
+            }
         }
 
         scan_flows(&mut core);
@@ -286,6 +357,10 @@ fn prepare_inbound(core: &mut StackCore, pkt: &[u8]) {
                 .is_ok()
             {
                 let h = core.sockets.add(sock);
+                // 索引可能被回收后复用，必须清掉"已移除"标记，否则新 socket 会被当成已死。
+                core.removed_sockets.remove(&h);
+                core.kinds.insert(h, SocketKind::Tcp);
+                core.pending_at.insert(h, std::time::Instant::now());
                 core.tcp_pending.insert(ep, h);
             }
         }
@@ -311,6 +386,9 @@ fn prepare_inbound(core: &mut StackCore, pkt: &[u8]) {
             );
             if sock.bind(ep).is_ok() {
                 let h = core.sockets.add(sock);
+                core.removed_sockets.remove(&h);
+                core.kinds.insert(h, SocketKind::Udp);
+                core.udp_at.insert(h, std::time::Instant::now());
                 core.udp_flows.insert(ep, h);
             }
         }
@@ -331,6 +409,7 @@ fn scan_flows(core: &mut StackCore) {
         .collect();
     for ep in ready {
         if let Some(h) = core.tcp_pending.remove(&ep) {
+            core.pending_at.remove(&h);
             let remote = {
                 let s: &tcp::Socket = core.sockets.get(h);
                 s.remote_endpoint().unwrap_or(ep)
@@ -358,6 +437,7 @@ fn scan_flows(core: &mut StackCore) {
                 Err(_) => continue,
             }
         };
+        core.udp_at.insert(h, std::time::Instant::now());
         // DNS 劫持：轮询线程内直接应答（fail-closed）。
         let local_ip = match local.addr {
             IpAddress::Ipv4(v4) => std::net::IpAddr::V4(v4.into()),
@@ -388,8 +468,23 @@ fn scan_flows(core: &mut StackCore) {
     }
 }
 
-/// 回收已关闭且无等待者的 socket。
+/// 半开连接未被完成的最长存活时间（客户端 RST/放弃 SYN 后立即回收）。
+const PENDING_TTL: Duration = Duration::from_secs(45);
+/// UDP 会话空闲回收时间（超过即释放 socket，后续报文会重新建立）。
+const UDP_IDLE_TTL: Duration = Duration::from_secs(120);
+/// socket 总量告警阈值：正常使用在几十个量级。
+const SOCKET_WARN_LIMIT: usize = 1024;
+
+/// 回收已结束/超时/空闲的 socket。
+///
+/// 三种都必须回收，否则 SocketSet 无界增长，`iface.poll` 每轮遍历全部
+/// socket，几分钟后就会把界面和网络一起拖死：
+/// - 已关闭的 TCP 流；
+/// - 握手未完成的 TCP（旧实现只在握手成功后删条目，被放弃的连接永久滞留）；
+/// - 长时间无流量的 UDP 会话（旧实现从不回收）。
 pub fn reap_closed(core: &mut StackCore) {
+    let now = std::time::Instant::now();
+
     let dead_tcp: Vec<SocketHandle> = core
         .tcp_flows
         .keys()
@@ -404,6 +499,58 @@ pub fn reap_closed(core: &mut StackCore) {
         core.sockets.remove(h);
         // 流封装可能仍存活（tokio split 的另一半），记录避免其 drop/读写 panic。
         core.removed_sockets.insert(h);
+        core.kinds.remove(&h);
+    }
+
+    let stale_pending: Vec<(IpEndpoint, SocketHandle)> = core
+        .tcp_pending
+        .iter()
+        .filter(|(_, h)| {
+            let s: &tcp::Socket = core.sockets.get(**h);
+            s.state() == tcp::State::Closed
+                || core
+                    .pending_at
+                    .get(*h)
+                    .is_some_and(|t| now.duration_since(*t) > PENDING_TTL)
+        })
+        .map(|(ep, h)| (*ep, *h))
+        .collect();
+    for (ep, h) in stale_pending {
+        core.tcp_pending.remove(&ep);
+        core.pending_at.remove(&h);
+        core.sockets.remove(h);
+        core.removed_sockets.insert(h);
+        core.kinds.remove(&h);
+    }
+
+    let idle_udp: Vec<(IpEndpoint, SocketHandle)> = core
+        .udp_flows
+        .iter()
+        .filter(|(_, h)| {
+            !core.wakers.contains_key(*h)
+                && core
+                    .udp_at
+                    .get(*h)
+                    .is_some_and(|t| now.duration_since(*t) > UDP_IDLE_TTL)
+        })
+        .map(|(ep, h)| (*ep, *h))
+        .collect();
+    for (ep, h) in idle_udp {
+        core.udp_flows.remove(&ep);
+        core.udp_at.remove(&h);
+        core.sockets.remove(h);
+        core.removed_sockets.insert(h);
+        core.kinds.remove(&h);
+    }
+
+    let total = core.tcp_pending.len() + core.tcp_flows.len() + core.udp_flows.len();
+    if total > SOCKET_WARN_LIMIT {
+        log::warn!(
+            "TUN socket 数异常增长: {total}（pending={} flows={} udp={}）",
+            core.tcp_pending.len(),
+            core.tcp_flows.len(),
+            core.udp_flows.len()
+        );
     }
 }
 
@@ -426,7 +573,7 @@ impl Drop for SmolTcpStream {
     fn drop(&mut self) {
         let mut core = self.shared.lock();
         // reaper 可能已移除该 socket（流封装比 SocketSet 条目活得久）。
-        if core.removed_sockets.contains(&self.handle) {
+        if !core.tcp_live(self.handle) {
             core.wakers.remove(&self.handle);
             return;
         }
@@ -443,15 +590,22 @@ impl tokio::io::AsyncRead for SmolTcpStream {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let mut core = self.shared.lock();
-        if core.removed_sockets.contains(&self.handle) {
+        if !core.tcp_live(self.handle) {
             return Poll::Ready(Ok(())); // 已被回收 → EOF
         }
         let sock = core.sockets.get_mut::<tcp::Socket>(self.handle);
         if sock.may_recv() {
             let mut tmp = [0u8; 8192];
+            // 必须按调用方 ReadBuf 的剩余容量截断：copy_bidirectional / TLS
+            // 可能只给几字节空间，超出会触发 ReadBuf::put_slice 的 panic
+            //（release 下 panic=abort，表现为进程静默退出）。
+            let capacity = buf.remaining().min(tmp.len());
+            if capacity == 0 {
+                return Poll::Ready(Ok(()));
+            }
             let n = sock
                 .recv(|data| {
-                    let n = data.len().min(tmp.len());
+                    let n = data.len().min(capacity);
                     tmp[..n].copy_from_slice(&data[..n]);
                     (n, n)
                 })
@@ -475,7 +629,7 @@ impl tokio::io::AsyncWrite for SmolTcpStream {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let mut core = self.shared.lock();
-        if core.removed_sockets.contains(&self.handle) {
+        if !core.tcp_live(self.handle) {
             return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
         }
         let sock = core.sockets.get_mut::<tcp::Socket>(self.handle);
@@ -508,7 +662,7 @@ impl tokio::io::AsyncWrite for SmolTcpStream {
         _cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
         let mut core = self.shared.lock();
-        if core.removed_sockets.contains(&self.handle) {
+        if !core.tcp_live(self.handle) {
             return Poll::Ready(Ok(()));
         }
         core.sockets.get_mut::<tcp::Socket>(self.handle).close();
@@ -532,6 +686,9 @@ impl SmolUdpSocket {
     pub async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         std::future::poll_fn(|cx| {
             let mut core = self.shared.lock();
+            if !core.udp_live(self.handle) {
+                return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
             let sock: &mut smoltcp::socket::udp::Socket = core.sockets.get_mut(self.handle);
             if sock.can_recv() {
                 let (n, meta) = sock
@@ -555,6 +712,9 @@ impl SmolUdpSocket {
         };
         std::future::poll_fn(|cx| {
             let mut core = self.shared.lock();
+            if !core.udp_live(self.handle) {
+                return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
             let sock: &mut smoltcp::socket::udp::Socket = core.sockets.get_mut(self.handle);
             match sock.send_slice(buf, remote_ep) {
                 Ok(()) => {

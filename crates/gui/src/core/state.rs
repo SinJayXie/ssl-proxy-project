@@ -12,6 +12,20 @@ use trust_dns_resolver::config::{NameServerConfig, Protocol, ResolverConfig, Res
 pub type Connections = HashMap<u32, ConnectionInfo>;
 pub type DnsCache = HashMap<String, String>;
 
+/// TUN 运行期的解析绕行参数。
+///
+/// TUN 会劫持任何走默认路由的 :53 查询（包括程序自身解析器），把结果换成
+/// fake-ip；因此 TUN 启用期间所有解析都必须绑定物理网卡直连 DNS，
+/// 并且缓存命中时要排除 fake-ip 段的值。
+#[derive(Clone)]
+pub struct TunDnsBypass {
+    pub if_index: u32,
+    /// 物理网卡源地址：不绑定可能取到 TUN 地址导致查询丢失。
+    pub local_ipv4: Option<std::net::Ipv4Addr>,
+    pub nameservers: Vec<String>,
+    pub fake_ip_range: String,
+}
+
 pub struct AppState {
     pub connections: Arc<RwLock<Connections>>,
     pub dns_cache: Arc<RwLock<DnsCache>>,
@@ -28,6 +42,8 @@ pub struct AppState {
     /// 隧道 TCP 连接必须直接用该 IP（TLS/SNI 仍按配置域名校验）；
     /// 未启用 TUN 时为 None，走原域名解析。
     pub proxy_resolved_ip: std::sync::RwLock<Option<String>>,
+    /// TUN 运行期 DNS 绕行参数（None = TUN 未启用，走系统解析器）。
+    pub tun_dns_bypass: std::sync::RwLock<Option<TunDnsBypass>>,
     /// Directory of the executable (resources: GeoDB.dat)
     pub app_path: PathBuf,
     /// User data directory ($HOME/ssl-proxy-client): settings, rules, log, consent
@@ -88,6 +104,7 @@ impl AppState {
             error_pool: Arc::new(RwLock::new(Vec::new())),
             dns_resolver,
             proxy_resolved_ip: std::sync::RwLock::new(None),
+            tun_dns_bypass: std::sync::RwLock::new(None),
             app_path,
             config_dir,
             geo_manager,

@@ -139,10 +139,13 @@ pub fn execute(cmds: &[String]) -> Vec<(String, String)> {
         let out = std::process::Command::new(program).args(&args).output();
         match out {
             Ok(o) if o.status.success() => {}
-            Ok(o) => failures.push((
-                cmd.clone(),
-                String::from_utf8_lossy(&o.stderr).trim().to_string(),
-            )),
+            Ok(o) => {
+                // route.exe 把错误写在 stdout（stderr 常为空），两者都收。
+                let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let msg = if stderr.is_empty() { stdout } else { stderr };
+                failures.push((cmd.clone(), msg));
+            }
             Err(e) => failures.push((cmd.clone(), e.to_string())),
         }
     }
@@ -158,6 +161,7 @@ mod tests {
         PhysicalRoute {
             if_index: 12,
             gateway: "192.168.1.1".parse().unwrap(),
+            local_ipv4: None,
         }
     }
 

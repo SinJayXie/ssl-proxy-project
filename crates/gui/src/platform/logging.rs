@@ -21,11 +21,35 @@ impl Write for TeeWriter {
     }
 }
 
+/// 把 panic 落盘到 `<config_dir>/crash.log`。
+///
+/// release 构建使用 `panic="abort"` 且 GUI 进程没有控制台，panic 信息会
+/// 完全丢失（表现为日志戛然而止、看起来像"卡死"）。这里用独立文件句柄
+/// 追加写入，避免和 logger 的互斥锁互相影响（panic 可能发生在持锁期间）。
+fn install_panic_hook(config_dir: &Path) {
+    let path = config_dir.join("crash.log");
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let message = format!("[PANIC] {info}\n{backtrace}\n");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = file.write_all(message.as_bytes());
+            let _ = file.flush();
+        }
+        eprintln!("{message}");
+    }));
+}
+
 /// Initialize logging to stdout and `<config_dir>/app.log`.
 pub fn init(config_dir: &Path) {
     if let Err(err) = std::fs::create_dir_all(config_dir) {
         eprintln!("Failed to create config dir {config_dir:?}: {err}");
     }
+
+    install_panic_hook(config_dir);
 
     let log_path = config_dir.join("app.log");
     let log_file = match File::create(&log_path) {

@@ -217,6 +217,8 @@ pub struct SettingsPage {
     tun_auto_route: bool,
     tun_strict_route: bool,
     tun_auto_detect_interface: bool,
+    /// 清空 fake-ip 后的结果提示（成功条数 / 错误）。
+    fakeip_notice: Option<String>,
     /// 亚克力窗口背景（偏好项，改动立即生效，不参与配置保存）。
     acrylic: bool,
     /// 亚克力背景不透明度（30-100）。
@@ -259,6 +261,7 @@ impl SettingsPage {
             tun_auto_route: config.tun.auto_route,
             tun_strict_route: config.tun.strict_route,
             tun_auto_detect_interface: config.tun.auto_detect_interface,
+            fakeip_notice: None,
             acrylic,
             acrylic_opacity,
             acrylic_slider,
@@ -295,6 +298,28 @@ impl SettingsPage {
     fn toggle_tun_auto_detect_interface(&mut self, checked: &bool, cx: &mut Context<Self>) {
         self.tun_auto_detect_interface = *checked;
         cx.notify();
+    }
+
+    /// 清空 fake-ip 映射（内存 + fakeip.json），并提示结果。
+    fn clear_fakeip(&mut self, cx: &mut Context<Self>) {
+        let handle = self.core.clear_fakeip();
+        cx.spawn(async move |this, cx| {
+            let result = handle.await;
+            let _ = this.update(cx, |page, cx| {
+                page.fakeip_notice = Some(match result {
+                    Ok(Ok(n)) => i18n::t_with("TUN_CLEAR_FAKEIP_DONE", &[("n", &n.to_string())]),
+                    Ok(Err(err)) => {
+                        i18n::t_with("TUN_CLEAR_FAKEIP_FAILED", &[("error", &err)])
+                    }
+                    Err(err) => i18n::t_with(
+                        "TUN_CLEAR_FAKEIP_FAILED",
+                        &[("error", &err.to_string())],
+                    ),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn toggle_acrylic(&mut self, checked: &bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1020,6 +1045,46 @@ impl Render for SettingsPage {
                     cx,
                     Input::new(&self.tun_inputs.direct_nameservers).into_any_element(),
                 ))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(
+                            v_flex()
+                                .gap(px(2.))
+                                .child(
+                                    div()
+                                        .text_size(px(13.))
+                                        .child(i18n::t("TUN_CLEAR_FAKEIP")),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme::text_muted(cx))
+                                        .child(i18n::t("TUN_CLEAR_FAKEIP_HINT")),
+                                ),
+                        )
+                        .child(
+                            Button::new("tun-clear-fakeip")
+                                .label(i18n::t("TUN_CLEAR_FAKEIP_BUTTON"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.clear_fakeip(cx)
+                                })),
+                        ),
+                )
+                .child({
+                    let mut notice = v_flex().w_full();
+                    if let Some(text) = &self.fakeip_notice {
+                        notice = notice.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme::text_muted(cx))
+                                .child(text.clone()),
+                        );
+                    }
+                    notice
+                })
                 .child(
                     div()
                         .text_size(px(11.))

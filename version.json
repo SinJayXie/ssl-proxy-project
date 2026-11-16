@@ -3,7 +3,7 @@
     "changelog":  [
                       "TUN: WinTun virtual adapter with full data plane - fake-ip DNS hijack, smoltcp netstack, unified route engine (TCP/UDP)",
                       "TUN: fail-closed guarantees - capability gating, route rollback on failure, crash recovery snapshot, exit-time cleanup",
-                      "TUN: fake-ip mapping persistence (fakeip.json) so apps' cached addresses resolve across restarts",
+                      "TUN: fake-ip mapping persistence (fakeip.json) so apps\u0027 cached addresses resolve across restarts",
                       "TUN: strict-route hardening - private/loopback targets forced DIRECT, DNS hijack required, direct DNS bound to physical NIC",
                       "TUN: UDP proxy via TLS tunnel (FLAG_UDP frames, shared with SOCKS5 UDP ASSOCIATE)",
                       "TUN: proxy tunnel dials pre-resolved server IP so its own DNS is never hijacked (loop prevention)",
@@ -11,6 +11,6 @@
                       "Fix: LUID-to-ifIndex conversion via system API (was breaking adapter setup); smoltcp AnyIP mode for routed traffic; socket-recycle panic in mux forwarding"
                   ],
     "downloadUrl":  "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.6.0_x64-setup.exe",
-    "sha256":  "1f878a5128d85ebf78bca80c33368b4435f29cd4233ec720adc50b49d7154905",
-    "signature":  "f333988ba77d1a655d08213b8e3d60a7d97004cd355fce2fac94a83fc033c3faa9375c1378a3a5db47b3646646bb2ce02d0653b00d9465a95dc2bae3d0274d02"
+    "sha256":  "26cebd63a065df4927f57d2480d135db868c1bddd9467c66915c0bf3c4a985cd",
+    "signature":  "e1ac2d60e0b23a87eabff350ad3a36ae17f377ab1770d8ed9486ed1f8935be02a46a2c73af5f3b0c74bcf704a463efc4d88a1f62ce1d8c2e0eeb7b416cd2070b"
 }
