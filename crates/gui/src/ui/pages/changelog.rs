@@ -12,6 +12,19 @@ struct Entry {
 
 const CHANGELOG: &[Entry] = &[
     Entry {
+        version: "2.7.0",
+        date: "2026-11-17",
+        changes: &[
+            "Performance: DNS lookups no longer serialize concurrent connections (the cache lock is never held across a resolver await), and entries expire after 5 minutes",
+            "Performance: direct connections dial the already-resolved IP instead of re-resolving the domain through the system resolver - first connections to a new host no longer take seconds",
+            "Performance: idle connections skip the stats write lock; copy buffers grew from 8 KB to 64 KB; connection IDs are allocated atomically",
+            "Connections: TUN direct connections now appear in the connections page with geo info, latency and traffic stats (previously only proxy connections were listed)",
+            "TUN: TUN settings apply immediately on change (switches, route scope and text fields on Enter/blur) - no Save button and no app restart needed",
+            "TUN: route commands no longer flash console windows when enabling/disabling TUN or running diagnostics",
+            "Security: rate-limit and blacklist tables are swept periodically instead of growing without bound; app.log rotates at 10 MB and the log viewer reads only the tail; crash.log is capped; fake-ip pool prefixes are validated (8-32)",
+        ],
+    },
+    Entry {
         version: "2.6.2",
         date: "2026-11-17",
         changes: &[

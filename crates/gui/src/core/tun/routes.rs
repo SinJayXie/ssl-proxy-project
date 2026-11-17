@@ -176,7 +176,17 @@ pub fn execute(cmds: &[String]) -> Vec<(String, String)> {
             (Some(p), a) if !a.is_empty() => (p, a),
             _ => continue,
         };
-        let out = std::process::Command::new(program).args(&args).output();
+        let mut command = std::process::Command::new(program);
+        command.args(&args);
+        // 静默执行：TUN 启停会连续执行大量路由命令，
+        // 不设 CREATE_NO_WINDOW 时每条命令都会闪一个 cmd 窗口。
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let out = command.output();
         match out {
             Ok(o) if o.status.success() => {}
             Ok(o) => {

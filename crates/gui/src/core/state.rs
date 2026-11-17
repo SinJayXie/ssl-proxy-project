@@ -3,14 +3,41 @@ use crate::types::{AppConfig, AppError, ConnectionInfo, DataFlow, RuleConfig, Ud
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use trust_dns_resolver::TokioAsyncResolver;
 use trust_dns_resolver::config::{NameServerConfig, Protocol, ResolverConfig, ResolverOpts};
 
 pub type Connections = HashMap<u32, ConnectionInfo>;
-pub type DnsCache = HashMap<String, String>;
+
+/// DNS 缓存条目：记录写入时间用于 TTL 过期判定
+#[derive(Debug, Clone)]
+pub struct DnsCacheEntry {
+    pub ip: String,
+    pub cached_at: std::time::Instant,
+}
+
+pub type DnsCache = HashMap<String, DnsCacheEntry>;
+
+/// DNS 缓存 TTL：过期视为未命中，避免 CDN 等域名切换后一直被旧 IP 拖住
+pub const DNS_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// 纯函数版缓存命中判定（带 TTL 参数，便于测试）。
+pub fn cache_lookup_with_ttl<'a>(
+    cache: &'a DnsCache,
+    domain: &str,
+    ttl: Duration,
+) -> Option<&'a str> {
+    let entry = cache.get(domain)?;
+    if entry.cached_at.elapsed() < ttl {
+        Some(entry.ip.as_str())
+    } else {
+        None
+    }
+}
 
 /// TUN 运行期的解析绕行参数。
 ///
@@ -35,7 +62,8 @@ pub struct AppState {
     /// keeps meaning exactly what it meant before UDP support).
     pub udp_dataflow: Arc<RwLock<DataFlow>>,
     pub config: Arc<RwLock<AppConfig>>,
-    pub connection_id: Arc<RwLock<u32>>,
+    /// 连接 ID 分配器（原子自增，避免每条新连接都拿一次写锁）
+    pub connection_id: Arc<AtomicU32>,
     pub error_pool: Arc<RwLock<Vec<AppError>>>,
     pub dns_resolver: TokioAsyncResolver,
     /// TUN 启动时预解析的代理服务器 IP。TUN 开启后系统 DNS 被自身劫持，
@@ -100,7 +128,7 @@ impl AppState {
             total_dataflow: Arc::new(RwLock::new(DataFlow::new())),
             udp_dataflow: Arc::new(RwLock::new(DataFlow::new())),
             config: Arc::new(RwLock::new(config)),
-            connection_id: Arc::new(RwLock::new(0)),
+            connection_id: Arc::new(AtomicU32::new(0)),
             error_pool: Arc::new(RwLock::new(Vec::new())),
             dns_resolver,
             proxy_resolved_ip: std::sync::RwLock::new(None),
@@ -331,5 +359,37 @@ mod tests {
         assert!(!AppState::load_config(&dir).tun.enable);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// DNS 缓存命中必须遵循 TTL：有效期内命中，过期后视为未命中。
+    #[test]
+    fn dns_cache_lookup_respects_ttl() {
+        let mut cache: DnsCache = HashMap::new();
+        cache.insert(
+            "example.com".to_string(),
+            DnsCacheEntry {
+                ip: "1.2.3.4".to_string(),
+                cached_at: std::time::Instant::now(),
+            },
+        );
+
+        // 有效期内命中
+        assert_eq!(
+            cache_lookup_with_ttl(&cache, "example.com", DNS_CACHE_TTL),
+            Some("1.2.3.4")
+        );
+
+        // TTL 为 0：elapsed() >= 0 恒成立，视为过期未命中
+        assert_eq!(cache_lookup_with_ttl(&cache, "example.com", Duration::ZERO), None);
+
+        // 短 TTL + 睡眠：跨过 TTL 后未命中
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(
+            cache_lookup_with_ttl(&cache, "example.com", Duration::from_millis(20)),
+            None
+        );
+
+        // 不存在的域名
+        assert_eq!(cache_lookup_with_ttl(&cache, "other.com", DNS_CACHE_TTL), None);
     }
 }

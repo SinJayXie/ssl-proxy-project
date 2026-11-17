@@ -159,7 +159,7 @@
   "ACRYLIC_OPACITY": "背景不透明度",
   "ACRYLIC_OPACITY_HINT": "数值越低桌面透出越多，过低会影响文字可读性；需开启亚克力背景。",
   "SETTINGS_TUN": "TUN 虚拟网卡",
-  "SETTINGS_TUN_DESC": "在系统层接管流量并送入代理隧道。需要管理员权限，保存后自动重启生效。",
+  "SETTINGS_TUN_DESC": "在系统层接管流量并送入代理隧道。需要管理员权限，修改即时生效，无需保存或重启。",
   "TUN_ENABLE": "启用 TUN",
   "TUN_ENABLE_ON": "已启用（系统级流量经隧道转发）",
   "TUN_ENABLE_OFF": "已关闭（仅本机 SOCKS5 代理）",

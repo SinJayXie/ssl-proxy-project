@@ -446,12 +446,8 @@ pub async fn resolve_and_connect(
     }
     let is_direct = route.is_direct();
 
-    // Generate connection ID
-    let id = {
-        let mut cid = state.connection_id.write().await;
-        *cid += 1;
-        *cid
-    };
+    // Generate connection ID（原子自增，保持从 1 开始的旧行为）
+    let id = state.connection_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
     // Create connection info
     let conn_info = ConnectionInfo {
@@ -481,8 +477,19 @@ pub async fn resolve_and_connect(
     let time = std::time::Instant::now();
 
     if is_direct {
-        // 用 (host, port) 元组交给 tokio 解析：IPv6 字面量不能用字符串拼接
-        let target = match TcpStream::connect((host, port)).await {
+        // 直连必须用已解析的 IP：TcpStream::connect((host, port)) 会把域名再交给
+        // 系统解析器重新解析一遍（未命中 OS 缓存时实测可达数秒，是直连首连延迟
+        // 的主要来源），且并发首连会一起堵在系统解析上。
+        // IPv6 字面量用 SocketAddr 构造，不能用字符串拼接；解析失败时回退旧行为。
+        let addr = resolved_ip
+            .as_deref()
+            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+            .map(|ip| std::net::SocketAddr::new(ip, port));
+        let attempt = match addr {
+            Some(addr) => TcpStream::connect(addr).await,
+            None => TcpStream::connect((host, port)).await,
+        };
+        let target = match attempt {
             Ok(t) => t,
             Err(e) => {
                 log::error!("Direct connect failed for {}:{}: {}", host, port, e);

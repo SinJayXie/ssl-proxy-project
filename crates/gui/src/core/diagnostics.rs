@@ -167,9 +167,14 @@ async fn check_dns(state: &Arc<AppState>) -> CheckResult {
 #[cfg(target_os = "windows")]
 async fn check_route(tun_prefix: &str) -> CheckResult {
     const NAME: &str = "DIAG_CHECK_ROUTE";
-    let output = std::process::Command::new("route")
-        .args(["print", "-4"])
-        .output();
+    let mut route_cmd = std::process::Command::new("route");
+    route_cmd.args(["print", "-4"]);
+    // CREATE_NO_WINDOW：诊断在 GUI 进程内运行，避免闪 cmd 窗口
+    {
+        use std::os::windows::process::CommandExt;
+        route_cmd.creation_flags(0x0800_0000);
+    }
+    let output = route_cmd.output();
 
     let output = match output {
         Ok(output) if output.status.success() => output,
@@ -292,10 +297,14 @@ pub fn format_report(results: &[CheckResult]) -> String {
 pub fn route_table_text() -> String {
     #[cfg(target_os = "windows")]
     {
-        match std::process::Command::new("route")
-            .args(["print", "-4"])
-            .output()
+        let mut route_cmd = std::process::Command::new("route");
+        route_cmd.args(["print", "-4"]);
+        // CREATE_NO_WINDOW：避免闪 cmd 窗口
         {
+            use std::os::windows::process::CommandExt;
+            route_cmd.creation_flags(0x0800_0000);
+        }
+        match route_cmd.output() {
             Ok(output) if output.status.success() => {
                 String::from_utf8_lossy(&output.stdout).into_owned()
             }

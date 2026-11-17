@@ -117,7 +117,12 @@ fn host_of(shared: &StackShared, ip: IpAddr, fake_range: &str) -> Result<String,
 /// 因此 TUN 期间**所有**解析都要走这里；缓存命中的 fake-ip 视为未命中。
 pub async fn lookup_direct(state: &Arc<AppState>, domain: &str) -> Option<String> {
     let bypass = state.tun_dns_bypass.read().ok().and_then(|g| g.clone())?;
-    let cached = state.dns_cache.read().await.get(domain).cloned();
+    let cached = state
+        .dns_cache
+        .read()
+        .await
+        .get(domain)
+        .map(|e| e.ip.clone());
     let cached = cached.filter(|ip| {
         !ip.parse::<IpAddr>()
             .map(|addr| is_in_fake_ip_pool(&addr, &bypass.fake_ip_range))
@@ -171,7 +176,13 @@ pub async fn lookup_direct(state: &Arc<AppState>, domain: &str) -> Option<String
         .dns_cache
         .write()
         .await
-        .insert(domain, ip.clone());
+        .insert(
+            domain,
+            crate::state::DnsCacheEntry {
+                ip: ip.clone(),
+                cached_at: std::time::Instant::now(),
+            },
+        );
     Some(ip)
 }
 
@@ -288,13 +299,51 @@ async fn handle_tcp(
                 return;
             }
         };
+        let time = std::time::Instant::now();
         match connect_direct(&ip, port, &env).await {
             Ok(target) => {
-                let mut target = target;
-                let mut stream = stream;
-                if let Err(e) = tokio::io::copy_bidirectional(&mut stream, &mut target).await {
-                    log::debug!("TUN direct pump {host}:{port} ended: {e}");
+                // 与 PROXY 路径一致：注册连接表（否则 UI 连接页只有代理连接可见），
+                // 并复用 forward_target_stream 获得相同的流量统计与半关闭语义。
+                let id = state
+                    .connection_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                let geo_info = state
+                    .geo_manager
+                    .get_country_by_ip(&ip)
+                    .map(|c| crate::types::GeoInfo {
+                        country: c.country.clone(),
+                        alpha2_code: c.alpha2_code.clone(),
+                        alpha3_code: c.alpha3_code.clone(),
+                        numeric: c.numeric,
+                    })
+                    .unwrap_or_else(|| crate::types::GeoInfo {
+                        country: "Unknown".to_string(),
+                        alpha2_code: "UNK".to_string(),
+                        alpha3_code: "UNK".to_string(),
+                        numeric: 0,
+                    });
+                let conn_info = crate::types::ConnectionInfo {
+                    host: host.clone(),
+                    port,
+                    id,
+                    ip: ip.clone(),
+                    conn_type: "DIRECT".to_string(),
+                    create_time: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    geo: geo_info,
+                    data: crate::types::DataFlow::new(),
+                    latency_ms: time.elapsed().as_millis() as u64,
+                    // TUN 路径没有 accepted socket 的 peer 端点，进程名暂不采集。
+                    process: String::new(),
+                };
+                {
+                    let mut conns = state.connections.write().await;
+                    conns.insert(id, conn_info);
                 }
+                forward_target_stream(stream, crate::core::proxy::tunnel::TargetStream::Direct(target), id, state).await;
             }
             Err(e) => log::error!("TUN direct {ip}:{port} failed: {e}"),
         }

@@ -159,7 +159,7 @@
   "ACRYLIC_OPACITY": "Background Opacity",
   "ACRYLIC_OPACITY_HINT": "Lower values let more of the desktop show through; too low hurts legibility. Requires acrylic background.",
   "SETTINGS_TUN": "TUN (System Proxy)",
-  "SETTINGS_TUN_DESC": "Capture traffic at the system level and route it through the proxy. Requires administrator privileges; saving restarts the app.",
+  "SETTINGS_TUN_DESC": "Capture traffic at the system level and route it through the proxy. Requires administrator privileges; changes apply immediately without saving or restarting.",
   "TUN_ENABLE": "Enable TUN",
   "TUN_ENABLE_ON": "Enabled (system-wide traffic goes through the tunnel)",
   "TUN_ENABLE_OFF": "Disabled (local SOCKS5 proxy only)",

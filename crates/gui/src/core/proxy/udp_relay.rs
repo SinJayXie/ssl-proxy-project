@@ -482,11 +482,10 @@ async fn create_session(
 
     // 注册连接条目（协议标识 UDP）
     let proxied = !matches!(&tunnel, Tunnel::Direct);
-    let id = {
-        let mut cid = state.connection_id.write().await;
-        *cid += 1;
-        *cid
-    };
+    let id = state
+        .connection_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
     let conn_info = ConnectionInfo {
         host: host.clone(),
         port,

@@ -7,9 +7,9 @@ use crate::ui::{i18n, theme};
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::combobox::{Combobox, ComboboxState};
-use gpui_kit::component::input::{Input, InputState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::searchable_list::SearchableVec;
-use gpui_kit::component::select::{Select, SelectState};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::scroll::ScrollableElement;
@@ -71,6 +71,18 @@ fn tun_scope_from_index(index: usize) -> TunRouteScope {
         1 => TunRouteScope::FakeIp,
         _ => TunRouteScope::Global,
     }
+}
+
+/// 订阅路由范围选择器：确认选择后立即生效（与外观设置一样无需保存）。
+fn subscribe_tun_scope(select: &TunScopeSelect, cx: &mut Context<SettingsPage>) -> Subscription {
+    cx.subscribe(
+        select,
+        |this, _, event: &SelectEvent<SearchableVec<SharedString>>, cx| {
+            if let SelectEvent::Confirm(Some(_)) = event {
+                this.apply_tun_now(cx);
+            }
+        },
+    )
 }
 
 struct SettingsInputs {
@@ -200,6 +212,8 @@ struct TunInputs {
     fake_ip_range: Entity<InputState>,
     fake_ip_range6: Entity<InputState>,
     direct_nameservers: Entity<InputState>,
+    /// 回车/失焦即生效的订阅，必须在页面生命周期内保持存活。
+    _subscriptions: Vec<Subscription>,
 }
 
 impl TunInputs {
@@ -211,22 +225,54 @@ impl TunInputs {
                     .placeholder(placeholder)
             })
         };
+        let device_name = input(&config.device_name, "SSLProxy");
+        let mtu = input(&config.mtu.to_string(), "1500");
+        let udp_timeout = input(&config.udp_timeout.to_string(), "60");
+        let max_connections = input(&config.max_connections.to_string(), "256");
+        let dns_hijack = input(&config.dns_hijack.join(", "), "any:53");
+        let route_exclude_address = input(
+            &config.route_exclude_address.join(", "),
+            "192.168.0.0/16, 10.0.0.0/8",
+        );
+        let fake_ip_range = input(&config.fake_ip_range, "198.18.0.1/16");
+        let fake_ip_range6 = input(&config.fake_ip_range6, "2001:2::0/64");
+        let direct_nameservers = input(
+            &config.direct_nameservers.join(", "),
+            "223.5.5.5, 119.29.29.29",
+        );
+
+        // TUN 不参与手动保存：输入框回车或失焦时校验并立即生效，
+        // 避免每敲一个字符就重建网卡。
+        let mut subscriptions = Vec::new();
+        for state in [
+            &device_name,
+            &mtu,
+            &udp_timeout,
+            &max_connections,
+            &dns_hijack,
+            &route_exclude_address,
+            &fake_ip_range,
+            &fake_ip_range6,
+            &direct_nameservers,
+        ] {
+            subscriptions.push(cx.subscribe(state, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                    this.apply_tun_now(cx);
+                }
+            }));
+        }
+
         Self {
-            device_name: input(&config.device_name, "SSLProxy"),
-            mtu: input(&config.mtu.to_string(), "1500"),
-            udp_timeout: input(&config.udp_timeout.to_string(), "60"),
-            max_connections: input(&config.max_connections.to_string(), "256"),
-            dns_hijack: input(&config.dns_hijack.join(", "), "any:53"),
-            route_exclude_address: input(
-                &config.route_exclude_address.join(", "),
-                "192.168.0.0/16, 10.0.0.0/8",
-            ),
-            fake_ip_range: input(&config.fake_ip_range, "198.18.0.1/16"),
-            fake_ip_range6: input(&config.fake_ip_range6, "2001:2::0/64"),
-            direct_nameservers: input(
-                &config.direct_nameservers.join(", "),
-                "223.5.5.5, 119.29.29.29",
-            ),
+            device_name,
+            mtu,
+            udp_timeout,
+            max_connections,
+            dns_hijack,
+            route_exclude_address,
+            fake_ip_range,
+            fake_ip_range6,
+            direct_nameservers,
+            _subscriptions: subscriptions,
         }
     }
 }
@@ -240,6 +286,8 @@ pub struct SettingsPage {
     mux_enabled: bool,
     tun_inputs: TunInputs,
     tun_route_scope_select: TunScopeSelect,
+    /// 路由范围选择变化后立即生效的订阅（重建选择器时需一并重建）。
+    _tun_scope_subscription: Subscription,
     tun_enabled: bool,
     tun_auto_route: bool,
     tun_strict_route: bool,
@@ -284,6 +332,7 @@ impl SettingsPage {
                 cx,
             )
         });
+        let tun_scope_subscription = subscribe_tun_scope(&tun_route_scope_select, cx);
 
         Self {
             core,
@@ -294,6 +343,7 @@ impl SettingsPage {
             mux_enabled: config.mux_enabled,
             tun_inputs: TunInputs::new(&config.tun, window, cx),
             tun_route_scope_select,
+            _tun_scope_subscription: tun_scope_subscription,
             tun_enabled: config.tun.enable,
             tun_auto_route: config.tun.auto_route,
             tun_strict_route: config.tun.strict_route,
@@ -320,21 +370,25 @@ impl SettingsPage {
     fn toggle_tun(&mut self, checked: &bool, cx: &mut Context<Self>) {
         self.tun_enabled = *checked;
         cx.notify();
+        self.apply_tun_now(cx);
     }
 
     fn toggle_tun_auto_route(&mut self, checked: &bool, cx: &mut Context<Self>) {
         self.tun_auto_route = *checked;
         cx.notify();
+        self.apply_tun_now(cx);
     }
 
     fn toggle_tun_strict_route(&mut self, checked: &bool, cx: &mut Context<Self>) {
         self.tun_strict_route = *checked;
         cx.notify();
+        self.apply_tun_now(cx);
     }
 
     fn toggle_tun_auto_detect_interface(&mut self, checked: &bool, cx: &mut Context<Self>) {
         self.tun_auto_detect_interface = *checked;
         cx.notify();
+        self.apply_tun_now(cx);
     }
 
     /// 清空 fake-ip 映射（内存 + fakeip.json），并提示结果。
@@ -407,11 +461,119 @@ impl SettingsPage {
                 cx,
             )
         });
+        self._tun_scope_subscription = subscribe_tun_scope(&self.tun_route_scope_select, cx);
         self.tun_enabled = self.config.tun.enable;
         self.tun_auto_route = self.config.tun.auto_route;
         self.tun_strict_route = self.config.tun.strict_route;
         self.tun_auto_detect_interface = self.config.tun.auto_detect_interface;
         self.error = None;
+        cx.notify();
+    }
+
+    /// 从当前 UI 状态读取 TUN 配置并校验（即时生效与手动保存共用）。
+    fn read_tun_config(&self, cx: &App) -> Result<TunConfig, String> {
+        let tun = TunConfig {
+            // stack 由后端决定（当前仅 smoltcp 可用），不在 UI 暴露。
+            stack: self.config.tun.stack,
+            enable: self.tun_enabled,
+            device_name: self
+                .tun_inputs
+                .device_name
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+            mtu: self
+                .tun_inputs
+                .mtu
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| i18n::t("VALIDATE_TUN"))?,
+            auto_route: self.tun_auto_route,
+            route_scope: {
+                let labels = tun_scope_labels();
+                self.tun_route_scope_select
+                    .read(cx)
+                    .selected_value()
+                    .and_then(|label| {
+                        labels
+                            .iter()
+                            .position(|l| l.as_ref() == label.as_ref())
+                    })
+                    .map(tun_scope_from_index)
+                    .unwrap_or(TunRouteScope::Global)
+            },
+            udp_timeout: self
+                .tun_inputs
+                .udp_timeout
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| i18n::t("VALIDATE_TUN"))?,
+            max_connections: self
+                .tun_inputs
+                .max_connections
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| i18n::t("VALIDATE_TUN"))?,
+            strict_route: self.tun_strict_route,
+            auto_detect_interface: self.tun_auto_detect_interface,
+            dns_hijack: parse_csv(&self.tun_inputs.dns_hijack.read(cx).value()),
+            route_exclude_address: parse_csv(
+                &self.tun_inputs.route_exclude_address.read(cx).value(),
+            ),
+            fake_ip_range: self
+                .tun_inputs
+                .fake_ip_range
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+            fake_ip_range6: self
+                .tun_inputs
+                .fake_ip_range6
+                .read(cx)
+                .value()
+                .trim()
+                .to_string(),
+            direct_nameservers: parse_csv(&self.tun_inputs.direct_nameservers.read(cx).value()),
+        };
+        tun.validate()
+            .map_err(|e| format!("{}: {}", i18n::t("VALIDATE_TUN"), e))?;
+        Ok(tun)
+    }
+
+    /// TUN 设置即时生效：校验通过后写盘，由 runner 按新配置启停/重建网卡。
+    /// 与外观设置一致——不参与手动保存，也不需要重启应用。
+    fn apply_tun_now(&mut self, cx: &mut Context<Self>) {
+        let tun = match self.read_tun_config(cx) {
+            Ok(tun) => tun,
+            Err(err) => {
+                self.error = Some(err);
+                cx.notify();
+                return;
+            }
+        };
+        // 语义相等（列表顺序无关）时不重复写盘，也不会触发网卡重建。
+        if tun.equal(&self.config.tun) {
+            if self.error.is_some() {
+                self.error = None;
+                cx.notify();
+            }
+            return;
+        }
+
+        let mut config = self.config.clone();
+        config.tun = tun.clone();
+        self.config.tun = tun;
+        self.error = None;
+        // save_config 内部会调用 runner::apply 按新配置启停/重建 TUN。
+        drop(self.core.save_config(config));
         cx.notify();
     }
 
@@ -492,79 +654,7 @@ impl SettingsPage {
                 .unwrap_or(UdpMode::Off)
         };
 
-        let tun = TunConfig {
-            // stack 由后端决定（当前仅 smoltcp 可用），不在 UI 暴露。
-            stack: self.config.tun.stack,
-            enable: self.tun_enabled,
-            device_name: self
-                .tun_inputs
-                .device_name
-                .read(cx)
-                .value()
-                .trim()
-                .to_string(),
-            mtu: self
-                .tun_inputs
-                .mtu
-                .read(cx)
-                .value()
-                .trim()
-                .parse::<u16>()
-                .map_err(|_| i18n::t("VALIDATE_TUN"))?,
-            auto_route: self.tun_auto_route,
-            route_scope: {
-                let labels = tun_scope_labels();
-                self.tun_route_scope_select
-                    .read(cx)
-                    .selected_value()
-                    .and_then(|label| {
-                        labels
-                            .iter()
-                            .position(|l| l.as_ref() == label.as_ref())
-                    })
-                    .map(tun_scope_from_index)
-                    .unwrap_or(TunRouteScope::Global)
-            },
-            udp_timeout: self
-                .tun_inputs
-                .udp_timeout
-                .read(cx)
-                .value()
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| i18n::t("VALIDATE_TUN"))?,
-            max_connections: self
-                .tun_inputs
-                .max_connections
-                .read(cx)
-                .value()
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| i18n::t("VALIDATE_TUN"))?,
-            strict_route: self.tun_strict_route,
-            auto_detect_interface: self.tun_auto_detect_interface,
-            dns_hijack: parse_csv(&self.tun_inputs.dns_hijack.read(cx).value()),
-            route_exclude_address: parse_csv(
-                &self.tun_inputs.route_exclude_address.read(cx).value(),
-            ),
-            fake_ip_range: self
-                .tun_inputs
-                .fake_ip_range
-                .read(cx)
-                .value()
-                .trim()
-                .to_string(),
-            fake_ip_range6: self
-                .tun_inputs
-                .fake_ip_range6
-                .read(cx)
-                .value()
-                .trim()
-                .to_string(),
-            direct_nameservers: parse_csv(&self.tun_inputs.direct_nameservers.read(cx).value()),
-        };
-        tun.validate()
-            .map_err(|e| format!("{}: {}", i18n::t("VALIDATE_TUN"), e))?;
+        let tun = self.read_tun_config(cx)?;
 
         Ok(AppConfig {
             socks_port,
@@ -1000,7 +1090,7 @@ impl Render for SettingsPage {
                 .into_any_element(),
         );
 
-        // TUN：系统级流量接管（需管理员权限，保存后自动重启生效）
+        // TUN：系统级流量接管（需管理员权限，修改即时生效，不参与手动保存）
         let tun_card = section(
             i18n::t("SETTINGS_TUN"),
             i18n::t("SETTINGS_TUN_DESC"),

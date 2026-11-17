@@ -16,6 +16,84 @@ pub enum TargetStream {
     Mux(MuxStream),
 }
 
+// ==================== Per-connection stats helpers ====================
+
+/// 每连接四向计数器（上行/下行总量 + 本连接增量）。
+struct ConnStats {
+    up: Arc<AtomicU64>,
+    down: Arc<AtomicU64>,
+    up_conn: Arc<AtomicU64>,
+    down_conn: Arc<AtomicU64>,
+}
+
+impl ConnStats {
+    fn new() -> Self {
+        Self {
+            up: Arc::new(AtomicU64::new(0)),
+            down: Arc::new(AtomicU64::new(0)),
+            up_conn: Arc::new(AtomicU64::new(0)),
+            down_conn: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn snapshot(&self) -> (u64, u64, u64, u64) {
+        (
+            self.up.load(Ordering::Relaxed),
+            self.down.load(Ordering::Relaxed),
+            self.up_conn.load(Ordering::Relaxed),
+            self.down_conn.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// 每 500ms 把连接计数刷入 connections / total_dataflow。
+///
+/// 计数无变化（空闲连接）时跳过写锁，避免大量连接时与 UI 读取互相竞争；
+/// 观察到的数据与"每 tick 无条件写"完全一致（总量用 max，连接数据等值覆盖）。
+fn spawn_stats_flusher(state: Arc<AppState>, id: u32, s: ConnStats) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last = (0u64, 0u64, 0u64, 0u64);
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            let cur = s.snapshot();
+            if cur == last {
+                continue;
+            }
+            last = cur;
+
+            let mut conns = state.connections.write().await;
+            if let Some(info) = conns.get_mut(&id) {
+                info.data.up = cur.2;
+                info.data.down = cur.3;
+            }
+            drop(conns);
+
+            let mut total_df = state.total_dataflow.write().await;
+            total_df.up = total_df.up.max(cur.0);
+            total_df.down = total_df.down.max(cur.1);
+            total_df.total = total_df.up + total_df.down;
+        }
+    })
+}
+
+/// 连接结束后做一次权威刷写（与改动前逐条连接的收尾逻辑一致）。
+async fn finalize_stats(state: &Arc<AppState>, id: u32, s: &ConnStats) {
+    let (u, d, uc, dc) = s.snapshot();
+    {
+        let mut conns = state.connections.write().await;
+        if let Some(info) = conns.get_mut(&id) {
+            info.data.up = uc;
+            info.data.down = dc;
+        }
+    }
+    {
+        let mut total_df = state.total_dataflow.write().await;
+        total_df.up = total_df.up.max(u);
+        total_df.down = total_df.down.max(d);
+        total_df.total = total_df.up + total_df.down;
+    }
+}
+
 // ==================== Track / forward helpers ====================
 
 /// Track bytes copied with atomic counters (lock-free per-chunk updates)
@@ -29,7 +107,8 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut buf = [0u8; 8192];
+    // 64KB：高吞吐下减少 syscall 次数（原 8KB）
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         let n = reader.read(&mut buf).await?;
         if n == 0 {
@@ -56,48 +135,23 @@ pub async fn forward_bidirectional<R1, W1, R2, W2>(
     R2: tokio::io::AsyncRead + Unpin,
     W2: tokio::io::AsyncWrite + Unpin,
 {
-    let up = Arc::new(AtomicU64::new(0));
-    let down = Arc::new(AtomicU64::new(0));
-    let up_conn = Arc::new(AtomicU64::new(0));
-    let down_conn = Arc::new(AtomicU64::new(0));
-
-    let up_clone = up.clone();
-    let down_clone = down.clone();
-    let up_conn_clone = up_conn.clone();
-    let down_conn_clone = down_conn.clone();
-
-    let state_clone = Arc::clone(&state);
-    let flush_handle = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            let u = up_clone.load(Ordering::Relaxed);
-            let d = down_clone.load(Ordering::Relaxed);
-            let uc = up_conn_clone.load(Ordering::Relaxed);
-            let dc = down_conn_clone.load(Ordering::Relaxed);
-
-            let mut conns = state_clone.connections.write().await;
-            if let Some(info) = conns.get_mut(&id) {
-                info.data.up = uc;
-                info.data.down = dc;
-            }
-            drop(conns);
-
-            let mut total_df = state_clone.total_dataflow.write().await;
-            total_df.up = total_df.up.max(u);
-            total_df.down = total_df.down.max(d);
-            total_df.total = total_df.up + total_df.down;
-        }
+    let stats = ConnStats::new();
+    let flush_handle = spawn_stats_flusher(Arc::clone(&state), id, ConnStats {
+        up: Arc::clone(&stats.up),
+        down: Arc::clone(&stats.down),
+        up_conn: Arc::clone(&stats.up_conn),
+        down_conn: Arc::clone(&stats.down_conn),
     });
 
     // half-close：任一方向 EOF 后只关闭"对应写半边"，另一方向继续转发，
     // 直到双方都结束（HTTP/1.1、WebSocket、SSH 等依赖半关闭的协议需要）。
     let c2t = async {
-        let r = track_copy(&mut cr, &mut tw, &up, &up_conn).await;
+        let r = track_copy(&mut cr, &mut tw, &stats.up, &stats.up_conn).await;
         let _ = tw.shutdown().await;
         r
     };
     let t2c = async {
-        let r = track_copy(&mut tr, &mut cw, &down, &down_conn).await;
+        let r = track_copy(&mut tr, &mut cw, &stats.down, &stats.down_conn).await;
         let _ = cw.shutdown().await;
         r
     };
@@ -111,25 +165,7 @@ pub async fn forward_bidirectional<R1, W1, R2, W2>(
     }
 
     flush_handle.abort();
-
-    let u = up.load(Ordering::Relaxed);
-    let d = down.load(Ordering::Relaxed);
-    let uc = up_conn.load(Ordering::Relaxed);
-    let dc = down_conn.load(Ordering::Relaxed);
-
-    {
-        let mut conns = state.connections.write().await;
-        if let Some(info) = conns.get_mut(&id) {
-            info.data.up = uc;
-            info.data.down = dc;
-        }
-    }
-    {
-        let mut total_df = state.total_dataflow.write().await;
-        total_df.up = total_df.up.max(u);
-        total_df.down = total_df.down.max(d);
-        total_df.total = total_df.up + total_df.down;
-    }
+    finalize_stats(&state, id, &stats).await;
 }
 
 /// Forward bidirectional using TargetStream
@@ -173,37 +209,12 @@ pub async fn forward_padded_bidirectional<C>(
     let (mut cr, mut cw) = tokio::io::split(client);
     let (mut tr, mut tw) = tokio::io::split(target);
 
-    let up = Arc::new(AtomicU64::new(0));
-    let down = Arc::new(AtomicU64::new(0));
-    let up_conn = Arc::new(AtomicU64::new(0));
-    let down_conn = Arc::new(AtomicU64::new(0));
-
-    let up_clone = up.clone();
-    let down_clone = down.clone();
-    let up_conn_clone = up_conn.clone();
-    let down_conn_clone = down_conn.clone();
-
-    let state_clone = Arc::clone(&state);
-    let flush_handle = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            let u = up_clone.load(Ordering::Relaxed);
-            let d = down_clone.load(Ordering::Relaxed);
-            let uc = up_conn_clone.load(Ordering::Relaxed);
-            let dc = down_conn_clone.load(Ordering::Relaxed);
-
-            let mut conns = state_clone.connections.write().await;
-            if let Some(info) = conns.get_mut(&id) {
-                info.data.up = uc;
-                info.data.down = dc;
-            }
-            drop(conns);
-
-            let mut total_df = state_clone.total_dataflow.write().await;
-            total_df.up = total_df.up.max(u);
-            total_df.down = total_df.down.max(d);
-            total_df.total = total_df.up + total_df.down;
-        }
+    let stats = ConnStats::new();
+    let flush_handle = spawn_stats_flusher(Arc::clone(&state), id, ConnStats {
+        up: Arc::clone(&stats.up),
+        down: Arc::clone(&stats.down),
+        up_conn: Arc::clone(&stats.up_conn),
+        down_conn: Arc::clone(&stats.down_conn),
     });
 
     // c -> t：原始字节 -> 分帧 + padding
@@ -220,8 +231,8 @@ pub async fn forward_padded_bidirectional<C>(
             if tw.write_all(&out).await.is_err() {
                 break;
             }
-            up.fetch_add(n as u64, Ordering::Relaxed);
-            up_conn.fetch_add(n as u64, Ordering::Relaxed);
+            stats.up.fetch_add(n as u64, Ordering::Relaxed);
+            stats.up_conn.fetch_add(n as u64, Ordering::Relaxed);
         }
         let _ = tw.shutdown().await;
     };
@@ -244,11 +255,11 @@ pub async fn forward_padded_bidirectional<C>(
                 if cw.write_all(&payload).await.is_err() {
                     break;
                 }
-                down.fetch_add(payload.len() as u64, Ordering::Relaxed);
-                down_conn.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                stats.down.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                stats.down_conn.fetch_add(payload.len() as u64, Ordering::Relaxed);
             }
             if flag == FLAG_RAW {
-                if let Err(e) = track_copy(&mut tr, &mut cw, &down, &down_conn).await {
+                if let Err(e) = track_copy(&mut tr, &mut cw, &stats.down, &stats.down_conn).await {
                     log::debug!("t2c raw pipe closed: {}", e);
                 }
                 break;
@@ -259,25 +270,7 @@ pub async fn forward_padded_bidirectional<C>(
 
     tokio::join!(c2t, t2c);
     flush_handle.abort();
-
-    let u = up.load(Ordering::Relaxed);
-    let d = down.load(Ordering::Relaxed);
-    let uc = up_conn.load(Ordering::Relaxed);
-    let dc = down_conn.load(Ordering::Relaxed);
-
-    {
-        let mut conns = state.connections.write().await;
-        if let Some(info) = conns.get_mut(&id) {
-            info.data.up = uc;
-            info.data.down = dc;
-        }
-    }
-    {
-        let mut total_df = state.total_dataflow.write().await;
-        total_df.up = total_df.up.max(u);
-        total_df.down = total_df.down.max(d);
-        total_df.total = total_df.up + total_df.down;
-    }
+    finalize_stats(&state, id, &stats).await;
 }
 
 /// Mux 模式：这条连接与其他流共享同一条已认证的 TLS 隧道。
@@ -292,37 +285,12 @@ pub async fn forward_mux_bidirectional<C>(
     let (mut cr, mut cw) = tokio::io::split(client);
     let (mut reader, writer) = stream.split();
 
-    let up = Arc::new(AtomicU64::new(0));
-    let down = Arc::new(AtomicU64::new(0));
-    let up_conn = Arc::new(AtomicU64::new(0));
-    let down_conn = Arc::new(AtomicU64::new(0));
-
-    let up_clone = up.clone();
-    let down_clone = down.clone();
-    let up_conn_clone = up_conn.clone();
-    let down_conn_clone = down_conn.clone();
-
-    let state_clone = Arc::clone(&state);
-    let flush_handle = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            let u = up_clone.load(Ordering::Relaxed);
-            let d = down_clone.load(Ordering::Relaxed);
-            let uc = up_conn_clone.load(Ordering::Relaxed);
-            let dc = down_conn_clone.load(Ordering::Relaxed);
-
-            let mut conns = state_clone.connections.write().await;
-            if let Some(info) = conns.get_mut(&id) {
-                info.data.up = uc;
-                info.data.down = dc;
-            }
-            drop(conns);
-
-            let mut total_df = state_clone.total_dataflow.write().await;
-            total_df.up = total_df.up.max(u);
-            total_df.down = total_df.down.max(d);
-            total_df.total = total_df.up + total_df.down;
-        }
+    let stats = ConnStats::new();
+    let flush_handle = spawn_stats_flusher(Arc::clone(&state), id, ConnStats {
+        up: Arc::clone(&stats.up),
+        down: Arc::clone(&stats.down),
+        up_conn: Arc::clone(&stats.up_conn),
+        down_conn: Arc::clone(&stats.down_conn),
     });
 
     // 本地 -> mux 流
@@ -336,8 +304,8 @@ pub async fn forward_mux_bidirectional<C>(
             if writer.send(&buf[..n]).await.is_err() {
                 break;
             }
-            up.fetch_add(n as u64, Ordering::Relaxed);
-            up_conn.fetch_add(n as u64, Ordering::Relaxed);
+            stats.up.fetch_add(n as u64, Ordering::Relaxed);
+            stats.up_conn.fetch_add(n as u64, Ordering::Relaxed);
         }
         writer.shutdown().await;
     };
@@ -350,8 +318,8 @@ pub async fn forward_mux_bidirectional<C>(
                     if cw.write_all(&data).await.is_err() {
                         break;
                     }
-                    down.fetch_add(data.len() as u64, Ordering::Relaxed);
-                    down_conn.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    stats.down.fetch_add(data.len() as u64, Ordering::Relaxed);
+                    stats.down_conn.fetch_add(data.len() as u64, Ordering::Relaxed);
                     // 已消费：返还下载方向窗口，避免服务端单流窗口耗尽
                     reader.ack(data.len()).await;
                 }
@@ -367,23 +335,5 @@ pub async fn forward_mux_bidirectional<C>(
 
     tokio::join!(c2t, t2c);
     flush_handle.abort();
-
-    let u = up.load(Ordering::Relaxed);
-    let d = down.load(Ordering::Relaxed);
-    let uc = up_conn.load(Ordering::Relaxed);
-    let dc = down_conn.load(Ordering::Relaxed);
-
-    {
-        let mut conns = state.connections.write().await;
-        if let Some(info) = conns.get_mut(&id) {
-            info.data.up = uc;
-            info.data.down = dc;
-        }
-    }
-    {
-        let mut total_df = state.total_dataflow.write().await;
-        total_df.up = total_df.up.max(u);
-        total_df.down = total_df.down.max(d);
-        total_df.total = total_df.up + total_df.down;
-    }
+    finalize_stats(&state, id, &stats).await;
 }

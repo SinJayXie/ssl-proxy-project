@@ -1,16 +1,14 @@
 {
-    "version":  "2.6.2",
+    "version":  "2.7.0",
     "changelog":  [
-                      "Logs: filter by level, keyword search, export the filtered lines, and generate a one-click diagnostics bundle",
-                      "New Diagnostics page: local proxy port, upstream reachability, DNS resolution, IPv4 route table and TUN self-check, with a copyable report",
-                      "Connections: search, sort by time / traffic / latency / host, PROXY vs DIRECT filter and per-process filter",
-                      "Connections: process names are captured on Windows via the TCP/UDP owner tables",
-                      "Compliance: the installer ships THIRD-PARTY-NOTICES.md and the Wintun GPLv2 license; the About page opens a third-party notices dialog",
-                      "Compliance: cargo-deny and cargo-audit run in CI with a permissive-license allow-list",
-                      "UI: hover highlights now follow the rounded corners of cards in Connections, Rules and Rule Tester",
-                      "Fixes: log reading keeps up to 2 MB without splitting UTF-8; the diagnostics bundle redacts credentials"
+                      "Performance: DNS lookups no longer serialize concurrent connections; cache entries expire after 5 minutes",
+                      "Performance: direct connections dial the already-resolved IP, so first connections to a new host no longer take seconds",
+                      "Connections: TUN direct connections now appear in the connections page with geo info, latency and traffic stats",
+                      "TUN: TUN settings apply immediately on change - no Save button and no app restart needed",
+                      "TUN: route commands no longer flash console windows on TUN toggle or diagnostics",
+                      "Security: rate-limit tables swept periodically, logs rotate at 10 MB, log viewer reads only the tail, fake-ip pool prefixes validated"
                   ],
-    "downloadUrl":  "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.6.2_x64-setup.exe",
-    "sha256":  "256d5e50eeb70d9a9f491dbcf7e5d0287d8630a9aefecabbc553178b45349280",
-    "signature":  "e060d3f06696115ea133dc248a3b698112059dd2380173e5c828e4a67654d154c4d91499598f84679386cad1b119bd2c992fe311eac741559fe6b126e6666307"
+    "downloadUrl":  "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.7.0_x64-setup.exe",
+    "sha256":  "92eb56393ce225ef3937cec8bb9703d8cbb08968470aa1ba53e753e23d75f249",
+    "signature":  "4d433c8233ce7d592e16b5738ed7efd2c36afcaad19e3063d696708b52589e261e13e19b34aeacc21238f0f1baad58378a74dd88583ebe315fabdd58c76f8607"
 }
