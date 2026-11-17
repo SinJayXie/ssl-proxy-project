@@ -193,11 +193,27 @@ impl Core {
     }
 
     /// Last `max_bytes` bytes of `app.log`, trimmed to a UTF-8 char boundary.
+    ///
+    /// 通过 seek 只读取文件尾部（而非整个文件读入内存），
+    /// 避免日志变大时每次刷新都产生内存尖峰。
     pub fn read_logs_tail(&self, max_bytes: usize) -> String {
+        use std::io::{Read, Seek, SeekFrom};
         let path = self.state.config_dir.join("app.log");
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(mut file) = std::fs::File::open(&path) else {
             return "No logs yet".to_string();
         };
+        let len = match file.metadata() {
+            Ok(meta) => meta.len(),
+            Err(_) => return "No logs yet".to_string(),
+        };
+        let start = len.saturating_sub(max_bytes as u64);
+        if file.seek(SeekFrom::Start(start)).is_err() {
+            return "No logs yet".to_string();
+        }
+        let mut bytes = Vec::with_capacity((len - start) as usize);
+        if file.read_to_end(&mut bytes).is_err() {
+            return "No logs yet".to_string();
+        }
         tail_utf8(&bytes, max_bytes)
     }
 

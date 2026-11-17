@@ -102,10 +102,10 @@ impl FakeIpMap {
         let (base, prefix) = pool.split_once('/')?;
         let prefix: u32 = prefix.parse().ok()?;
         let base: std::net::Ipv4Addr = base.parse().ok()?;
-        if prefix < 8 {
+        if !(8..=32).contains(&prefix) {
             return None;
         }
-        let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+        let mask = u32::MAX << (32 - prefix);
         let base_u32 = u32::from(base) & mask;
         let capacity = 1u32 << (32 - prefix).min(24);
         let usable = capacity.saturating_sub(4);
@@ -114,7 +114,9 @@ impl FakeIpMap {
         }
         for i in 0..usable {
             let offset = (self.next_v4 + i) % usable;
-            let ip = std::net::Ipv4Addr::from(base_u32 + 3 + offset);
+            // checked_add 防止池靠近地址空间顶部时溢出（如 255.0.0.0/8）
+            let ip_u32 = base_u32.checked_add(3)?.checked_add(offset)?;
+            let ip = std::net::Ipv4Addr::from(ip_u32);
             let ip_str = ip.to_string();
             if !self.reverse.contains_key(&ip_str) {
                 self.insert(domain, &ip_str);

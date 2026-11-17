@@ -1,9 +1,14 @@
 //! 内存级 IP 限流 + 黑名单（基于 DashMap，并发安全）
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+
+/// 每累计 N 次写入做一次过期清扫，避免 `records` / `blacklist`
+/// 随大量不同源 IP 无界增长（内存泄漏）。
+const SWEEP_EVERY: u64 = 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub struct RateLimitConfig {
@@ -36,6 +41,7 @@ pub struct RateLimit {
     records: Arc<DashMap<String, RateRecord>>,
     blacklist: Arc<DashMap<String, u64>>,
     config: RateLimitConfig,
+    ops: Arc<AtomicU64>,
 }
 
 impl RateLimit {
@@ -44,7 +50,17 @@ impl RateLimit {
             records: Arc::new(DashMap::new()),
             blacklist: Arc::new(DashMap::new()),
             config,
+            ops: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// 惰性清扫过期条目：周期窗口外的计数记录与已过期的黑名单项。
+    fn sweep(&self, now: u64) {
+        let rate_ms = self.config.rate_time.as_millis() as u64;
+        self.records.retain(|_, rec| {
+            now.saturating_sub(rec.time_ms) < rate_ms
+        });
+        self.blacklist.retain(|_, expiry| *expiry > now);
     }
 
     /// 只检查黑名单（不计数）：供"已封禁则跳过昂贵校验"的路径使用
@@ -66,6 +82,11 @@ impl RateLimit {
             return false;
         }
         let now = current_millis();
+
+        // 每 SWEEP_EVERY 次写入清扫一次过期条目，防止无界增长
+        if self.ops.fetch_add(1, Ordering::Relaxed) % SWEEP_EVERY == 0 {
+            self.sweep(now);
+        }
 
         let rate_ms = self.config.rate_time.as_millis() as u64;
         let max = self.config.max_requests;

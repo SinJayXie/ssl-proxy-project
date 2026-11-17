@@ -21,6 +21,9 @@ impl Write for TeeWriter {
     }
 }
 
+/// app.log / crash.log 的大小上限：超过后轮转（app.log → app.log.1）或截断重开
+const MAX_LOG_FILE_SIZE: u64 = 10 * 1024 * 1024;
+
 /// 把 panic 落盘到 `<config_dir>/crash.log`。
 ///
 /// release 构建使用 `panic="abort"` 且 GUI 进程没有控制台，panic 信息会
@@ -29,6 +32,12 @@ impl Write for TeeWriter {
 fn install_panic_hook(config_dir: &Path) {
     let path = config_dir.join("crash.log");
     std::panic::set_hook(Box::new(move |info| {
+        // 防止 crash.log 跨会话无限增长：超过上限时重开
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > MAX_LOG_FILE_SIZE {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
         let backtrace = std::backtrace::Backtrace::force_capture();
         let message = format!("[PANIC] {info}\n{backtrace}\n");
         if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -52,6 +61,12 @@ pub fn init(config_dir: &Path) {
     install_panic_hook(config_dir);
 
     let log_path = config_dir.join("app.log");
+    // 简单轮转：上一会话的日志超过上限时移到 app.log.1，避免单文件无限增长
+    if let Ok(meta) = std::fs::metadata(&log_path) {
+        if meta.len() > MAX_LOG_FILE_SIZE {
+            let _ = std::fs::rename(&log_path, config_dir.join("app.log.1"));
+        }
+    }
     let log_file = match File::create(&log_path) {
         Ok(file) => file,
         Err(err) => {
