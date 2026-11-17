@@ -29,3 +29,9 @@ pub mod recovery;
 pub mod route;
 pub mod routes;
 pub mod runner;
+
+/// TUN 仅在 Windows 上提供（WinTun + IpHelper）。
+///
+/// 其他平台既不显示设置入口，也会在 [`runner::apply`] 里直接拒绝启动，
+/// 避免把只对 Windows 有意义的配置（路由、网卡名）带到 macOS/Linux。
+pub const TUN_SUPPORTED: bool = cfg!(target_os = "windows");

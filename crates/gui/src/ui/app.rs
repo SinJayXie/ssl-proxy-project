@@ -3,7 +3,8 @@ use crate::core::types::{ApiAppInfo, AppError, CheckUpdateResult, DataFlow, Down
 use crate::core::Core;
 use crate::ui::assets::mdi;
 use crate::ui::pages::{
-    AboutPage, ChangelogPage, ConnectionsPage, LogsPage, RulesPage, SettingsPage, TestRulePage,
+    AboutPage, ChangelogPage, ConnectionsPage, DiagnosticsPage, LogsPage, RulesPage,
+    SettingsPage, TestRulePage,
 };
 use crate::ui::prefs::Prefs;
 use crate::ui::{i18n, theme, util};
@@ -32,6 +33,7 @@ enum Page {
     Dashboard,
     Connections,
     Logs,
+    Diagnostics,
     Rules,
     TestRule,
     Settings,
@@ -39,10 +41,11 @@ enum Page {
     About,
 }
 
-const NAV_ITEMS: [(Page, &str, &str); 8] = [
+const NAV_ITEMS: [(Page, &str, &str); 9] = [
     (Page::Dashboard, "view-dashboard-outline", "APP"),
     (Page::Connections, "lan-connect", "CONNECTIONS"),
     (Page::Logs, "text-box-outline", "LOG"),
+    (Page::Diagnostics, "shield-alert-outline", "DIAGNOSTICS"),
     (Page::Rules, "filter-variant", "RULES"),
     (Page::TestRule, "flask-outline", "TEST_RULE"),
     (Page::Settings, "cog-outline", "SETTINGS"),
@@ -57,6 +60,7 @@ pub struct AppShell {
     dashboard: Entity<DashboardPage>,
     connections: Entity<ConnectionsPage>,
     logs: Entity<LogsPage>,
+    diagnostics: Entity<DiagnosticsPage>,
     rules: Entity<RulesPage>,
     test_rule: Entity<TestRulePage>,
     settings: Entity<SettingsPage>,
@@ -85,10 +89,11 @@ impl AppShell {
         cx: &mut Context<Self>,
     ) -> Self {
         let dashboard = cx.new(|cx| DashboardPage::new(core.clone(), cx));
-        let logs = cx.new(|cx| LogsPage::new(core.clone(), cx));
+        let logs = cx.new(|cx| LogsPage::new(core.clone(), window, cx));
+        let diagnostics = cx.new(|_| DiagnosticsPage::new(core.clone()));
         let rules = cx.new(|cx| RulesPage::new(core.clone(), cx));
         let connections = cx.new(|cx| {
-            ConnectionsPage::new(core.clone(), rules.downgrade(), cx)
+            ConnectionsPage::new(core.clone(), rules.downgrade(), window, cx)
         });
         let test_rule = cx.new(|cx| {
             TestRulePage::new(core.clone(), rules.downgrade(), window, cx)
@@ -114,6 +119,7 @@ impl AppShell {
             let updated = this.update(cx, |shell, cx| {
                 shell.dashboard.update(cx, |_, cx| cx.notify());
                 shell.connections.update(cx, |_, cx| cx.notify());
+                shell.diagnostics.update(cx, |_, cx| cx.notify());
                 shell.rules.update(cx, |_, cx| cx.notify());
                 shell.test_rule.update(cx, |_, cx| cx.notify());
                 shell.settings.update(cx, |_, cx| cx.notify());
@@ -166,6 +172,7 @@ impl AppShell {
         {
             "connections" => Page::Connections,
             "logs" => Page::Logs,
+            "diagnostics" => Page::Diagnostics,
             "rules" => Page::Rules,
             "test" => Page::TestRule,
             "settings" => Page::Settings,
@@ -181,6 +188,7 @@ impl AppShell {
             dashboard,
             connections,
             logs,
+            diagnostics,
             rules,
             test_rule,
             settings,
@@ -803,6 +811,7 @@ impl Render for AppShell {
                 Page::Dashboard => self.dashboard.clone().into_any_element(),
                 Page::Connections => self.connections.clone().into_any_element(),
                 Page::Logs => self.logs.clone().into_any_element(),
+                Page::Diagnostics => self.diagnostics.clone().into_any_element(),
                 Page::Rules => self.rules.clone().into_any_element(),
                 Page::TestRule => self.test_rule.clone().into_any_element(),
                 Page::Settings => self.settings.clone().into_any_element(),

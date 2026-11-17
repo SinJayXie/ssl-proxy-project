@@ -1,14 +1,17 @@
 //! TUN 系统路由的生成与执行（Windows `route` 命令）。
 //!
-//! 设计对应研究方案 12.5/12.6：
-//! - 默认路由指向 TUN（metric 100，低优先级）；
-//! - 代理节点 IP 与私网段写成指向**物理网关**的 metric 1 主机路由，
-//!   保证隧道出站与直连出站绝不二次进入 TUN（防自环死锁）；
-//! - down 程序与 up 对称，崩溃/退出时由 runner 按序回滚。
+//! 设计对应研究方案 12.5/12.6，按 [`TunConfig::route_scope`] 分两种路由范围：
+//! - `global`：默认路由指向 TUN（0.0.0.0/1 + 128.0.0.0/1，metric 100，低优先级）；
+//!   代理节点 IP 与私网段写成指向**物理网关**的 metric 1 路由，保证隧道出站与
+//!   直连出站绝不二次进入 TUN（防自环死锁）。
+//! - `fake-ip`：只把 fake-ip 池网段（如 198.18.0.0/16）路由进 TUN，不接管整机
+//!   默认路由、也不写任何例外，物理网络保持原样。
+//!
+//! 两种范围的 down 程序都与 up 对称，崩溃/退出时由 runner 按序回滚。
 //!
 //! 命令生成是纯函数（可测）；`execute` 只负责跑 `route.exe`。
 
-use super::config::TunConfig;
+use super::config::{TunConfig, TunRouteScope};
 use super::netinfo::PhysicalRoute;
 use std::net::Ipv4Addr;
 
@@ -70,6 +73,11 @@ pub fn cidr_to_mask(prefix: u8) -> Ipv4Addr {
     Ipv4Addr::from(v)
 }
 
+/// 取 CIDR 的网络地址（主机位清零）。
+pub fn network_v4(addr: Ipv4Addr, prefix: u8) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(addr) & u32::from(cidr_to_mask(prefix)))
+}
+
 /// 解析 CIDR 列表，仅保留 IPv4 项（IPv6 路由本阶段暂不支持，静默跳过）。
 pub fn parse_v4_cidrs(cidrs: &[String]) -> Vec<(Ipv4Addr, u8)> {
     cidrs
@@ -85,6 +93,10 @@ pub fn parse_v4_cidrs(cidrs: &[String]) -> Vec<(Ipv4Addr, u8)> {
 
 /// 生成 up/down 路由程序。
 ///
+/// 路由范围由 `tun.route_scope` 决定：
+/// - `global`：两条 /1 默认路由指向 TUN + 例外走物理网关；
+/// - `fake-ip`：只有 fake-ip 池网段指向 TUN，不写 /1、不写例外。
+///
 /// - `tun_gateway`：TUN 自身地址（198.18.0.1），默认路由下一跳；
 /// - `physical`：装路由**之前**探测的物理接口/网关；
 /// - `excludes`：需绕过 TUN 的基集网段（代理节点 IP + 用户显式排除，来自
@@ -97,31 +109,59 @@ pub fn build_program(
     physical: &PhysicalRoute,
     excludes: &[String],
 ) -> RouteProgram {
+    // auto-route 关闭：路由由用户自行管理，不安装任何路由（对齐 meow-rs）。
+    if !tun.auto_route {
+        return RouteProgram { up: Vec::new(), down: Vec::new() };
+    }
+
     let mut up = Vec::new();
     let mut down = Vec::new();
-    // 按 strict_route 决定私网段是否写例外（严格模式不写 → 私网流量也进 TUN）。
-    let excludes = effective_excludes(tun.strict_route, excludes);
 
-    // 默认路由 → TUN。metric 100 低于所有例外路由（metric 1）。
-    let default = format!(
-        "route add 0.0.0.0 mask 0.0.0.0 {tun_gateway} metric 100 if {tun_if_index}"
-    );
-    up.push(default);
-    down.push(format!(
-        "route delete 0.0.0.0 mask 0.0.0.0 {tun_gateway}"
-    ));
+    match tun.route_scope {
+        TunRouteScope::Global => {
+            // 按 strict_route 决定私网段是否写例外（严格模式不写 → 私网流量也进 TUN）。
+            let excludes = effective_excludes(tun.strict_route, excludes);
 
-    // 例外：指向物理网关，metric 1 必胜 TUN 默认路由。
-    for (addr, prefix) in parse_v4_cidrs(&excludes) {
-        let mask = cidr_to_mask(prefix);
-        up.push(format!(
-            "route add {addr} mask {mask} {} metric 1 if {}",
-            physical.gateway, physical.if_index
-        ));
-        down.push(format!(
-            "route delete {addr} mask {mask} {}",
-            physical.gateway
-        ));
+            // 默认路由 → TUN。对齐 meow-rs global scope：拆成两条 /1，比系统
+            // 默认路由更具体，因此无需改动、也不会误删用户原有的 0.0.0.0/0。
+            for (dest, mask) in [("0.0.0.0", "128.0.0.0"), ("128.0.0.0", "128.0.0.0")] {
+                up.push(format!(
+                    "route add {dest} mask {mask} {tun_gateway} metric 100 if {tun_if_index}"
+                ));
+                down.push(format!("route delete {dest} mask {mask} {tun_gateway}"));
+            }
+
+            // 例外：指向物理网关，metric 1 必胜 TUN 默认路由。
+            for (addr, prefix) in parse_v4_cidrs(&excludes) {
+                let mask = cidr_to_mask(prefix);
+                up.push(format!(
+                    "route add {addr} mask {mask} {} metric 1 if {}",
+                    physical.gateway, physical.if_index
+                ));
+                down.push(format!(
+                    "route delete {addr} mask {mask} {}",
+                    physical.gateway
+                ));
+            }
+        }
+        TunRouteScope::FakeIp => {
+            // 只接管 fake-ip 池：解析失败时返回空程序，不写任何路由。
+            // （该字段在配置校验阶段已保证是合法 CIDR，这里仅做兜底。）
+            let parsed = tun.fake_ip_range.split_once('/').and_then(|(addr, prefix)| {
+                let addr: Ipv4Addr = addr.parse().ok()?;
+                let prefix: u8 = prefix.parse().ok()?;
+                (prefix <= 32).then_some((addr, prefix))
+            });
+            let Some((addr, prefix)) = parsed else {
+                return RouteProgram { up, down };
+            };
+            let network = network_v4(addr, prefix);
+            let mask = cidr_to_mask(prefix);
+            up.push(format!(
+                "route add {network} mask {mask} {tun_gateway} metric 1 if {tun_if_index}"
+            ));
+            down.push(format!("route delete {network} mask {mask} {tun_gateway}"));
+        }
     }
 
     RouteProgram { up, down }
@@ -155,7 +195,7 @@ pub fn execute(cmds: &[String]) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::tun::config::TunConfig;
+    use crate::core::tun::config::{TunConfig, TunRouteScope};
 
     fn physical() -> PhysicalRoute {
         PhysicalRoute {
@@ -179,13 +219,53 @@ mod tests {
         let excludes = vec!["1.2.3.4/32".to_string(), "10.0.0.0/8".to_string()];
         let prog = build_program(&tun, 77, "198.18.0.1".parse().unwrap(), &physical(), &excludes);
 
-        assert!(prog.up.iter().any(|c| c.contains("route add 0.0.0.0 mask 0.0.0.0 198.18.0.1 metric 100 if 77")));
+        assert!(prog.up.iter().any(|c| c.contains("route add 0.0.0.0 mask 128.0.0.0 198.18.0.1 metric 100 if 77")));
+        assert!(prog.up.iter().any(|c| c.contains("route add 128.0.0.0 mask 128.0.0.0 198.18.0.1 metric 100 if 77")));
         // 例外走物理网关 + metric 1。
         assert!(prog.up.iter().any(|c| c.contains("route add 1.2.3.4 mask 255.255.255.255 192.168.1.1 metric 1 if 12")));
         assert!(prog.up.iter().any(|c| c.contains("route add 10.0.0.0 mask 255.0.0.0 192.168.1.1 metric 1 if 12")));
         // down 对称删除。
-        assert!(prog.down.iter().any(|c| c.contains("route delete 0.0.0.0 mask 0.0.0.0 198.18.0.1")));
+        assert!(prog.down.iter().any(|c| c.contains("route delete 0.0.0.0 mask 128.0.0.0 198.18.0.1")));
+        assert!(prog.down.iter().any(|c| c.contains("route delete 128.0.0.0 mask 128.0.0.0 198.18.0.1")));
         assert!(prog.down.iter().any(|c| c.contains("route delete 1.2.3.4 mask 255.255.255.255 192.168.1.1")));
+    }
+
+    #[test]
+    fn network_address_clears_host_bits() {
+        assert_eq!(network_v4("198.18.0.1".parse().unwrap(), 16), "198.18.0.0".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(network_v4("198.18.0.1".parse().unwrap(), 30), "198.18.0.0".parse::<Ipv4Addr>().unwrap());
+        // prefix=0 边界：整个地址空间即 0.0.0.0/0。
+        assert_eq!(network_v4("1.2.3.4".parse().unwrap(), 0), Ipv4Addr::UNSPECIFIED);
+    }
+
+    #[test]
+    fn auto_route_off_installs_nothing() {
+        let tun = TunConfig {
+            auto_route: false,
+            ..Default::default()
+        };
+        let excludes = vec!["1.2.3.4/32".to_string()];
+        let prog = build_program(&tun, 77, "198.18.0.1".parse().unwrap(), &physical(), &excludes);
+        assert!(prog.up.is_empty());
+        assert!(prog.down.is_empty());
+    }
+
+    #[test]
+    fn fake_ip_scope_only_routes_fake_ip_pool() {
+        let tun = TunConfig {
+            route_scope: TunRouteScope::FakeIp,
+            ..Default::default()
+        };
+        let excludes = vec!["1.2.3.4/32".to_string(), "10.0.0.0/8".to_string()];
+        let prog = build_program(&tun, 77, "198.18.0.1".parse().unwrap(), &physical(), &excludes);
+
+        assert_eq!(prog.up.len(), 1);
+        assert_eq!(prog.down.len(), 1);
+        assert!(prog.up[0].contains("route add 198.18.0.0 mask 255.255.0.0 198.18.0.1 metric 1 if 77"));
+        assert!(prog.down[0].contains("route delete 198.18.0.0 mask 255.255.0.0 198.18.0.1"));
+        // 不接管整机默认路由，也不写任何例外。
+        assert!(!prog.up.iter().any(|c| c.contains("0.0.0.0 mask 128.0.0.0")));
+        assert!(!prog.up.iter().any(|c| c.contains("192.168.0.0")));
     }
 
     #[test]

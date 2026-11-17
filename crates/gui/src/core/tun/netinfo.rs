@@ -137,12 +137,11 @@ fn snapshot() -> std::sync::Arc<Vec<()>> {
 pub fn validate_physical(route: &PhysicalRoute, tun_if_index: u32) -> Result<(), String> {
     if route.if_index == tun_if_index {
         return Err(format!(
-            "接口探测返回 TUN 自身（ifIndex {}），拒绝启用以防自环",
-            tun_if_index
+            "interface probe returned the TUN itself (ifIndex {tun_if_index}), refusing to start to avoid a loop"
         ));
     }
     if route.gateway.is_unspecified() {
-        return Err("物理网关无效（未指定）".into());
+        return Err("physical gateway is unspecified".into());
     }
     Ok(())
 }

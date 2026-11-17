@@ -34,7 +34,8 @@ pub async fn create_connection_task(
     is_domain: bool,
     state: Arc<AppState>,
 ) {
-    let result = match resolve_and_connect(host, port, is_domain, &state).await {
+    let client_peer = client.peer_addr().ok();
+    let result = match resolve_and_connect(host, port, is_domain, &state, client_peer).await {
         Some(r) => r,
         None => return,
     };

@@ -92,6 +92,14 @@ if (-not $SkipClient) {
     if (-not (Test-Path $wintunDll)) {
         throw "找不到 WinTun 驱动: $wintunDll（TUN 模式依赖它，缺失时安装后无法启用 TUN）"
     }
+    $noticesFile = Join-Path $Root 'THIRD-PARTY-NOTICES.md'
+    $wintunLicense = Join-Path $GuiCrate 'assets\wintun\LICENSE.txt'
+    if (-not (Test-Path $noticesFile)) {
+        throw "找不到第三方许可清单: $noticesFile"
+    }
+    if (-not (Test-Path $wintunLicense)) {
+        throw "找不到 WinTun 许可文本: $wintunLicense"
+    }
     $iconFile = Join-Path $Root 'icons\icon.ico'
     if (-not (Test-Path $iconFile)) {
         throw "找不到安装包图标: $iconFile（可用 SSL_PROXY_ICON 环境变量指定）"
@@ -102,6 +110,7 @@ if (-not $SkipClient) {
     & $Makensis /V2 "/DPRODUCT_VERSION=$guiVersion" "/DUSE_PAYLOAD" `
         "/DPAYLOAD_EXE=$payloadExe" "/DSOURCE_GEO=$sourceGeo" `
         "/DWINTUN_DLL=$wintunDll" `
+        "/DNOTICES_FILE=$noticesFile" "/DWINTUN_LICENSE=$wintunLicense" `
         "/DICON_FILE=$iconFile" "/DOUT_FILE=$setup" `
         (Join-Path $GuiCrate 'installer\installer.nsi')
     if ($LASTEXITCODE -ne 0) { throw "makensis 失败（退出码 $LASTEXITCODE）" }

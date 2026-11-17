@@ -12,6 +12,48 @@ struct Entry {
 
 const CHANGELOG: &[Entry] = &[
     Entry {
+        version: "2.6.2",
+        date: "2026-11-17",
+        changes: &[
+            "Logs: filter by level, keyword search, export the filtered lines, and generate a one-click diagnostics bundle",
+            "New Diagnostics page: local proxy port, upstream reachability, DNS resolution, IPv4 route table and TUN self-check, with a copyable report",
+            "Connections: search, sort by time / traffic / latency / host, PROXY vs DIRECT filter and per-process filter",
+            "Connections: process names are captured on Windows via the TCP/UDP owner tables",
+            "Compliance: the installer ships THIRD-PARTY-NOTICES.md and the Wintun GPLv2 license; the About page opens a third-party notices dialog",
+            "Compliance: cargo-deny and cargo-audit run in CI with a permissive-license allow-list",
+            "UI: hover highlights now follow the rounded corners of cards in Connections, Rules and Rule Tester",
+            "Fixes: log reading keeps up to 2 MB without splitting UTF-8; the diagnostics bundle redacts credentials",
+        ],
+    },
+    Entry {
+        version: "2.6.1",
+        date: "2026-11-17",
+        changes: &[
+            "TUN: the adapter address is assigned through IP Helper with duplicate-address detection off, so the interface is usable immediately (fixes direct-connection timeouts on some Windows 10 hosts)",
+            "TUN: adapter creation retries up to 5 times, 500 ms apart, and falls back to name-1 ... name-4 when the configured name is taken",
+            "TUN: all-traffic mode installs two /1 routes and leaves the system default route untouched",
+            "TUN: new route scope option (global / fake-ip), plus configurable UDP idle timeout (default 60 s) and max connections (default 256)",
+            "TUN: auto route is honoured; turning it off installs no routes at all",
+            "TUN: the TUN settings panel is Windows-only, and other platforms never start it",
+            "Connections: groups are collapsed by default and rendered by a virtualised list whose scrollbar stays visible at the right edge",
+            "Logs: client log output is English only, and the periodic UI heartbeat line is gone",
+            "UI: hover highlights follow the rounded corners of cards in Connections, Rules and Rule Tester",
+        ],
+    },
+    Entry {
+        version: "2.6.0",
+        date: "2026-11-16",
+        changes: &[
+            "TUN (Windows): WinTun adapter with a userland smoltcp stack, fake-IP DNS hijack on :53 and one routing engine shared by TCP and UDP",
+            "TUN: fail-closed startup with route rollback, a crash-recovery snapshot and cleanup on every exit path",
+            "TUN: fake-IP mappings persist across restarts in fakeip.json and can be cleared from Settings",
+            "TUN: strict route forces private / loopback targets DIRECT and requires a DNS hijack list",
+            "TUN: UDP proxying through the TLS tunnel, including QUIC / HTTP3",
+            "Settings: new TUN panel with enable, strict-route and auto-route switches plus tunable parameters",
+            "Fixes: adapter index conversion, smoltcp AnyIP, socket-recycle panic; the installer now ships wintun.dll",
+        ],
+    },
+    Entry {
         version: "2.5.2",
         date: "2026-11-13",
         changes: &[

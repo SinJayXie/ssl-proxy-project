@@ -1,16 +1,16 @@
 {
-    "version":  "2.6.0",
+    "version":  "2.6.2",
     "changelog":  [
-                      "TUN: WinTun virtual adapter with full data plane - fake-ip DNS hijack, smoltcp netstack, unified route engine (TCP/UDP)",
-                      "TUN: fail-closed guarantees - capability gating, route rollback on failure, crash recovery snapshot, exit-time cleanup",
-                      "TUN: fake-ip mapping persistence (fakeip.json) so apps\u0027 cached addresses resolve across restarts",
-                      "TUN: strict-route hardening - private/loopback targets forced DIRECT, DNS hijack required, direct DNS bound to physical NIC",
-                      "TUN: UDP proxy via TLS tunnel (FLAG_UDP frames, shared with SOCKS5 UDP ASSOCIATE)",
-                      "TUN: proxy tunnel dials pre-resolved server IP so its own DNS is never hijacked (loop prevention)",
-                      "Settings: new TUN panel with enable/strict-route/auto-route switches and tunable parameters",
-                      "Fix: LUID-to-ifIndex conversion via system API (was breaking adapter setup); smoltcp AnyIP mode for routed traffic; socket-recycle panic in mux forwarding"
+                      "Logs: filter by level, keyword search, export the filtered lines, and generate a one-click diagnostics bundle",
+                      "New Diagnostics page: local proxy port, upstream reachability, DNS resolution, IPv4 route table and TUN self-check, with a copyable report",
+                      "Connections: search, sort by time / traffic / latency / host, PROXY vs DIRECT filter and per-process filter",
+                      "Connections: process names are captured on Windows via the TCP/UDP owner tables",
+                      "Compliance: the installer ships THIRD-PARTY-NOTICES.md and the Wintun GPLv2 license; the About page opens a third-party notices dialog",
+                      "Compliance: cargo-deny and cargo-audit run in CI with a permissive-license allow-list",
+                      "UI: hover highlights now follow the rounded corners of cards in Connections, Rules and Rule Tester",
+                      "Fixes: log reading keeps up to 2 MB without splitting UTF-8; the diagnostics bundle redacts credentials"
                   ],
-    "downloadUrl":  "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.6.0_x64-setup.exe",
-    "sha256":  "27196f60cb901e68490a9becf9bc637e9737d68e8b937c556c615fb54a1c61af",
-    "signature":  "9caa2f9f9bb0d053d3795da6021c380b2e7ec7918d92c246a6a3c7d350ff044470b7b3b812c6c3024ecb81b36bc747640996e1a8b8fc96ebbaab6db94dcf3406"
+    "downloadUrl":  "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.6.2_x64-setup.exe",
+    "sha256":  "256d5e50eeb70d9a9f491dbcf7e5d0287d8630a9aefecabbc553178b45349280",
+    "signature":  "e060d3f06696115ea133dc248a3b698112059dd2380173e5c828e4a67654d154c4d91499598f84679386cad1b119bd2c992fe311eac741559fe6b126e6666307"
 }

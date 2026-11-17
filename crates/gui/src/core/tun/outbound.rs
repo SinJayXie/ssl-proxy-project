@@ -104,7 +104,7 @@ fn host_of(shared: &StackShared, ip: IpAddr, fake_range: &str) -> Result<String,
             .insert(ip)
         {
             log::warn!(
-                "TUN fake-ip {ip} 无映射（应用缓存了上个会话的 fake-ip），fail-closed 拒绝该流；映射持久化生效后不再出现"
+                "TUN fake-ip {ip} has no mapping (app cached a fake-ip from a previous session), rejecting flow (fail-closed); will not recur once mapping persistence takes effect"
             );
         }
         return Err(());
@@ -198,7 +198,7 @@ async fn decide_for_tun(
     if let Some(ip) = resolved.as_ref().and_then(|s| s.parse::<IpAddr>().ok())
         && is_in_fake_ip_pool(&ip, fake_range)
     {
-        log::warn!("TUN DNS 污染防护: {host} 解析到 fake-ip，按未解析处理");
+        log::warn!("TUN DNS pollution guard: {host} resolved to fake-ip, treating as unresolved");
         resolved = None;
     }
 
@@ -209,7 +209,7 @@ async fn decide_for_tun(
     if let Some(ip) = resolved.as_ref().and_then(|s| s.parse::<IpAddr>().ok())
         && crate::core::tun::route::must_direct_ip(&ip)
     {
-        log::debug!("TUN strict-route: 私网/本地目标 {ip} 强制 DIRECT");
+        log::debug!("TUN strict-route: private/local target {ip} forced DIRECT");
         return Ok(RouteDecision {
             outbound: RouteOutbound::Direct,
             reason: DecisionReason::PrivateNetwork,
@@ -271,12 +271,12 @@ async fn handle_tcp(
     let decision = match decide_for_tun(&state, &host, &fake_range).await {
         Ok(d) => d,
         Err(e) => {
-            log::error!("TUN 决策失败 {host}:{port}: {e}");
+            log::error!("TUN decision failed {host}:{port}: {e}");
             return; // drop stream → 关闭连接
         }
     };
     if decision.outbound == crate::core::proxy::route::Outbound::Reject {
-        log::debug!("TUN 拒绝 {host}:{port}（无出口）");
+        log::debug!("TUN rejected {host}:{port} (no outbound)");
         return;
     }
 
@@ -284,7 +284,7 @@ async fn handle_tcp(
         let ip = match decision.resolved_ip {
             Some(ip) => ip,
             None => {
-                log::warn!("TUN 直连 {host}:{port} 无可用解析结果，放弃（不裸连）");
+                log::warn!("TUN direct {host}:{port} has no usable resolution result, giving up (no naked connect)");
                 return;
             }
         };
@@ -293,21 +293,22 @@ async fn handle_tcp(
                 let mut target = target;
                 let mut stream = stream;
                 if let Err(e) = tokio::io::copy_bidirectional(&mut stream, &mut target).await {
-                    log::debug!("TUN direct pump {host}:{port} 结束: {e}");
+                    log::debug!("TUN direct pump {host}:{port} ended: {e}");
                 }
             }
-            Err(e) => log::error!("TUN 直连 {ip}:{port} 失败: {e}"),
+            Err(e) => log::error!("TUN direct {ip}:{port} failed: {e}"),
         }
         return;
     }
 
     // PROXY：复用完整隧道路径（含 mux / padding / 连接表统计）。
+    // TUN 路径没有 accepted socket 的 peer 端点，进程名暂不采集（显示为空）。
     let is_domain = host.parse::<IpAddr>().is_err();
-    match resolve_and_connect(&host, port, is_domain, &state).await {
+    match resolve_and_connect(&host, port, is_domain, &state, None).await {
         Some(result) => {
             forward_target_stream(stream, result.target, result.id, state).await;
         }
-        None => log::error!("TUN 代理出站失败 {host}:{port}"),
+        None => log::error!("TUN proxy outbound failed {host}:{port}"),
     }
 }
 
@@ -342,7 +343,7 @@ async fn serve_tcp_dns(
             crate::core::tun::dns::answer_query(&payload, &mut core.fake_map, &pool_v4, &pool_v6)
         };
         let Ok(resp) = answer else {
-            log::debug!("TUN TCP DNS 查询无法应答（fail-closed）: {host}");
+            log::debug!("TUN TCP DNS query unanswerable (fail-closed): {host}");
             break;
         };
         if resp.len() > u16::MAX as usize {
@@ -376,12 +377,12 @@ async fn connect_direct(
     };
     match egress {
         Some(e) if Some(e.if_index) != env.physical_if => log::info!(
-            "TUN 直连出口切换: {addr} → ifIndex={} 源地址={:?}",
+            "TUN direct egress switched: {addr} -> ifIndex={} source address={:?}",
             e.if_index,
             e.local_ipv4
         ),
-        Some(e) => log::debug!("TUN 直连出口: {addr} → ifIndex={}", e.if_index),
-        None => log::debug!("TUN 直连出口: {addr} → 沿用探测网卡 {:?}", env.physical_if),
+        Some(e) => log::debug!("TUN direct egress: {addr} -> ifIndex={}", e.if_index),
+        None => log::debug!("TUN direct egress: {addr} -> using probed adapter {:?}", env.physical_if),
     }
     let if_index = egress.map(|e| e.if_index).or(env.physical_if);
     let local_ip = egress.and_then(|e| e.local_ipv4).or(env.physical_ip);
@@ -460,7 +461,7 @@ async fn handle_udp(
     let key = (handle, remote);
     // DNS：轮询线程已劫持应答；到达这里的 53 包都是未劫持目标，丢弃防泄漏。
     if port == 53 {
-        log::debug!("TUN UDP:53 未命中劫持规则，丢弃 {remote}");
+        log::debug!("TUN UDP:53 does not match hijack rules, dropping {remote}");
         return;
     }
 
@@ -574,7 +575,7 @@ async fn build_proxy_udp(state: &Arc<AppState>, host: &str) -> Option<UdpUpstrea
             Some(UdpUpstream::Proxy(r, w))
         }
         Err(e) => {
-            log::error!("TUN UDP 代理隧道失败 {host}: {:?}", e);
+            log::error!("TUN UDP proxy tunnel failed {host}: {:?}", e);
             None
         }
     }
@@ -651,5 +652,5 @@ async fn pump_udp(
             }
         },
     }
-    log::debug!("TUN UDP 会话结束 {host}:{remote}");
+    log::debug!("TUN UDP session ended {host}:{remote}");
 }

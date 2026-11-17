@@ -24,6 +24,10 @@ pub struct TunManager {
     active_cfg: Option<TunConfig>,
     shared: Option<netstack::StackShared>,
     down_cmds: Vec<String>,
+    /// 实际启用的网卡名（可能因冲突轮转为 "SSLProxy-1" 等）。
+    device_name: Option<String>,
+    /// 实际网卡的 ifIndex。
+    if_index: Option<u32>,
 }
 
 static MANAGER: OnceCell<Mutex<TunManager>> = OnceCell::new();
@@ -33,7 +37,45 @@ fn manager() -> &'static Mutex<TunManager> {
         active_cfg: None,
         shared: None,
         down_cmds: vec![],
+        device_name: None,
+        if_index: None,
     }))
+}
+
+/// 运行中的 TUN 只读状态（诊断/日志用）。
+#[derive(Debug, Clone)]
+pub struct TunStatus {
+    pub device_name: String,
+    pub if_index: u32,
+    pub route_scope: crate::core::tun::config::TunRouteScope,
+    pub fakeip_count: usize,
+    pub tcp_pending: usize,
+    pub tcp_active: usize,
+    pub udp_active: usize,
+    pub queued: usize,
+}
+
+/// 未启用返回 None；调用不得阻塞 UI（只做一次短锁）。
+pub fn status() -> Option<TunStatus> {
+    let m = manager();
+    let g = m.lock().unwrap_or_else(|e| e.into_inner());
+    let shared = g.shared.as_ref()?;
+    let cfg = g.active_cfg.as_ref()?;
+    let fakeip_count = shared.fakeip_count();
+    let (tcp_pending, tcp_active, udp_active, queued) = shared.lock().stats();
+    Some(TunStatus {
+        device_name: g
+            .device_name
+            .clone()
+            .unwrap_or_else(|| cfg.device_name.clone()),
+        if_index: g.if_index.unwrap_or(0),
+        route_scope: cfg.route_scope,
+        fakeip_count,
+        tcp_pending,
+        tcp_active,
+        udp_active,
+        queued,
+    })
 }
 
 /// 按当前配置对齐 TUN 状态（保存配置 / 启动时调用）。
@@ -60,6 +102,10 @@ enum Action {
 }
 
 pub async fn apply(state: Arc<AppState>) {
+    // 非 Windows 平台不提供 TUN：不读配置、不建网卡、不改路由。
+    if !crate::core::tun::TUN_SUPPORTED {
+        return;
+    }
     let cfg = state.config.read().await.tun.clone();
     let config_dir = state.config_dir.clone();
 
@@ -85,7 +131,7 @@ pub async fn apply(state: Arc<AppState>) {
 
     match action {
         Action::Start | Action::Restart => match start(state, &cfg).await {
-            Ok((shared, down)) => {
+            Ok((shared, down, device_name, if_index)) => {
                 let m = manager();
                 let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
                 if g.shared.is_some() {
@@ -96,14 +142,16 @@ pub async fn apply(state: Arc<AppState>) {
                 g.active_cfg = Some(cfg.clone());
                 g.shared = Some(shared);
                 g.down_cmds = down;
+                g.device_name = Some(device_name);
+                g.if_index = Some(if_index);
                 log::info!(
-                    "TUN 已启用{}",
-                    if action == Action::Restart { "（配置已变更，重建完成）" } else { "" }
+                    "TUN enabled{}",
+                    if action == Action::Restart { " (config changed, rebuilt)" } else { "" }
                 );
             }
-            Err(e) => log::error!("TUN 启动失败（已回滚）: {e}"),
+            Err(e) => log::error!("TUN start failed (rolled back): {e}"),
         },
-        Action::Stop => log::info!("TUN 已停止，路由已回滚"),
+        Action::Stop => log::info!("TUN stopped, routes rolled back"),
         Action::None => {}
     }
 }
@@ -111,7 +159,7 @@ pub async fn apply(state: Arc<AppState>) {
 async fn start(
     state: Arc<AppState>,
     cfg: &TunConfig,
-) -> Result<(netstack::StackShared, Vec<String>), String> {
+) -> Result<(netstack::StackShared, Vec<String>, String, u32), String> {
     cfg.validate()?;
 
     // 1. 代理服务器 IP（域名先经现有 resolver 解析，供路由例外防自环）。
@@ -125,7 +173,7 @@ async fn start(
         } else {
             match crate::core::dns::lookup(&state, &proxy_server).await {
                 Ok(ip) => proxy_ips.push(ip),
-                Err(e) => return Err(format!("解析代理服务器 {proxy_server} 失败: {e}")),
+                Err(e) => return Err(format!("failed to resolve proxy server {proxy_server}: {e}")),
             }
         }
         // 登记 TUN 启动前解析的 IP：TUN 开启后系统 DNS 被自身劫持，
@@ -148,7 +196,7 @@ async fn start(
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| "1.1.1.1".parse().unwrap());
     let phys = netinfo::find_route_to(probe_target)
-        .ok_or_else(|| "无法探测物理网卡（IpHelper 不可用）".to_string())?;
+        .ok_or_else(|| "failed to probe physical adapter (IpHelper unavailable)".to_string())?;
 
     // 3. 打开网卡（无管理员权限在这里快速失败）。
     let tun_dev = device::open(cfg)?;
@@ -160,24 +208,31 @@ async fn start(
         .fake_ip_range
         .split_once('/')
         .and_then(|(a, _)| a.parse().ok())
-        .ok_or_else(|| "fake-ip-range 无效".to_string())?;
+        .ok_or_else(|| "invalid fake-ip-range".to_string())?;
     let program = routes::build_program(cfg, tun_dev.if_index, tun_gateway, &phys, &exclude_list);
     let failures = routes::execute(&program.up);
     if !failures.is_empty() {
         routes::execute(&program.down);
-        return Err(format!("安装路由失败: {:?}", failures));
+        return Err(format!("failed to install routes: {:?}", failures));
     }
 
     // 路由已生效：立刻写崩溃恢复快照（即使后续崩溃也能在下次启动清理）。
-    let snapshot = RouteSnapshot::new(std::process::id(), cfg.device_name.clone(), program.down.clone());
-    if let Err(e) = snapshot.save(&state.config_dir) {
-        routes::execute(&program.down);
-        return Err(format!("写入 TUN 路由快照失败（已回滚路由）: {e}"));
+    // 网卡名可能因冲突轮转发生变化，快照必须记录实际名称。
+    // auto-route 关闭时没有安装任何路由，也就不需要快照。
+    if !program.up.is_empty() {
+        let snapshot =
+            RouteSnapshot::new(std::process::id(), tun_dev.name.clone(), program.down.clone());
+        if let Err(e) = snapshot.save(&state.config_dir) {
+            routes::execute(&program.down);
+            return Err(format!("failed to write TUN route snapshot (routes rolled back): {e}"));
+        }
     }
 
     // 5. 协议栈 + 事件泵。fake-ip 映射持久化恢复（应用缓存跨重启可反查）。
     let (ev_tx, ev_rx) = std::sync::mpsc::channel::<netstack::FlowEvent>();
     let fake_map = crate::core::tun::dns::FakeIpMap::load_from(&fakeip_path(&state.config_dir));
+    // 实际网卡名可能因冲突轮转，随启动结果返回并登记到 manager。
+    let tun_name = tun_dev.name.clone();
     let shared = netstack::spawn(tun_dev, cfg.clone(), ev_tx, fake_map);
     let env = OutboundEnv::new(
         Some(phys.if_index),
@@ -205,7 +260,7 @@ async fn start(
     flush_system_dns_cache();
 
     log::info!(
-        "TUN 数据面就绪: {} ifIndex={} gw={} 物理网关={}，strict-route={}，排除 {} 条基集网段",
+        "TUN data plane ready: {} ifIndex={} gw={} physical gateway={}, strict-route={}, {} baseline route excludes",
         cfg.device_name,
         phys.if_index,
         tun_gateway,
@@ -214,11 +269,11 @@ async fn start(
         exclude_list.len()
     );
     log::info!(
-        "TUN 物理出口: ifIndex={} 源地址={:?}",
+        "TUN physical egress: ifIndex={} source address={:?}",
         phys.if_index,
         phys.local_ipv4
     );
-    Ok((shared, program.down))
+    Ok((shared, program.down, tun_name, tun_if_index))
 }
 
 /// 清空 Windows 系统 DNS 缓存（TUN 启停时调用，防 fake-ip 残留缓存）。
@@ -231,8 +286,8 @@ fn flush_system_dns_cache() {
         .creation_flags(CREATE_NO_WINDOW)
         .output()
     {
-        Ok(_) => log::info!("已刷新系统 DNS 缓存"),
-        Err(e) => log::warn!("刷新系统 DNS 缓存失败（可能影响 fake-ip 反查）: {e}"),
+        Ok(_) => log::info!("system DNS cache flushed"),
+        Err(e) => log::warn!("failed to flush system DNS cache (may affect fake-ip reverse lookup): {e}"),
     }
 }
 
@@ -294,7 +349,7 @@ fn spawn_fakeip_saver(config_dir: std::path::PathBuf, shared: netstack::StackSha
                 })
                 .await
                 {
-                    log::warn!("保存 fake-ip 映射失败: {e:?}");
+                    log::warn!("failed to save fake-ip mappings: {e:?}");
                 }
             }
         });
@@ -306,7 +361,7 @@ fn stop_inner(m: &mut TunManager, config_dir: Option<&std::path::Path>) {
     if let Some(shared) = &m.shared {
         if let Some(dir) = config_dir {
             if let Err(e) = shared.lock().fake_map.save_to(&fakeip_path(dir)) {
-                log::warn!("保存 fake-ip 映射失败: {e}");
+                log::warn!("failed to save fake-ip mappings: {e}");
             }
         }
     }
@@ -314,11 +369,13 @@ fn stop_inner(m: &mut TunManager, config_dir: Option<&std::path::Path>) {
     m.down_cmds.clear();
     m.active_cfg = None;
     m.shared = None; // 丢弃共享句柄 → 通道关闭 → 协议栈线程退出 → 网卡关闭
+    m.device_name = None;
+    m.if_index = None;
     // 停止后 fake-ip 不再可达，清缓存让应用尽快重新走真实 DNS（后台执行，不阻塞退出）。
     flush_system_dns_cache_async();
     if let Some(dir) = config_dir {
         if let Err(e) = RouteSnapshot::clear(dir) {
-            log::warn!("清理 TUN 路由快照失败: {e}");
+            log::warn!("failed to clear TUN route snapshot: {e}");
         }
     }
 }
@@ -331,27 +388,30 @@ pub fn stop_before_exit(config_dir: &std::path::Path) {
     };
     if m.shared.is_some() {
         stop_inner(&mut m, Some(config_dir));
-        log::info!("TUN 已在进程重启前停止");
+        log::info!("TUN stopped before process restart");
     }
 }
 
 /// 启动自检：回滚上次异常退出残留的 TUN 路由（崩溃恢复）。
 /// 在 Core 构造后、apply_tun 之前调用，避免残留路由干扰物理网卡探测。
 pub fn recover_on_startup(config_dir: &std::path::Path) {
+    if !crate::core::tun::TUN_SUPPORTED {
+        return;
+    }
     match crate::core::tun::recovery::pending_rollback(config_dir) {
         Ok(Some(cmds)) => {
             let failures = routes::execute(&cmds);
             if failures.is_empty() {
-                log::info!("TUN 崩溃恢复完成：已撤销上次残留路由");
+                log::info!("TUN crash recovery complete: residual routes from last run removed");
             } else {
-                log::error!("TUN 崩溃恢复部分失败: {:?}", failures);
+                log::error!("TUN crash recovery partially failed: {:?}", failures);
             }
             if let Err(e) = RouteSnapshot::clear(config_dir) {
-                log::warn!("清理残留 TUN 路由快照失败: {e}");
+                log::warn!("failed to clear residual TUN route snapshot: {e}");
             }
         }
         Ok(None) => {}
-        Err(e) => log::error!("读取 TUN 路由快照失败（跳过崩溃恢复）: {e}"),
+        Err(e) => log::error!("failed to read TUN route snapshot (skipping crash recovery): {e}"),
     }
 }
 
@@ -400,7 +460,7 @@ pub fn clear_fakeip(state: &AppState) -> Result<usize, String> {
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("删除 {:?} 失败: {e}", path)),
+        Err(e) => return Err(format!("failed to delete {:?}: {e}", path)),
     }
     flush_system_dns_cache_async();
     Ok(cleared)
@@ -430,7 +490,7 @@ fn spawn_egress_monitor(state: Arc<AppState>, tun_if_index: u32) {
                 }
                 // PhysicalRoute 是 Copy，这里保留值语义用于下一次比较。
                 log::info!(
-                    "TUN 默认出口变化: ifIndex={:?} 源地址={:?}",
+                    "TUN default egress changed: ifIndex={:?} source address={:?}",
                     current.map(|r| r.if_index),
                     current.and_then(|r| r.local_ipv4)
                 );
@@ -458,7 +518,7 @@ fn spawn_reaper(shared: netstack::StackShared) {
                 let mut core = shared.lock();
                 netstack::reap_closed(&mut core);
                 let (pending, flows, udp, queued) = core.stats();
-                log::info!("TUN 心跳: 半开={pending} TCP={flows} UDP={udp} 待处理包={queued}");
+                log::info!("TUN heartbeat: pending={pending} tcp={flows} udp={udp} queued={queued}");
             }
         });
     }
@@ -473,6 +533,15 @@ mod tests {
         let m = manager().lock().unwrap();
         assert!(m.shared.is_none());
         assert!(m.down_cmds.is_empty());
+        assert!(m.device_name.is_none());
+        assert!(m.if_index.is_none());
+    }
+
+    #[test]
+    fn status_is_none_before_start() {
+        // 测试进程内没有真实 TUN（需要管理员权限与 wintun.dll），
+        // 因此 manager 始终保持未启动状态，status() 必须返回 None。
+        assert!(status().is_none());
     }
 
     #[test]

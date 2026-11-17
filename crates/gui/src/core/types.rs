@@ -41,6 +41,9 @@ pub struct ConnectionInfo {
     pub geo: GeoInfo,
     pub data: DataFlow,
     pub latency_ms: u64,
+    /// 发起连接的本机进程名（Windows），未知时为空字符串。
+    #[serde(default)]
+    pub process: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

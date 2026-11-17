@@ -6963,7 +6963,7 @@ dependencies = [
 
 [[package]]
 name = "ssl-proxy-gui"
-version = "2.6.0"
+version = "2.6.2"
 dependencies = [
  "crc32fast",
  "embed-resource",

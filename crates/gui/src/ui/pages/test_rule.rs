@@ -270,7 +270,15 @@ impl Render for TestRulePage {
                     .border_color(theme::border_light(cx))
                     .shadow_xs()
                     .overflow_hidden()
-                    .child(div().w(px(3.)).flex_shrink_0().bg(bar_color))
+                    // 卡片是圆角 + 矩形裁剪，左侧色条必须自带左侧圆角，
+                    // 否则上下两端的直角会盖在卡片圆角之外。
+                    .child(
+                        div()
+                            .w(px(3.))
+                            .flex_shrink_0()
+                            .rounded_l(px(10.))
+                            .bg(bar_color),
+                    )
                     .child(body),
             );
         }

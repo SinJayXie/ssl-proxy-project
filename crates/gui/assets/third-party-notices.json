@@ -1,0 +1,47 @@
+[
+    {
+        "name":  "Wintun",
+        "version":  "0.14.1",
+        "license":  "GPL-2.0 (WireGuard LLC)"
+    },
+    {
+        "name":  "Material Design Icons",
+        "version":  "-",
+        "license":  "Apache-2.0 (Pictogrammers)"
+    },
+    {
+        "name":  "GeoDB.dat",
+        "version":  "-",
+        "license":  "Bundled GeoIP data (see project docs)"
+    },
+    {
+        "name":  "cbindgen",
+        "version":  "0.28.0",
+        "license":  "MPL-2.0"
+    },
+    {
+        "name":  "dwrote",
+        "version":  "0.11.5",
+        "license":  "MPL-2.0"
+    },
+    {
+        "name":  "option-ext",
+        "version":  "0.2.0",
+        "license":  "MPL-2.0"
+    },
+    {
+        "name":  "r-efi",
+        "version":  "5.3.0",
+        "license":  "MIT OR Apache-2.0 OR LGPL-2.1-or-later"
+    },
+    {
+        "name":  "r-efi",
+        "version":  "6.0.0",
+        "license":  "MIT OR Apache-2.0 OR LGPL-2.1-or-later"
+    },
+    {
+        "name":  "self_cell",
+        "version":  "1.3.0",
+        "license":  "Apache-2.0 OR GPL-2.0-only"
+    }
+]

@@ -140,7 +140,8 @@ pub async fn handle_http_client(mut client: TcpStream, first_byte: u8, state: Ar
         log::info!("[HTTP CONNECT] {}:{}", host, port);
 
         let is_domain = host.parse::<std::net::IpAddr>().is_err();
-        let result = match resolve_and_connect(&host, port, is_domain, &state).await {
+        let client_peer = client.peer_addr().ok();
+        let result = match resolve_and_connect(&host, port, is_domain, &state, client_peer).await {
             Some(r) => r,
             None => {
                 let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
@@ -173,7 +174,8 @@ pub async fn handle_http_client(mut client: TcpStream, first_byte: u8, state: Ar
         log::info!("[HTTP {}] {}:{}{}", method, host, port, path);
 
         let is_domain = host.parse::<std::net::IpAddr>().is_err();
-        let mut result = match resolve_and_connect(host, port, is_domain, &state).await {
+        let client_peer = client.peer_addr().ok();
+        let mut result = match resolve_and_connect(host, port, is_domain, &state, client_peer).await {
             Some(r) => r,
             None => {
                 let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;

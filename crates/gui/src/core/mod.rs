@@ -1,6 +1,8 @@
+pub mod diagnostics;
 pub mod dns;
 pub mod geo;
 pub mod geo_sdk;
+pub mod proc;
 pub mod proxy;
 pub mod state;
 pub mod stats;
@@ -190,18 +192,34 @@ impl Core {
         self.state.geo_manager.get_all_country_codes()
     }
 
-    /// Last 5000 characters of `app.log`.
-    pub fn read_logs(&self) -> String {
+    /// Last `max_bytes` bytes of `app.log`, trimmed to a UTF-8 char boundary.
+    pub fn read_logs_tail(&self, max_bytes: usize) -> String {
         let path = self.state.config_dir.join("app.log");
-        let Ok(content) = std::fs::read_to_string(&path) else {
+        let Ok(bytes) = std::fs::read(&path) else {
             return "No logs yet".to_string();
         };
+        tail_utf8(&bytes, max_bytes)
+    }
 
-        let mut start = content.len().saturating_sub(5000);
-        while start < content.len() && !content.is_char_boundary(start) {
-            start += 1;
-        }
-        content[start..].to_string()
+    /// Last 5000 bytes of `app.log`.
+    #[allow(dead_code)] // 保留给后续小窗口日志展示，当前日志页统一读 2 MB 尾部。
+    pub fn read_logs(&self) -> String {
+        self.read_logs_tail(5000)
+    }
+
+    /// Write `content` under `<config_dir>/exports` and return the full path.
+    pub fn export_text(&self, kind: &str, content: &str) -> std::io::Result<PathBuf> {
+        write_export(&self.state.config_dir, kind, content)
+    }
+
+    /// 在后台运行全部诊断检查（日志页的“诊断包”用）。
+    pub fn run_diagnostics(
+        &self,
+    ) -> tokio::task::JoinHandle<Vec<crate::core::diagnostics::CheckResult>> {
+        let state = self.state.clone();
+        let config = self.snapshot_config().unwrap_or_default();
+        self.runtime
+            .spawn(async move { crate::core::diagnostics::run_with(state, config).await })
     }
 
     // ---------- Asynchronous actions ----------
@@ -300,6 +318,66 @@ impl Core {
         self.runtime
             .spawn(async move { run_download_update(url, sha256, signature, progress).await })
     }
+}
+
+/// Write `content` to `<dir>/exports/<kind>-<yyyyMMdd-HHmmss>.txt` (UTC, no BOM).
+pub(crate) fn write_export(dir: &Path, kind: &str, content: &str) -> std::io::Result<PathBuf> {
+    let exports = dir.join("exports");
+    std::fs::create_dir_all(&exports)?;
+    let path = exports.join(format!("{}-{}.txt", kind, timestamp_utc()));
+    std::fs::write(&path, content.as_bytes())?;
+    Ok(path)
+}
+
+/// Current UTC time formatted as `yyyyMMdd-HHmmss`.
+fn timestamp_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    format_timestamp_utc(secs)
+}
+
+/// Format seconds since the Unix epoch as `yyyyMMdd-HHmmss` (proleptic Gregorian).
+fn format_timestamp_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let time = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        year,
+        month,
+        day,
+        time / 3600,
+        (time % 3600) / 60,
+        time % 60
+    )
+}
+
+/// Days since 1970-01-01 → (year, month, day), after Howard Hinnant's
+/// `civil_from_days` (no external date crate needed).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Decode the last `max_bytes` of `bytes`, skipping a partially cut leading
+/// character so the result never starts mid-codepoint.
+fn tail_utf8(bytes: &[u8], max_bytes: usize) -> String {
+    let mut start = bytes.len().saturating_sub(max_bytes);
+    while start < bytes.len() && (bytes[start] & 0xC0) == 0x80 {
+        start += 1;
+    }
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
 }
 
 fn save_rules_to_file(rules: &[RuleConfig], config_dir: &Path) {
@@ -844,5 +922,58 @@ mod update_security_tests {
             "篡改内容必须校验失败"
         );
         assert!(verify_ed25519(public_key, data, "").is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_timestamp_utc, tail_utf8, write_export};
+
+    #[test]
+    fn timestamp_formats_known_epochs() {
+        assert_eq!(format_timestamp_utc(946_684_800), "20000101-000000");
+        assert_eq!(format_timestamp_utc(0), "19700101-000000");
+        assert_eq!(format_timestamp_utc(1_700_000_000), "20231114-221320");
+    }
+
+    #[test]
+    fn write_export_creates_timestamped_file() {
+        let dir = std::env::temp_dir().join(format!("ssl-proxy-test-{}", std::process::id()));
+        let path = write_export(&dir, "logs", "hello log").expect("write export");
+
+        assert!(path.starts_with(dir.join("exports")), "unexpected path: {path:?}");
+        let name = path
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .to_string();
+        assert!(name.starts_with("logs-"), "unexpected file name: {name}");
+        assert!(name.ends_with(".txt"), "unexpected file name: {name}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello log");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tail_keeps_small_file_intact() {
+        assert_eq!(tail_utf8(b"short log", 5000), "short log");
+        assert_eq!(tail_utf8(b"", 5000), "");
+    }
+
+    #[test]
+    fn tail_keeps_only_last_bytes() {
+        let content = "x".repeat(100);
+        assert_eq!(tail_utf8(content.as_bytes(), 10), "xxxxxxxxxx");
+    }
+
+    #[test]
+    fn tail_does_not_split_multibyte_chars() {
+        let content = "2024-01-01 日志内容 日本語";
+        // Cut lands inside "日"; the partial char is dropped, leaving "本語".
+        let tail = tail_utf8(content.as_bytes(), 7);
+
+        assert!(std::str::from_utf8(tail.as_bytes()).is_ok());
+        assert!(!tail.contains('\u{FFFD}'), "no replacement chars: {tail:?}");
+        assert_eq!(tail, "本語");
     }
 }

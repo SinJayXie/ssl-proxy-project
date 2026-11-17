@@ -1,4 +1,4 @@
-use crate::core::tun::config::TunConfig;
+use crate::core::tun::config::{TunConfig, TunRouteScope};
 use crate::core::types::{AppConfig, UdpMode};
 use crate::core::Core;
 use crate::ui::assets::mdi;
@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 type GeoCombo = Entity<ComboboxState<SearchableVec<SharedString>>>;
 type UdpModeSelect = Entity<SelectState<SearchableVec<SharedString>>>;
+type TunScopeSelect = Entity<SelectState<SearchableVec<SharedString>>>;
 
 static IP_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^(\d{1,3}\.){3}\d{1,3}$").expect("valid ip regex"));
@@ -48,6 +49,27 @@ fn udp_mode_from_index(index: usize) -> UdpMode {
         1 => UdpMode::Direct,
         2 => UdpMode::Proxy,
         _ => UdpMode::Off,
+    }
+}
+
+fn tun_scope_labels() -> Vec<SharedString> {
+    vec![
+        i18n::t("TUN_ROUTE_SCOPE_GLOBAL").into(),
+        i18n::t("TUN_ROUTE_SCOPE_FAKEIP").into(),
+    ]
+}
+
+fn tun_scope_index(scope: TunRouteScope) -> usize {
+    match scope {
+        TunRouteScope::Global => 0,
+        TunRouteScope::FakeIp => 1,
+    }
+}
+
+fn tun_scope_from_index(index: usize) -> TunRouteScope {
+    match index {
+        1 => TunRouteScope::FakeIp,
+        _ => TunRouteScope::Global,
     }
 }
 
@@ -171,6 +193,8 @@ impl SettingsInputs {
 struct TunInputs {
     device_name: Entity<InputState>,
     mtu: Entity<InputState>,
+    udp_timeout: Entity<InputState>,
+    max_connections: Entity<InputState>,
     dns_hijack: Entity<InputState>,
     route_exclude_address: Entity<InputState>,
     fake_ip_range: Entity<InputState>,
@@ -190,6 +214,8 @@ impl TunInputs {
         Self {
             device_name: input(&config.device_name, "SSLProxy"),
             mtu: input(&config.mtu.to_string(), "1500"),
+            udp_timeout: input(&config.udp_timeout.to_string(), "60"),
+            max_connections: input(&config.max_connections.to_string(), "256"),
             dns_hijack: input(&config.dns_hijack.join(", "), "any:53"),
             route_exclude_address: input(
                 &config.route_exclude_address.join(", "),
@@ -213,6 +239,7 @@ pub struct SettingsPage {
     tls_skip: bool,
     mux_enabled: bool,
     tun_inputs: TunInputs,
+    tun_route_scope_select: TunScopeSelect,
     tun_enabled: bool,
     tun_auto_route: bool,
     tun_strict_route: bool,
@@ -249,6 +276,15 @@ impl SettingsPage {
                 this.on_acrylic_opacity(event, cx)
             });
 
+        let tun_route_scope_select = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(tun_scope_labels()),
+                Some(IndexPath::new(tun_scope_index(config.tun.route_scope))),
+                window,
+                cx,
+            )
+        });
+
         Self {
             core,
             config: config.clone(),
@@ -257,6 +293,7 @@ impl SettingsPage {
             tls_skip: config.danger_accept_invalid_certs,
             mux_enabled: config.mux_enabled,
             tun_inputs: TunInputs::new(&config.tun, window, cx),
+            tun_route_scope_select,
             tun_enabled: config.tun.enable,
             tun_auto_route: config.tun.auto_route,
             tun_strict_route: config.tun.strict_route,
@@ -361,6 +398,15 @@ impl SettingsPage {
         self.tls_skip = self.config.danger_accept_invalid_certs;
         self.mux_enabled = self.config.mux_enabled;
         self.tun_inputs = TunInputs::new(&self.config.tun, window, cx);
+        let tun_scope = self.config.tun.route_scope;
+        self.tun_route_scope_select = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(tun_scope_labels()),
+                Some(IndexPath::new(tun_scope_index(tun_scope))),
+                window,
+                cx,
+            )
+        });
         self.tun_enabled = self.config.tun.enable;
         self.tun_auto_route = self.config.tun.auto_route;
         self.tun_strict_route = self.config.tun.strict_route;
@@ -466,6 +512,35 @@ impl SettingsPage {
                 .parse::<u16>()
                 .map_err(|_| i18n::t("VALIDATE_TUN"))?,
             auto_route: self.tun_auto_route,
+            route_scope: {
+                let labels = tun_scope_labels();
+                self.tun_route_scope_select
+                    .read(cx)
+                    .selected_value()
+                    .and_then(|label| {
+                        labels
+                            .iter()
+                            .position(|l| l.as_ref() == label.as_ref())
+                    })
+                    .map(tun_scope_from_index)
+                    .unwrap_or(TunRouteScope::Global)
+            },
+            udp_timeout: self
+                .tun_inputs
+                .udp_timeout
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| i18n::t("VALIDATE_TUN"))?,
+            max_connections: self
+                .tun_inputs
+                .max_connections
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| i18n::t("VALIDATE_TUN"))?,
             strict_route: self.tun_strict_route,
             auto_detect_interface: self.tun_auto_detect_interface,
             dns_hijack: parse_csv(&self.tun_inputs.dns_hijack.read(cx).value()),
@@ -993,6 +1068,15 @@ impl Render for SettingsPage {
                         }))
                         .into_any_element(),
                 ))
+                .child(field(
+                    i18n::t("TUN_ROUTE_SCOPE"),
+                    Some(i18n::t("TUN_ROUTE_SCOPE_HINT")),
+                    cx,
+                    div()
+                        .w_full()
+                        .child(Select::new(&self.tun_route_scope_select))
+                        .into_any_element(),
+                ))
                 .child(
                     h_flex()
                         .items_start()
@@ -1008,6 +1092,23 @@ impl Render for SettingsPage {
                             None,
                             cx,
                             Input::new(&self.tun_inputs.mtu).into_any_element(),
+                        )),
+                )
+                .child(
+                    h_flex()
+                        .items_start()
+                        .gap_3()
+                        .child(field(
+                            i18n::t("TUN_UDP_TIMEOUT"),
+                            Some(i18n::t("TUN_UDP_TIMEOUT_HINT")),
+                            cx,
+                            Input::new(&self.tun_inputs.udp_timeout).into_any_element(),
+                        ))
+                        .child(field(
+                            i18n::t("TUN_MAX_CONNECTIONS"),
+                            Some(i18n::t("TUN_MAX_CONNECTIONS_HINT")),
+                            cx,
+                            Input::new(&self.tun_inputs.max_connections).into_any_element(),
                         )),
                 )
                 .child(
@@ -1170,9 +1271,12 @@ impl Render for SettingsPage {
             .child(proxy_card)
             .child(tls_card)
             .child(network_card)
-            .child(routing_card)
-            .child(tun_card)
-            .child(appearance_card);
+            .child(routing_card);
+        // TUN 仅 Windows 提供；其他平台不渲染该卡片，也不允许启用。
+        if crate::core::tun::TUN_SUPPORTED {
+            content = content.child(tun_card);
+        }
+        content = content.child(appearance_card);
 
         if let Some(error) = self.error.as_ref().or(validation_error.as_ref()) {
             content = content.child(

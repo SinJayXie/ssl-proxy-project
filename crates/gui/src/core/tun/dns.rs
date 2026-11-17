@@ -86,9 +86,9 @@ impl FakeIpMap {
         match serde_json::from_str::<Vec<(String, String)>>(&json) {
             Ok(entries) => {
                 map.restore(&entries);
-                log::info!("已恢复 {} 条 fake-ip 映射", entries.len());
+                log::info!("restored {} fake-ip mappings", entries.len());
             }
-            Err(e) => log::warn!("fake-ip 映射文件损坏，已忽略: {e}"),
+            Err(e) => log::warn!("corrupted fake-ip mapping file, ignored: {e}"),
         }
         map
     }
@@ -237,10 +237,10 @@ pub fn answer_query(
     use trust_dns_proto::rr::rdata::A;
     use trust_dns_proto::rr::{RData, Record, RecordType};
 
-    let query = Message::from_vec(payload).map_err(|e| format!("DNS 报文解析失败: {e}"))?;
+    let query = Message::from_vec(payload).map_err(|e| format!("failed to parse DNS message: {e}"))?;
     let header = query.header();
     if header.message_type() != MessageType::Query || header.op_code() != OpCode::Query {
-        return Err("非标准查询（可能是响应或通知），忽略".into());
+        return Err("non-standard query (possibly a response or notify), ignored".into());
     }
 
     let mut resp = Message::new();
@@ -275,7 +275,7 @@ pub fn answer_query(
         }
     }
 
-    resp.to_vec().map_err(|e| format!("DNS 应答编码失败: {e}"))
+    resp.to_vec().map_err(|e| format!("failed to encode DNS response: {e}"))
 }
 
 /// 为域名分配固定 fake IPv6（同域名重复查询返回同一地址）。

@@ -1,8 +1,9 @@
 [package]
 name = "ssl-proxy-gui"
-version = "2.6.0"
+version = "2.6.2"
 edition = "2024"
 description = "SSL Proxy Client (GPUI)"
+license = "MIT"
 
 [dependencies]
 gpui-kit = "0.9.1"

@@ -106,6 +106,9 @@ impl RulesPage {
             .px_3()
             .py_2()
             .cursor_pointer()
+            // hover 背景需要跟随卡片圆角，否则会被矩形裁切出直角。
+            .when(open, |this| this.rounded_t(px(10.)))
+            .when(!open, |this| this.rounded(px(10.)))
             .hover(move |style| style.bg(header_hover))
             .on_click(move |_, _, cx| {
                 let _ = weak.update(cx, |page, cx| {
@@ -220,6 +223,8 @@ impl RulesPage {
             .when(!is_last, |this| {
                 this.border_b_1().border_color(theme::border_light(cx))
             })
+            // 最后一行贴卡片底边，hover 背景也要跟着底部圆角。
+            .when(is_last, |this| this.rounded_b(px(10.)))
             .hover(move |style| style.bg(row_hover))
             .child(
                 h_flex()

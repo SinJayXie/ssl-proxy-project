@@ -66,7 +66,12 @@ impl StackShared {
         let n = core.fake_map.len();
         core.fake_map = FakeIpMap::new();
         drop(core);
-        log::info!("已清空 {n} 条 fake-ip 映射");
+        log::info!("cleared {n} fake-ip mappings");
+    }
+
+    /// 当前 fake-ip 映射数量（诊断用）。
+    pub fn fakeip_count(&self) -> usize {
+        self.inner.lock().map(|c| c.fake_map.len()).unwrap_or(0)
     }
 
     /// 请求立即轮询一次（写入数据后调用）。
@@ -325,7 +330,7 @@ fn poll_loop(shared: StackShared, wake_rx: std::sync::mpsc::Receiver<()>) {
             // 这是整机卡死的直接前兆，必须留证据。
             let spent = started.elapsed();
             if spent > Duration::from_millis(200) {
-                log::warn!("TUN 协议栈单次 poll 耗时 {spent:?}");
+                log::warn!("TUN stack single poll took {spent:?}");
             }
         }
 
@@ -348,6 +353,11 @@ fn prepare_inbound(core: &mut StackCore, pkt: &[u8]) {
             if core.tcp_pending.contains_key(&ep) || core.udp_flows.contains_key(&ep) {
                 return;
             }
+            // 达到并发上限时直接丢弃新流，已建立的连接不受影响。
+            // SocketSet 无 len()，用 iter().count() 统计当前 socket 数。
+            if at_capacity(core.cfg.max_connections, core.sockets.iter().count()) {
+                return;
+            }
             let mut sock = tcp::Socket::new(
                 smoltcp::socket::tcp::SocketBuffer::new(vec![0; TCP_BUF]),
                 smoltcp::socket::tcp::SocketBuffer::new(vec![0; TCP_BUF]),
@@ -368,6 +378,11 @@ fn prepare_inbound(core: &mut StackCore, pkt: &[u8]) {
             let Ok(udp) = UdpPacket::new_checked(ip.payload()) else { return };
             let ep = IpEndpoint { addr: dst_addr, port: udp.dst_port() };
             if core.udp_flows.contains_key(&ep) || core.tcp_pending.contains_key(&ep) {
+                return;
+            }
+            // 达到并发上限时直接丢弃新流，已建立的连接不受影响。
+            // SocketSet 无 len()，用 iter().count() 统计当前 socket 数。
+            if at_capacity(core.cfg.max_connections, core.sockets.iter().count()) {
                 return;
             }
             let mut sock = smoltcp::socket::udp::Socket::new(
@@ -470,10 +485,13 @@ fn scan_flows(core: &mut StackCore) {
 
 /// 半开连接未被完成的最长存活时间（客户端 RST/放弃 SYN 后立即回收）。
 const PENDING_TTL: Duration = Duration::from_secs(45);
-/// UDP 会话空闲回收时间（超过即释放 socket，后续报文会重新建立）。
-const UDP_IDLE_TTL: Duration = Duration::from_secs(120);
 /// socket 总量告警阈值：正常使用在几十个量级。
 const SOCKET_WARN_LIMIT: usize = 1024;
+
+/// 是否已达到并发 socket 上限（0 = 不限）。
+fn at_capacity(max_connections: usize, current: usize) -> bool {
+    max_connections > 0 && current >= max_connections
+}
 
 /// 回收已结束/超时/空闲的 socket。
 ///
@@ -484,6 +502,7 @@ const SOCKET_WARN_LIMIT: usize = 1024;
 /// - 长时间无流量的 UDP 会话（旧实现从不回收）。
 pub fn reap_closed(core: &mut StackCore) {
     let now = std::time::Instant::now();
+    let udp_idle_ttl = Duration::from_secs(core.cfg.udp_timeout.max(1));
 
     let dead_tcp: Vec<SocketHandle> = core
         .tcp_flows
@@ -531,7 +550,7 @@ pub fn reap_closed(core: &mut StackCore) {
                 && core
                     .udp_at
                     .get(*h)
-                    .is_some_and(|t| now.duration_since(*t) > UDP_IDLE_TTL)
+                    .is_some_and(|t| now.duration_since(*t) > udp_idle_ttl)
         })
         .map(|(ep, h)| (*ep, *h))
         .collect();
@@ -546,7 +565,7 @@ pub fn reap_closed(core: &mut StackCore) {
     let total = core.tcp_pending.len() + core.tcp_flows.len() + core.udp_flows.len();
     if total > SOCKET_WARN_LIMIT {
         log::warn!(
-            "TUN socket 数异常增长: {total}（pending={} flows={} udp={}）",
+            "TUN socket count abnormally high: {total} (pending={} flows={} udp={})",
             core.tcp_pending.len(),
             core.tcp_flows.len(),
             core.udp_flows.len()
@@ -736,5 +755,18 @@ impl Drop for SmolUdpSocket {
     fn drop(&mut self) {
         let mut core = self.shared.lock();
         core.wakers.remove(&self.handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::at_capacity;
+
+    #[test]
+    fn at_capacity_respects_limit() {
+        assert!(!at_capacity(0, 99999));
+        assert!(!at_capacity(10, 9));
+        assert!(at_capacity(10, 10));
+        assert!(at_capacity(10, 11));
     }
 }

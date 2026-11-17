@@ -158,7 +158,6 @@ fn main() {
             {
                 let quit_core = core.clone();
                 cx.spawn(async move |cx| {
-                    let mut ticks: u32 = 0;
                     loop {
                         smol::Timer::after(Duration::from_millis(250)).await;
                         if platform::tray::QUIT_REQUESTED.swap(false, Ordering::Relaxed) {
@@ -166,11 +165,6 @@ fn main() {
                             crate::core::tun::runner::stop_before_exit(&quit_core.state.config_dir);
                             cx.update(|cx| cx.quit());
                             break;
-                        }
-                        // UI 主线程心跳：日志里若 TUN 心跳还在、这里停了，说明是界面线程卡住。
-                        ticks = ticks.wrapping_add(1);
-                        if ticks % 20 == 0 {
-                            log::info!("UI 心跳");
                         }
                     }
                 })

@@ -43,6 +43,39 @@ impl TunStack {
     }
 }
 
+/// TUN 路由范围，对齐 meow-rs 的 tun auto-route 作用域。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TunRouteScope {
+    /// 整机流量进 TUN（0.0.0.0/1 + 128.0.0.0/1）。
+    Global,
+    /// 只把 fake-ip 网段路由进 TUN。
+    FakeIp,
+}
+
+impl Default for TunRouteScope {
+    fn default() -> Self {
+        Self::Global
+    }
+}
+
+impl TunRouteScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TunRouteScope::Global => "global",
+            TunRouteScope::FakeIp => "fake-ip",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "global" => Some(TunRouteScope::Global),
+            "fake-ip" => Some(TunRouteScope::FakeIp),
+            _ => None,
+        }
+    }
+}
+
 /// TUN 运行时配置。默认关闭，启用与否由 setting.yaml 的 tun 段决定。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -53,6 +86,12 @@ pub struct TunConfig {
     pub mtu: u16,
     /// 自动把全网段路由指向 TUN。
     pub auto_route: bool,
+    /// 路由范围：整机全局或仅 fake-ip 网段。
+    pub route_scope: TunRouteScope,
+    /// UDP 会话空闲回收秒数。
+    pub udp_timeout: u64,
+    /// 最大并发连接数；0 = 不限。
+    pub max_connections: usize,
     /// 严格路由：兼容优先时为 false，追求必不泄漏时为 true。
     pub strict_route: bool,
     /// 探测带默认网关的物理网卡作为 DIRECT 出口。
@@ -81,6 +120,9 @@ impl Default for TunConfig {
             device_name: "SSLProxy".to_string(),
             mtu: 1500,
             auto_route: true,
+            route_scope: TunRouteScope::default(),
+            udp_timeout: 60,
+            max_connections: 256,
             strict_route: false,
             auto_detect_interface: true,
             dns_hijack: vec!["any:53".to_string()],
@@ -117,6 +159,18 @@ impl TunConfig {
         }
         if self.device_name.trim().is_empty() {
             return Err("tun.device_name must not be empty".to_string());
+        }
+        if !(10..=86400).contains(&self.udp_timeout) {
+            return Err(format!(
+                "tun.udp-timeout out of range: {}",
+                self.udp_timeout
+            ));
+        }
+        if self.max_connections > 65535 {
+            return Err(format!(
+                "tun.max-connections out of range: {}",
+                self.max_connections
+            ));
         }
         validate_cidr(&self.fake_ip_range).map_err(|e| format!("tun.fake-ip-range: {}", e))?;
         if !self.fake_ip_range6.trim().is_empty() {
@@ -286,5 +340,57 @@ mod tests {
             assert_eq!(TunStack::parse(s).unwrap().as_str(), s);
         }
         assert!(TunStack::parse("bogus").is_none());
+    }
+
+    #[test]
+    fn default_route_scope_and_limits() {
+        let cfg = TunConfig::default();
+        assert_eq!(cfg.route_scope, TunRouteScope::Global);
+        assert_eq!(cfg.udp_timeout, 60);
+        assert_eq!(cfg.max_connections, 256);
+        assert!(cfg.validate().is_ok(), "{:?}", cfg.validate());
+    }
+
+    #[test]
+    fn legacy_config_without_new_fields_keeps_defaults() {
+        let cfg: TunConfig = serde_yaml::from_str("enable: true\n").unwrap();
+        assert!(cfg.enable);
+        assert_eq!(cfg.route_scope, TunRouteScope::Global);
+        assert_eq!(cfg.udp_timeout, 60);
+        assert_eq!(cfg.max_connections, 256);
+    }
+
+    #[test]
+    fn route_scope_deserializes_from_camel_case_key() {
+        let cfg: TunConfig = serde_yaml::from_str("routeScope: fake-ip\n").unwrap();
+        assert_eq!(cfg.route_scope, TunRouteScope::FakeIp);
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_limits() {
+        for timeout in [0, 999999] {
+            let cfg = TunConfig {
+                udp_timeout: timeout,
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_err(), "udp_timeout={} 应被拒绝", timeout);
+        }
+        let cfg = TunConfig {
+            max_connections: 70000,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err(), "max_connections=70000 应被拒绝");
+    }
+
+    #[test]
+    fn route_scope_parse_roundtrip() {
+        for s in ["global", "fake-ip"] {
+            assert_eq!(TunRouteScope::parse(s).unwrap().as_str(), s);
+        }
+        assert_eq!(
+            TunRouteScope::parse(" GLOBAL "),
+            Some(TunRouteScope::Global)
+        );
+        assert!(TunRouteScope::parse("bogus").is_none());
     }
 }

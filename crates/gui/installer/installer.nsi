@@ -41,6 +41,13 @@ XPStyle on
 !ifndef WINTUN_DLL
   !define WINTUN_DLL "..\assets\wintun\wintun.dll"
 !endif
+; Third-party notices: GPLv2 text for Wintun plus the full dependency list.
+!ifndef NOTICES_FILE
+  !define NOTICES_FILE "..\..\..\THIRD-PARTY-NOTICES.md"
+!endif
+!ifndef WINTUN_LICENSE
+  !define WINTUN_LICENSE "..\assets\wintun\LICENSE.txt"
+!endif
 ; Icons live in the repo-root icons/ directory.
 !ifndef ICON_FILE
   !define ICON_FILE "..\..\..\icons\icon.ico"
@@ -117,6 +124,8 @@ Section "Install" SEC_MAIN
   File "/oname=${PRODUCT_EXE}" "${PAYLOAD_EXE}"
   File "/oname=GeoDB.dat" "${SOURCE_GEO}"
   File "/oname=wintun.dll" "${WINTUN_DLL}"
+  File "/oname=THIRD-PARTY-NOTICES.md" "${NOTICES_FILE}"
+  File "/oname=wintun-LICENSE.txt" "${WINTUN_LICENSE}"
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
   ; Start-menu + desktop shortcuts are always (re)created, so upgrades keep a
@@ -145,6 +154,8 @@ Section "Uninstall"
   Delete "$INSTDIR\${PRODUCT_EXE}"
   Delete "$INSTDIR\GeoDB.dat"
   Delete "$INSTDIR\wintun.dll"
+  Delete "$INSTDIR\THIRD-PARTY-NOTICES.md"
+  Delete "$INSTDIR\wintun-LICENSE.txt"
   Delete "$INSTDIR\uninstall.exe"
   Delete "$SMPROGRAMS\${PRODUCT_NAME}.lnk"
   Delete "$DESKTOP\${PRODUCT_NAME}.lnk"

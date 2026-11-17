@@ -438,6 +438,7 @@ async fn handle_datagram(
             udp_mode,
             key,
             generation,
+            origin,
             rx,
         ));
     }
@@ -464,6 +465,8 @@ async fn create_session(
     udp_mode: UdpMode,
     key: (String, u16),
     generation: u64,
+    // 应用侧 UDP 客户端地址（relay 的 recv_from 来源），用于采集进程名。
+    client: std::net::SocketAddr,
     rx: mpsc::Receiver<UdpIn>,
 ) {
     let (host, port) = (key.0.clone(), key.1);
@@ -497,6 +500,7 @@ async fn create_session(
         geo: decision.geo,
         data: DataFlow::new(),
         latency_ms: 0,
+        process: crate::core::proc::process_name_for_udp(client).unwrap_or_default(),
     };
     state.connections.write().await.insert(id, conn_info);
 

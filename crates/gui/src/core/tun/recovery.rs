@@ -86,13 +86,13 @@ pub fn pending_rollback(config_dir: &Path) -> Result<Option<Vec<String>>, String
         Some(snap) => {
             if snap.is_valid() {
                 log::warn!(
-                    "发现 TUN 残留路由快照（pid {}，设备 {}），执行崩溃恢复",
+                    "found residual TUN route snapshot (pid {}, device {}), running crash recovery",
                     snap.pid,
                     snap.device
                 );
                 Ok(Some(snap.down_cmds))
             } else {
-                log::error!("TUN 路由快照无效（可能被篡改或损坏），忽略");
+                log::error!("invalid TUN route snapshot (possibly tampered or corrupted), ignored");
                 Ok(None)
             }
         }

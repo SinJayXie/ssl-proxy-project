@@ -368,6 +368,7 @@ pub async fn resolve_and_connect(
     port: u16,
     is_domain: bool,
     state: &Arc<AppState>,
+    client_peer: Option<std::net::SocketAddr>,
 ) -> Option<ConnectionResult> {
     let config = state.config.read().await;
     let proxy_server = config.proxy_server.clone();
@@ -466,6 +467,10 @@ pub async fn resolve_and_connect(
         geo: geo_info.clone(),
         data: crate::types::DataFlow::new(),
         latency_ms: 0,
+        // 用应用侧 peer 端点在 TCP 表里反查 PID → 进程名。
+        process: client_peer
+            .and_then(crate::core::proc::process_name_for_tcp)
+            .unwrap_or_default(),
     };
 
     {
