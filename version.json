@@ -1,14 +1,11 @@
 {
-    "version":  "2.7.0",
+    "version":  "2.7.1",
     "changelog":  [
-                      "Performance: DNS lookups no longer serialize concurrent connections; cache entries expire after 5 minutes",
-                      "Performance: direct connections dial the already-resolved IP, so first connections to a new host no longer take seconds",
-                      "Connections: TUN direct connections now appear in the connections page with geo info, latency and traffic stats",
-                      "TUN: TUN settings apply immediately on change - no Save button and no app restart needed",
-                      "TUN: route commands no longer flash console windows on TUN toggle or diagnostics",
-                      "Security: rate-limit tables swept periodically, logs rotate at 10 MB, log viewer reads only the tail, fake-ip pool prefixes validated"
+                      "TUN: disabling TUN fully tears down the data plane (stack thread, socket threads and wintun session) instead of leaving the adapter connected forever",
+                      "TUN: the virtual adapter is uninstalled when TUN is disabled, on a failed startup and when a duplicate start is rolled back",
+                      "TUN: leftover adapters from older versions (SSLProxy, SSLProxy-1 ... -4) are removed on startup after residual routes are rolled back"
                   ],
-    "downloadUrl":  "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.7.0_x64-setup.exe",
-    "sha256":  "92eb56393ce225ef3937cec8bb9703d8cbb08968470aa1ba53e753e23d75f249",
-    "signature":  "4d433c8233ce7d592e16b5738ed7efd2c36afcaad19e3063d696708b52589e261e13e19b34aeacc21238f0f1baad58378a74dd88583ebe315fabdd58c76f8607"
+    "downloadUrl":  "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.7.1_x64-setup.exe",
+    "sha256":  "ee5c683e5ff136618c3e871c7c24441cdf121fce39bdaf0f30df59c652384ebd",
+    "signature":  "4a0b4c5780eebec4e109cf0b8d9972cb830efd4fa407db6dc5b3f8e270ac403397c18bd7f8ff70011e4d73c848d89c06cd6536c9f9d2f120ba7ac8ab2809b00a"
 }

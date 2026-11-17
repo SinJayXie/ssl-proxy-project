@@ -12,6 +12,15 @@ struct Entry {
 
 const CHANGELOG: &[Entry] = &[
     Entry {
+        version: "2.7.1",
+        date: "2026-11-17",
+        changes: &[
+            "TUN: disabling TUN now fully tears down the data plane (stack thread, socket threads and wintun session) instead of leaving the adapter connected forever",
+            "TUN: the virtual adapter is uninstalled when TUN is disabled, when startup fails midway and when a duplicate start is rolled back",
+            "TUN: leftover adapters from older versions (SSLProxy, SSLProxy-1 ... -4) are removed on startup after residual routes are rolled back",
+        ],
+    },
+    Entry {
         version: "2.7.0",
         date: "2026-11-17",
         changes: &[

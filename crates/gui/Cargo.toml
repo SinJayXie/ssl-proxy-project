@@ -1,6 +1,6 @@
 [package]
 name = "ssl-proxy-gui"
-version = "2.7.0"
+version = "2.7.1"
 edition = "2024"
 description = "SSL Proxy Client (GPUI)"
 license = "MIT"
@@ -67,6 +67,9 @@ windows = { version = "0.58", features = [
     "Win32_Networking_WinSock",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
+    # 停用 TUN 时用 SetupAPI 从系统卸载虚拟网卡设备。
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
 ] }
 # WinTun 用户态网卡驱动绑定；运行时需 wintun.dll 位于 exe 同目录。
 wintun = "0.4"

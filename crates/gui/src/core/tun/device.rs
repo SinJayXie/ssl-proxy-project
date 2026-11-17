@@ -43,14 +43,40 @@ pub fn device_name_candidates(base: &str) -> Vec<String> {
     names
 }
 
+/// 清理时需要考虑的全部名称：历次启动可能因名字被占用而轮转到 `-N`，
+/// 这些设备都属于本程序的遗留物。
+pub fn stale_adapter_names(base: &str) -> Vec<String> {
+    device_name_candidates(base)
+}
+
 #[cfg(target_os = "windows")]
 mod imp {
     use super::*;
     use crate::core::tun::config::TunConfig;
 
+    /// adapter / session 与读写线程的所有权。
+    ///
+    /// 析构顺序很关键：先置停止标志并 join 读写线程，再关闭会话与网卡。
+    /// 字段按声明顺序析构，所以 `session` 必须写在 `adapter` 前面。
     struct Keepalive {
-        _adapter: Arc<wintun::Adapter>,
-        _session: Arc<wintun::Session>,
+        stop: Arc<AtomicBool>,
+        session: Arc<wintun::Session>,
+        adapter: Arc<wintun::Adapter>,
+        rx_thread: Option<std::thread::JoinHandle<()>>,
+        tx_thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for Keepalive {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            // 读线程 1ms 轮询、写线程 100ms 超时：join 有界，不会卡住调用方。
+            if let Some(t) = self.rx_thread.take() {
+                let _ = t.join();
+            }
+            if let Some(t) = self.tx_thread.take() {
+                let _ = t.join();
+            }
+        }
     }
 
     unsafe impl Send for Keepalive {}
@@ -108,6 +134,20 @@ mod imp {
             log::info!("TUN adapter name in use, using {used_name} instead");
         }
 
+        // 创建之后任何一步失败都要把半创建的网卡设备一并卸载，
+        // 否则"网络连接"里会永久残留一个未连接的虚拟网卡。
+        let result = open_with_adapter(cfg, &used_name, adapter);
+        if result.is_err() {
+            remove_adapter(&used_name);
+        }
+        result
+    }
+
+    fn open_with_adapter(
+        cfg: &TunConfig,
+        used_name: &str,
+        adapter: Arc<wintun::Adapter>,
+    ) -> Result<TunDevice, OpenError> {
         // 接口索引：直连出站绑定 + 路由命令都要用。
         // LUID ≠ ifIndex，必须走系统 API ConvertInterfaceLuidToIndex 转换；
         // 直接取 LUID 位域可能得到 0，会误判为无效。
@@ -143,7 +183,7 @@ mod imp {
         // 读线程：网卡 → 通道。显式 stop 信号保证协议栈退出后线程一定结束
         //（只依赖 send 失败会在"停用后无流量"时永久空转，泄漏 Session）。
         let stop = Arc::new(AtomicBool::new(false));
-        {
+        let rx_thread = {
             let session = session.clone();
             let stop = stop.clone();
             std::thread::Builder::new()
@@ -163,51 +203,157 @@ mod imp {
                         }
                     }
                 })
-                .map_err(|e| format!("failed to start TUN rx thread: {e}"))?;
-        }
+                .map_err(|e| format!("failed to start TUN rx thread: {e}"))?
+        };
 
-        // 写线程：通道 → 网卡。通道关闭后退出。
-        {
+        // 写线程：通道 → 网卡。通道关闭或收到停止信号后退出。
+        let tx_thread = {
             let session = session.clone();
+            let stop = stop.clone();
             std::thread::Builder::new()
                 .name("tun-tx".into())
-                .spawn(move || {
-                    for pkt in out_rx {
-                        // 只发送能完整放入 ring slot 的包：allocate_send_packet
-                        // 的长度与 pkt 不一致时 copy_from_slice 会 panic。
-                        let Some(len) = u16::try_from(pkt.len()).ok() else {
-                            log::debug!("dropping oversized outbound packet: {} bytes", pkt.len());
-                            continue;
-                        };
-                        let mut send = match session.allocate_send_packet(len) {
-                            Ok(p) => p,
-                            Err(_) => break,
-                        };
-                        let dst = send.bytes_mut();
-                        if dst.len() < pkt.len() {
-                            log::debug!(
-                                "dropping outbound packet: need {} bytes, ring slot only {}",
-                                pkt.len(),
-                                dst.len()
-                            );
+                .spawn(move || loop {
+                    // 带超时接收：停用 TUN 时不必等通道关闭（对端可能仍有
+                    // 在途连接持有 StackShared）就能及时退出、释放网卡会话。
+                    let pkt = match out_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Ok(pkt) => pkt,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
                             continue;
                         }
-                        dst[..pkt.len()].copy_from_slice(&pkt);
-                        session.send_packet(send);
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
+                    // 只发送能完整放入 ring slot 的包：allocate_send_packet
+                    // 的长度与 pkt 不一致时 copy_from_slice 会 panic。
+                    let Some(len) = u16::try_from(pkt.len()).ok() else {
+                        log::debug!("dropping oversized outbound packet: {} bytes", pkt.len());
+                        continue;
+                    };
+                    let mut send = match session.allocate_send_packet(len) {
+                        Ok(p) => p,
+                        Err(_) => break,
+                    };
+                    let dst = send.bytes_mut();
+                    if dst.len() < pkt.len() {
+                        log::debug!(
+                            "dropping outbound packet: need {} bytes, ring slot only {}",
+                            pkt.len(),
+                            dst.len()
+                        );
+                        continue;
                     }
+                    dst[..pkt.len()].copy_from_slice(&pkt);
+                    session.send_packet(send);
                 })
-                .map_err(|e| format!("failed to start TUN tx thread: {e}"))?;
-        }
+                .map_err(|e| format!("failed to start TUN tx thread: {e}"))?
+        };
 
         Ok(TunDevice {
             rx: in_rx,
             tx: out_tx,
-            name: used_name.clone(),
+            name: used_name.to_string(),
             mtu: cfg.mtu,
             if_index,
-            stop,
-            keepalive: Some(Box::new(Keepalive { _adapter: adapter, _session: session })),
+            stop: stop.clone(),
+            keepalive: Some(Box::new(Keepalive {
+                stop,
+                session,
+                adapter,
+                rx_thread: Some(rx_thread),
+                tx_thread: Some(tx_thread),
+            })),
         })
+    }
+
+    /// 从系统卸载虚拟网卡设备（尽力而为）。
+    ///
+    /// `WintunCloseAdapter` 只关闭句柄，设备节点仍留在"网络连接"中；这里用
+    /// SetupAPI 按友好名称（即 wintun adapter 名）匹配并删除设备实例，
+    /// 做到"停用 TUN 即卸载网卡"。
+    pub fn remove_adapter(name: &str) {
+        remove_adapters(&[name.to_string()]);
+    }
+
+    /// 批量卸载友好名称匹配 `names` 的虚拟网卡设备，返回实际移除的数量。
+    ///
+    /// 删除设备实例会连带移除挂在该接口上的路由，因此启动时可用于
+    /// 清理旧版本遗留（崩溃退出、昔日未卸载）的网卡。
+    pub fn remove_adapters(names: &[String]) -> usize {
+        if names.is_empty() {
+            return 0;
+        }
+        use windows::core::PCWSTR;
+        use windows::Win32::Devices::DeviceAndDriverInstallation::{
+            SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+            SetupDiGetDeviceRegistryPropertyW, SetupDiRemoveDevice, DIGCF_PRESENT,
+            GUID_DEVCLASS_NET, SPDRP_FRIENDLYNAME, SP_DEVINFO_DATA,
+        };
+
+        let mut removed = 0usize;
+        unsafe {
+            let set = match SetupDiGetClassDevsW(
+                Some(&GUID_DEVCLASS_NET),
+                PCWSTR::null(),
+                None,
+                DIGCF_PRESENT,
+            ) {
+                Ok(set) => set,
+                Err(e) => {
+                    log::warn!("failed to enumerate network adapters for cleanup: {e}");
+                    return 0;
+                }
+            };
+
+            let mut index = 0u32;
+            loop {
+                let mut info = SP_DEVINFO_DATA {
+                    cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+                    ..Default::default()
+                };
+                if SetupDiEnumDeviceInfo(set, index, &mut info).is_err() {
+                    break;
+                }
+                index += 1;
+
+                // 友好名以 UTF-16 返回；缓冲区按字节视图传入。
+                let mut buf = [0u16; 256];
+                let mut bytes = std::slice::from_raw_parts_mut(
+                    buf.as_mut_ptr().cast::<u8>(),
+                    buf.len() * std::mem::size_of::<u16>(),
+                );
+                let mut needed = 0u32;
+                let ok = SetupDiGetDeviceRegistryPropertyW(
+                    set,
+                    &info,
+                    SPDRP_FRIENDLYNAME,
+                    None,
+                    Some(&mut bytes),
+                    Some(&mut needed),
+                )
+                .is_ok();
+                if !ok {
+                    continue;
+                }
+                let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+                let friendly = String::from_utf16_lossy(&buf[..end]);
+                if !names.iter().any(|n| *n == friendly) {
+                    continue;
+                }
+                if SetupDiRemoveDevice(set, &mut info).as_bool() {
+                    removed += 1;
+                    log::info!("TUN adapter {friendly} removed from the system");
+                } else {
+                    log::warn!(
+                        "failed to remove TUN adapter {friendly}: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+            let _ = SetupDiDestroyDeviceInfoList(set);
+        }
+        removed
     }
 
     /// 解析 fake-ip 网关（"198.18.0.1/16" → (IPv4, /30 掩码)）。
@@ -350,7 +496,7 @@ mod imp {
 }
 
 #[cfg(target_os = "windows")]
-pub use imp::open;
+pub use imp::{open, remove_adapter, remove_adapters};
 
 #[cfg(not(target_os = "windows"))]
 mod imp {
@@ -360,10 +506,18 @@ mod imp {
     pub fn open(_cfg: &TunConfig) -> Result<TunDevice, OpenError> {
         Err("TUN is only supported on Windows".into())
     }
+
+    /// 非 Windows 无 TUN 设备可卸载。
+    pub fn remove_adapter(_name: &str) {}
+
+    /// 非 Windows 无 TUN 设备可卸载。
+    pub fn remove_adapters(_names: &[String]) -> usize {
+        0
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
-pub use imp::open;
+pub use imp::{open, remove_adapter, remove_adapters};
 
 #[cfg(test)]
 mod tests {
@@ -399,5 +553,16 @@ mod tests {
                 "SSLProxy-4".to_string(),
             ]
         );
+    }
+
+    /// 启动清理必须覆盖历次轮转出来的所有名称，否则 `-N` 设备会永久残留。
+    #[test]
+    fn stale_adapter_names_cover_all_candidates() {
+        let names = super::stale_adapter_names("SSLProxy");
+        assert_eq!(names.len(), 5);
+        assert!(names.contains(&"SSLProxy".to_string()));
+        for n in 1..5 {
+            assert!(names.contains(&format!("SSLProxy-{n}")));
+        }
     }
 }

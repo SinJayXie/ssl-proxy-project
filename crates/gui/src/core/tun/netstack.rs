@@ -22,6 +22,7 @@ use smoltcp::wire::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, UNIX_EPOCH};
@@ -52,6 +53,9 @@ pub enum FlowEvent {
 pub struct StackShared {
     inner: Arc<Mutex<StackCore>>,
     wake_tx: std::sync::mpsc::Sender<()>,
+    /// 停止信号：与网卡读线程共用。轮询线程只看它，避免"线程自己持有
+    /// wake_tx 导致通道永不 Disconnected、循环永不退出"的自锁。
+    stop: Arc<AtomicBool>,
 }
 
 impl StackShared {
@@ -77,6 +81,26 @@ impl StackShared {
     /// 请求立即轮询一次（写入数据后调用）。
     pub fn wake(&self) {
         let _ = self.wake_tx.send(());
+    }
+
+    /// 请求停止协议栈线程（TUN 停用时调用）。置位后唤醒一次，
+    /// 轮询线程在 ≤20ms 内退出，随后网卡读/写线程也会随之结束。
+    pub fn request_stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.wake_tx.send(());
+    }
+
+    /// 协议栈是否已被请求停止（线程退出前自查用）。
+    pub fn is_stopping(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    /// 关闭网卡会话。必须在协议栈线程 join 之后调用：
+    /// 取出 keepalive 即析构，其 Drop 会先 join 网卡读写线程，
+    /// 再按 session → adapter 的顺序关闭（之后才能从系统卸载设备）。
+    pub fn close_device(&self) {
+        let keepalive = self.lock().keepalive.take();
+        drop(keepalive);
     }
 }
 
@@ -209,16 +233,18 @@ impl smoltcp::phy::TxToken for TxToken<'_> {
     }
 }
 
-/// 启动轮询线程，返回共享句柄。`fake_map` 传入持久化恢复的映射表。
+/// 启动轮询线程，返回共享句柄与线程句柄（停用 TUN 时需要 join 以确保
+/// 网卡会话在线程退出后才关闭）。`fake_map` 传入持久化恢复的映射表。
 pub fn spawn(
     device: TunDevice,
     cfg: TunConfig,
     events_tx: std::sync::mpsc::Sender<FlowEvent>,
     fake_map: FakeIpMap,
-) -> StackShared {
+) -> (StackShared, std::thread::JoinHandle<()>) {
     let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
     let stop = device.stop.clone();
     let shared = StackShared {
+        stop: stop.clone(),
         inner: Arc::new(Mutex::new(StackCore {
             iface: build_iface(device.mtu, &cfg),
             sockets: SocketSet::new(vec![]),
@@ -243,15 +269,15 @@ pub fn spawn(
     };
 
     let loop_shared = shared.clone();
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("tun-stack".into())
         .spawn(move || {
             poll_loop(loop_shared, wake_rx);
             // 协议栈退出即停止读线程，避免其继续空转并持有网卡会话。
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            stop.store(true, Ordering::Relaxed);
         })
         .expect("spawn tun stack thread");
-    shared
+    (shared, handle)
 }
 
 fn build_iface(mtu: u16, cfg: &TunConfig) -> Interface {
@@ -306,6 +332,11 @@ fn poll_loop(shared: StackShared, wake_rx: std::sync::mpsc::Receiver<()>) {
         match wake_rx.recv_timeout(Duration::from_millis(20)) {
             Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        // 停止信号：本线程自己持有 wake_tx，通道不会 Disconnected，
+        // 必须靠显式标志退出，否则停用 TUN 后网卡永远不关闭。
+        if shared.is_stopping() {
+            return;
         }
         let mut core = shared.lock();
         // 背压：队列满时停止取包（留在通道里），而不是取出来后静默丢弃
@@ -761,6 +792,7 @@ impl Drop for SmolUdpSocket {
 #[cfg(test)]
 mod tests {
     use super::at_capacity;
+    use super::*;
 
     #[test]
     fn at_capacity_respects_limit() {
@@ -768,5 +800,56 @@ mod tests {
         assert!(!at_capacity(10, 9));
         assert!(at_capacity(10, 10));
         assert!(at_capacity(10, 11));
+    }
+
+    /// 停用 TUN 时轮询线程必须能退出。
+    ///
+    /// 回归点：线程自身持有 `wake_tx`，唤醒通道永远不会 Disconnected，
+    /// 只靠通道关闭判断退出的实现会永久阻塞 → 网卡会话不关闭、设备残留。
+    #[test]
+    fn poll_loop_exits_on_stop_request() {
+        let cfg = TunConfig::default();
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
+        let (dev_tx, _dev_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (_pkt_tx, pkt_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (ev_tx, _ev_rx) = std::sync::mpsc::channel::<FlowEvent>();
+
+        let shared = StackShared {
+            inner: Arc::new(Mutex::new(StackCore {
+                iface: build_iface(1500, &cfg),
+                sockets: SocketSet::new(vec![]),
+                wakers: HashMap::new(),
+                device_tx: dev_tx,
+                rx: pkt_rx,
+                queue: VecDeque::new(),
+                tcp_pending: HashMap::new(),
+                pending_at: HashMap::new(),
+                tcp_flows: HashMap::new(),
+                udp_flows: HashMap::new(),
+                udp_at: HashMap::new(),
+                removed_sockets: Default::default(),
+                kinds: HashMap::new(),
+                keepalive: None,
+                events: ev_tx,
+                fake_map: FakeIpMap::new(),
+                cfg,
+            })),
+            wake_tx,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+
+        let loop_shared = shared.clone();
+        let handle = std::thread::spawn(move || poll_loop(loop_shared, wake_rx));
+        shared.request_stop();
+
+        // 借助带超时的 join 通道：原实现会永久阻塞，测试应当失败而不是挂死。
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("poll_loop must exit after request_stop");
     }
 }

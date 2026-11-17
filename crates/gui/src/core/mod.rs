@@ -52,7 +52,15 @@ impl Core {
 
         let core = Self { state, runtime };
         // 崩溃恢复：先撤销上次异常退出残留的路由，再按当前配置决定是否启用 TUN。
-        crate::core::tun::runner::recover_on_startup(&core.state.config_dir);
+        // 同时清理历次遗留的 TUN 虚拟网卡（旧版本停用时不卸载设备）。
+        let tun_device_name = core
+            .snapshot_config()
+            .map(|cfg| cfg.tun.device_name)
+            .unwrap_or_else(|| crate::core::tun::config::TunConfig::default().device_name);
+        crate::core::tun::runner::recover_on_startup(
+            &core.state.config_dir,
+            &tun_device_name,
+        );
         core.apply_tun();
         core
     }

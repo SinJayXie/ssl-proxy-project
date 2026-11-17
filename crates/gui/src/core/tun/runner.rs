@@ -23,6 +23,8 @@ pub struct TunManager {
     /// 当前生效配置（用于热重载 Equal 判定：未变则不重建网卡）。
     active_cfg: Option<TunConfig>,
     shared: Option<netstack::StackShared>,
+    /// 协议栈线程句柄：停用时 join，确保网卡会话在线程退出后才关闭。
+    stack_thread: Option<std::thread::JoinHandle<()>>,
     down_cmds: Vec<String>,
     /// 实际启用的网卡名（可能因冲突轮转为 "SSLProxy-1" 等）。
     device_name: Option<String>,
@@ -36,6 +38,7 @@ fn manager() -> &'static Mutex<TunManager> {
     MANAGER.get_or_init(|| Mutex::new(TunManager {
         active_cfg: None,
         shared: None,
+        stack_thread: None,
         down_cmds: vec![],
         device_name: None,
         if_index: None,
@@ -131,16 +134,21 @@ pub async fn apply(state: Arc<AppState>) {
 
     match action {
         Action::Start | Action::Restart => match start(state, &cfg).await {
-            Ok((shared, down, device_name, if_index)) => {
+            Ok((shared, stack_thread, down, device_name, if_index)) => {
                 let m = manager();
                 let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
                 if g.shared.is_some() {
                     // 并发触发的重复启动：先回滚本次结果再登记旧实例。
                     routes::execute(&down);
+                    shared.request_stop();
+                    let _ = stack_thread.join();
+                    shared.close_device();
+                    crate::core::tun::device::remove_adapter(&device_name);
                     return;
                 }
                 g.active_cfg = Some(cfg.clone());
                 g.shared = Some(shared);
+                g.stack_thread = Some(stack_thread);
                 g.down_cmds = down;
                 g.device_name = Some(device_name);
                 g.if_index = Some(if_index);
@@ -159,7 +167,16 @@ pub async fn apply(state: Arc<AppState>) {
 async fn start(
     state: Arc<AppState>,
     cfg: &TunConfig,
-) -> Result<(netstack::StackShared, Vec<String>, String, u32), String> {
+) -> Result<
+    (
+        netstack::StackShared,
+        std::thread::JoinHandle<()>,
+        Vec<String>,
+        String,
+        u32,
+    ),
+    String,
+> {
     cfg.validate()?;
 
     // 1. 代理服务器 IP（域名先经现有 resolver 解析，供路由例外防自环）。
@@ -233,7 +250,7 @@ async fn start(
     let fake_map = crate::core::tun::dns::FakeIpMap::load_from(&fakeip_path(&state.config_dir));
     // 实际网卡名可能因冲突轮转，随启动结果返回并登记到 manager。
     let tun_name = tun_dev.name.clone();
-    let shared = netstack::spawn(tun_dev, cfg.clone(), ev_tx, fake_map);
+    let (shared, stack_thread) = netstack::spawn(tun_dev, cfg.clone(), ev_tx, fake_map);
     let env = OutboundEnv::new(
         Some(phys.if_index),
         Some(tun_if_index),
@@ -273,7 +290,13 @@ async fn start(
         phys.if_index,
         phys.local_ipv4
     );
-    Ok((shared, program.down, tun_name, tun_if_index))
+    Ok((
+        shared,
+        stack_thread,
+        program.down,
+        tun_name,
+        tun_if_index,
+    ))
 }
 
 /// 清空 Windows 系统 DNS 缓存（TUN 启停时调用，防 fake-ip 残留缓存）。
@@ -365,12 +388,32 @@ fn stop_inner(m: &mut TunManager, config_dir: Option<&std::path::Path>) {
             }
         }
     }
+    // 先回滚路由，再拆网卡：反序会让流量在"无网卡、仍有路由"的窗口被黑洞。
     routes::execute(&m.down_cmds);
     m.down_cmds.clear();
+
+    // 协议栈线程 → 网卡读写线程 → 会话/网卡句柄，必须按此顺序释放，
+    // 否则线程仍在使用已关闭的会话（且网卡永远不关闭，残留设备节点）。
+    if let Some(shared) = &m.shared {
+        shared.request_stop();
+    }
+    if let Some(thread) = m.stack_thread.take() {
+        let _ = thread.join();
+    }
+    if let Some(shared) = &m.shared {
+        shared.close_device();
+    }
+
     m.active_cfg = None;
-    m.shared = None; // 丢弃共享句柄 → 通道关闭 → 协议栈线程退出 → 网卡关闭
-    m.device_name = None;
+    m.shared = None; // 丢弃共享句柄 → 协议栈状态与通道随之释放
+    let removed_name = m.device_name.take();
     m.if_index = None;
+
+    // 从系统卸载虚拟网卡设备（SetupAPI 尽力而为；句柄已关闭）。
+    if let Some(name) = &removed_name {
+        crate::core::tun::device::remove_adapter(name);
+    }
+
     // 停止后 fake-ip 不再可达，清缓存让应用尽快重新走真实 DNS（后台执行，不阻塞退出）。
     flush_system_dns_cache_async();
     if let Some(dir) = config_dir {
@@ -392,9 +435,10 @@ pub fn stop_before_exit(config_dir: &std::path::Path) {
     }
 }
 
-/// 启动自检：回滚上次异常退出残留的 TUN 路由（崩溃恢复）。
+/// 启动自检：回滚上次异常退出残留的 TUN 路由（崩溃恢复），并清理历次遗留的
+/// 虚拟网卡（旧版本停用 TUN 时不会卸载设备）。
 /// 在 Core 构造后、apply_tun 之前调用，避免残留路由干扰物理网卡探测。
-pub fn recover_on_startup(config_dir: &std::path::Path) {
+pub fn recover_on_startup(config_dir: &std::path::Path, device_name: &str) {
     if !crate::core::tun::TUN_SUPPORTED {
         return;
     }
@@ -412,6 +456,14 @@ pub fn recover_on_startup(config_dir: &std::path::Path) {
         }
         Ok(None) => {}
         Err(e) => log::error!("failed to read TUN route snapshot (skipping crash recovery): {e}"),
+    }
+
+    // 顺序必须在路由回滚之后：删除设备实例会连带移除挂在该接口上的路由，
+    // 先删设备会让上面的回滚命令因"找不到路由"而报失败。
+    let names = crate::core::tun::device::stale_adapter_names(device_name);
+    let removed = crate::core::tun::device::remove_adapters(&names);
+    if removed > 0 {
+        log::info!("removed {removed} leftover TUN adapter(s) on startup");
     }
 }
 
