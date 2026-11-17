@@ -270,7 +270,7 @@ async fn start(
     spawn_event_pump(state.clone(), shared.clone(), ev_rx, env);
     spawn_reaper(shared.clone());
     spawn_fakeip_saver(state.config_dir.clone(), shared.clone());
-    spawn_egress_monitor(state.clone(), tun_if_index);
+    spawn_egress_monitor(state.clone(), tun_if_index, shared.stop_flag());
 
     // 清理系统 DNS 缓存：上次 TUN 会话的 fake-ip 可能仍被 OS 缓存，
     // 应用拿到缓存后不会重新查询，反查将失败（fail-closed 拒绝该流）。
@@ -350,6 +350,10 @@ fn spawn_fakeip_saver(config_dir: std::path::PathBuf, shared: netstack::StackSha
             let mut saved_len = usize::MAX;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                // 停用 TUN 后退出：停止流程已同步落盘过，这里不再需要轮询。
+                if shared.is_stopping() {
+                    break;
+                }
                 let (entries, len) = {
                     let core = shared.lock();
                     (core.fake_map.entries(), core.fake_map.len())
@@ -404,6 +408,8 @@ fn stop_inner(m: &mut TunManager, config_dir: Option<&std::path::Path>) {
         shared.close_device();
     }
 
+    // 基础网卡名（清理同名重复设备时用；在清空 active_cfg 前取出）。
+    let base_name = m.active_cfg.as_ref().map(|cfg| cfg.device_name.clone());
     m.active_cfg = None;
     m.shared = None; // 丢弃共享句柄 → 协议栈状态与通道随之释放
     let removed_name = m.device_name.take();
@@ -412,6 +418,10 @@ fn stop_inner(m: &mut TunManager, config_dir: Option<&std::path::Path>) {
     // 从系统卸载虚拟网卡设备（SetupAPI 尽力而为；句柄已关闭）。
     if let Some(name) = &removed_name {
         crate::core::tun::device::remove_adapter(name);
+    }
+    // 同一基础名下可能有旧版本遗留的重复设备（`SSLProxy 2` 等），一并清掉。
+    if let Some(base) = base_name {
+        crate::core::tun::device::remove_leftover_adapters(&base);
     }
 
     // 停止后 fake-ip 不再可达，清缓存让应用尽快重新走真实 DNS（后台执行，不阻塞退出）。
@@ -460,8 +470,7 @@ pub fn recover_on_startup(config_dir: &std::path::Path, device_name: &str) {
 
     // 顺序必须在路由回滚之后：删除设备实例会连带移除挂在该接口上的路由，
     // 先删设备会让上面的回滚命令因"找不到路由"而报失败。
-    let names = crate::core::tun::device::stale_adapter_names(device_name);
-    let removed = crate::core::tun::device::remove_adapters(&names);
+    let removed = crate::core::tun::device::remove_leftover_adapters(device_name);
     if removed > 0 {
         log::info!("removed {removed} leftover TUN adapter(s) on startup");
     }
@@ -475,17 +484,30 @@ fn spawn_event_pump(
     env: OutboundEnv,
 ) {
     let rt = tokio::runtime::Handle::try_current().ok();
+    let stop = shared.stop_flag();
     std::thread::Builder::new()
         .name("tun-events".into())
-        .spawn(move || {
-            for ev in ev_rx {
-                let state = state.clone();
-                let shared = shared.clone();
-                let env = env.clone();
-                match &rt {
-                    Some(rt) => rt.spawn(outbound::handle_event(state, shared, ev, env)),
-                    None => break,
-                };
+        .spawn(move || loop {
+            // 带超时接收：本线程持有 StackShared，若不看停止信号会永久阻塞，
+            // 协议栈状态（含心跳任务）便无法释放。
+            let ev = match ev_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(ev) => ev,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            let state = state.clone();
+            let shared = shared.clone();
+            let env = env.clone();
+            match &rt {
+                Some(rt) => {
+                    rt.spawn(outbound::handle_event(state, shared, ev, env));
+                }
+                None => break,
             }
         })
         .expect("spawn tun event pump");
@@ -522,13 +544,21 @@ pub fn clear_fakeip(state: &AppState) -> Result<usize, String> {
 ///
 /// 直连出站本身按目标实时解析（netinfo::resolve_egress），这里只负责
 /// 让 DNS 查询与日志跟上变化，避免出现「直连已切换、DNS 还绑旧网卡」。
-fn spawn_egress_monitor(state: Arc<AppState>, tun_if_index: u32) {
+fn spawn_egress_monitor(
+    state: Arc<AppState>,
+    tun_if_index: u32,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) {
     let rt = tokio::runtime::Handle::try_current().ok();
     if let Some(rt) = rt {
         rt.spawn(async move {
             let mut last = netinfo::default_egress(tun_if_index);
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                // 停用 TUN 后退出，避免每次启停都留下一个常驻轮询任务。
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 let current = netinfo::default_egress(tun_if_index);
                 let changed = match (last, current) {
                     (Some(a), Some(b)) => {
@@ -567,6 +597,11 @@ fn spawn_reaper(shared: netstack::StackShared) {
         rt.spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                // 停用 TUN 后必须退出，否则心跳会一直打，且本任务持有
+                // StackShared 使协议栈状态无法释放。
+                if shared.is_stopping() {
+                    break;
+                }
                 let mut core = shared.lock();
                 netstack::reap_closed(&mut core);
                 let (pending, flows, udp, queued) = core.stats();

@@ -12,12 +12,21 @@ struct Entry {
 
 const CHANGELOG: &[Entry] = &[
     Entry {
+        version: "2.7.2",
+        date: "2026-11-17",
+        changes: &[
+            "Dashboard: a TUN card shows the current state and lets you toggle TUN without opening Settings (applies immediately)",
+            "TUN: heartbeat, fake-ip saver, egress monitor and the event pump now exit together with TUN, so no heartbeat lines appear after disabling and toggling no longer accumulates background tasks",
+            "TUN: the adapter is reopened when it already exists and uses a stable GUID derived from its name, so toggling TUN no longer creates SSLProxy 2, SSLProxy 3, ...",
+            "TUN: leftover adapters (SSLProxy, SSLProxy-1 ... -4, suffixed SSLProxy 2, 3 ... and the early SSLProxy Tunnel Tunnel form) are removed on startup; only wintun devices are touched",
+        ],
+    },
+    Entry {
         version: "2.7.1",
         date: "2026-11-17",
         changes: &[
             "TUN: disabling TUN now fully tears down the data plane (stack thread, socket threads and wintun session) instead of leaving the adapter connected forever",
             "TUN: the virtual adapter is uninstalled when TUN is disabled, when startup fails midway and when a duplicate start is rolled back",
-            "TUN: leftover adapters from older versions (SSLProxy, SSLProxy-1 ... -4) are removed on startup after residual routes are rolled back",
         ],
     },
     Entry {

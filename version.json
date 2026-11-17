@@ -1,11 +1,12 @@
 {
-    "version":  "2.7.1",
+    "version":  "2.7.2",
     "changelog":  [
-                      "TUN: disabling TUN fully tears down the data plane (stack thread, socket threads and wintun session) instead of leaving the adapter connected forever",
-                      "TUN: the virtual adapter is uninstalled when TUN is disabled, on a failed startup and when a duplicate start is rolled back",
-                      "TUN: leftover adapters from older versions (SSLProxy, SSLProxy-1 ... -4) are removed on startup after residual routes are rolled back"
+                      "Dashboard: a TUN card shows the current state and toggles it without opening Settings",
+                      "TUN: heartbeat, fake-ip saver, egress monitor and the event pump now exit with TUN (no heartbeat lines after disabling)",
+                      "TUN: the adapter is reopened when it exists and uses a stable GUID, so toggling no longer creates SSLProxy 2, 3, ...",
+                      "TUN: leftover adapters (SSLProxy, -1 ... -4, suffixed SSLProxy 2, 3 ... and SSLProxy Tunnel Tunnel) are removed on startup (wintun devices only)"
                   ],
-    "downloadUrl":  "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.7.1_x64-setup.exe",
+    "downloadUrl":  "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.7.2_x64-setup.exe",
     "sha256":  "ee5c683e5ff136618c3e871c7c24441cdf121fce39bdaf0f30df59c652384ebd",
     "signature":  "4a0b4c5780eebec4e109cf0b8d9972cb830efd4fa407db6dc5b3f8e270ac403397c18bd7f8ff70011e4d73c848d89c06cd6536c9f9d2f120ba7ac8ab2809b00a"
 }

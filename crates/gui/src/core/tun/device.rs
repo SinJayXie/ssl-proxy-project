@@ -43,10 +43,51 @@ pub fn device_name_candidates(base: &str) -> Vec<String> {
     names
 }
 
-/// 清理时需要考虑的全部名称：历次启动可能因名字被占用而轮转到 `-N`，
-/// 这些设备都属于本程序的遗留物。
-pub fn stale_adapter_names(base: &str) -> Vec<String> {
-    device_name_candidates(base)
+/// 由网卡名派生固定 GUID。
+///
+/// 必须固定：`wintun::Adapter::create(name, .., None)` 每次都会生成新的随机
+/// GUID，Windows 会为同名但 GUID 不同的设备再建一个实例，于是每开关一次
+/// TUN 就多一张网卡（显示为 `SSLProxy`、`SSLProxy 2` …）。传入稳定 GUID 后
+/// 同名同 GUID 会**复用**已存在的设备，不再新增。
+pub fn adapter_guid(name: &str) -> u128 {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"ssl-proxy-tun-adapter:");
+    hasher.update(name.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // 按 UUID v5 形式填充 version / variant 位（仅格式规范，不影响稳定性）。
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    u128::from_be_bytes(bytes)
+}
+
+/// 判定网卡友好名是否属于本程序的遗留设备。
+///
+/// 兼容三种形态：
+/// - 旧版本轮转出的 `SSLProxy-1 ... -4`；
+/// - Windows 为同名设备自动追加的 `SSLProxy 2`、`SSLProxy 42`；
+/// - 早期版本把隧道类型拼进名字的 `SSLProxy Tunnel Tunnel`。
+///
+/// 因此 `-` 后缀只接受数字（避免误伤 `Wi-FI` 这类），空格后缀则接受任意
+/// 非空内容；调用方还会额外校验设备服务为 wintun，双重保险。
+pub fn is_leftover_adapter_name(friendly: &str, base: &str) -> bool {
+    if friendly == base {
+        return true;
+    }
+    let Some(rest) = friendly.strip_prefix(base) else {
+        return false;
+    };
+    if let Some(digits) = rest.strip_prefix('-') {
+        return !digits.is_empty()
+            && digits.len() <= 2
+            && digits.bytes().all(|b| b.is_ascii_digit());
+    }
+    if let Some(tail) = rest.strip_prefix(' ') {
+        return !tail.trim().is_empty();
+    }
+    false
 }
 
 #[cfg(target_os = "windows")]
@@ -105,22 +146,49 @@ mod imp {
         let candidates = device_name_candidates(&cfg.device_name);
         let total = candidates.len();
         for (idx, name) in candidates.into_iter().enumerate() {
-            match wintun::Adapter::create(&dll, &name, "SSLProxy Tunnel", None) {
-                Ok(a) => {
+            // 首选名称先重试几次：停用 TUN 后设备可能正处于异步移除中，
+            // 此刻同名重建会短暂失败，不应立刻轮转到 `-N`（那会不断新增网卡）。
+            let attempts = if idx == 0 { 3 } else { 1 };
+            for attempt in 0..attempts {
+                // 先尝试打开同名已有网卡：直接复用设备，绝不会新建实例
+                //（`create` 在名字已存在时是否复用取决于 GUID，不够确定）。
+                if let Ok(a) = wintun::Adapter::open(&dll, &name) {
+                    log::debug!("reusing existing TUN adapter {name}");
                     used_name = Some(name);
                     adapter = Some(a);
                     break;
                 }
-                Err(e) => {
-                    // 只在第一次失败时 warn，避免多次尝试刷屏。
-                    if idx == 0 {
-                        log::warn!("failed to create TUN adapter {name}, trying next name: {e}");
+                // 不存在才创建；传固定 GUID，保证下次仍指向同一设备。
+                match wintun::Adapter::create(
+                    &dll,
+                    &name,
+                    "SSLProxy Tunnel",
+                    Some(adapter_guid(&name)),
+                ) {
+                    Ok(a) => {
+                        used_name = Some(name);
+                        adapter = Some(a);
+                        break;
                     }
-                    last_err = Some(e.to_string());
-                    if idx + 1 < total {
-                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    Err(e) => {
+                        // 只在首次失败时 warn，避免多次尝试刷屏。
+                        if idx == 0 && attempt == 0 {
+                            log::warn!("failed to create TUN adapter {name}, retrying: {e}");
+                        } else {
+                            log::debug!("TUN adapter {name} create attempt failed: {e}");
+                        }
+                        last_err = Some(e.to_string());
+                        if attempt + 1 < attempts {
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                        }
                     }
                 }
+            }
+            if adapter.is_some() {
+                break;
+            }
+            if idx + 1 < total {
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
         }
         let (used_name, adapter) = match (used_name, adapter) {
@@ -273,22 +341,22 @@ mod imp {
     /// SetupAPI 按友好名称（即 wintun adapter 名）匹配并删除设备实例，
     /// 做到"停用 TUN 即卸载网卡"。
     pub fn remove_adapter(name: &str) {
-        remove_adapters(&[name.to_string()]);
+        remove_adapters_where(|friendly| friendly == name);
     }
 
-    /// 批量卸载友好名称匹配 `names` 的虚拟网卡设备，返回实际移除的数量。
-    ///
-    /// 删除设备实例会连带移除挂在该接口上的路由，因此启动时可用于
-    /// 清理旧版本遗留（崩溃退出、昔日未卸载）的网卡。
-    pub fn remove_adapters(names: &[String]) -> usize {
-        if names.is_empty() {
-            return 0;
-        }
+    /// 清理本程序遗留的全部网卡：`SSLProxy`、`SSLProxy-1 ... -4`，
+    /// 以及 Windows 为同名设备自动追加的 `SSLProxy 2`、`SSLProxy 3`。
+    pub fn remove_leftover_adapters(base: &str) -> usize {
+        remove_adapters_where(|friendly| is_leftover_adapter_name(friendly, base))
+    }
+
+    /// 枚举网络类设备，删除友好名满足 `matches` 的设备，返回移除数量。
+    fn remove_adapters_where(matches: impl Fn(&str) -> bool) -> usize {
         use windows::core::PCWSTR;
         use windows::Win32::Devices::DeviceAndDriverInstallation::{
             SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
-            SetupDiGetDeviceRegistryPropertyW, SetupDiRemoveDevice, DIGCF_PRESENT,
-            GUID_DEVCLASS_NET, SPDRP_FRIENDLYNAME, SP_DEVINFO_DATA,
+            SetupDiRemoveDevice, DIGCF_PRESENT, GUID_DEVCLASS_NET, SPDRP_FRIENDLYNAME,
+            SPDRP_SERVICE, SP_DEVINFO_DATA,
         };
 
         let mut removed = 0usize;
@@ -318,27 +386,20 @@ mod imp {
                 index += 1;
 
                 // 友好名以 UTF-16 返回；缓冲区按字节视图传入。
-                let mut buf = [0u16; 256];
-                let mut bytes = std::slice::from_raw_parts_mut(
-                    buf.as_mut_ptr().cast::<u8>(),
-                    buf.len() * std::mem::size_of::<u16>(),
-                );
-                let mut needed = 0u32;
-                let ok = SetupDiGetDeviceRegistryPropertyW(
-                    set,
-                    &info,
-                    SPDRP_FRIENDLYNAME,
-                    None,
-                    Some(&mut bytes),
-                    Some(&mut needed),
-                )
-                .is_ok();
-                if !ok {
+                let Some(friendly) = read_string_property(set, &info, SPDRP_FRIENDLYNAME) else {
+                    continue;
+                };
+                if !matches(&friendly) {
                     continue;
                 }
-                let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
-                let friendly = String::from_utf16_lossy(&buf[..end]);
-                if !names.iter().any(|n| *n == friendly) {
+                // 只动 wintun 设备：名字前缀 + 驱动服务双重校验，
+                // 避免误删恰好同名的物理网卡或其他厂商的虚拟网卡。
+                let service = read_string_property(set, &info, SPDRP_SERVICE)
+                    .unwrap_or_default();
+                if !service.eq_ignore_ascii_case("wintun") {
+                    log::debug!(
+                        "skipping adapter {friendly} (service {service:?} is not wintun)"
+                    );
                     continue;
                 }
                 if SetupDiRemoveDevice(set, &mut info).as_bool() {
@@ -354,6 +415,35 @@ mod imp {
             let _ = SetupDiDestroyDeviceInfoList(set);
         }
         removed
+    }
+
+    /// 读取设备注册表字符串属性（如友好名、驱动服务名）。
+    unsafe fn read_string_property(
+        set: windows::Win32::Devices::DeviceAndDriverInstallation::HDEVINFO,
+        info: &windows::Win32::Devices::DeviceAndDriverInstallation::SP_DEVINFO_DATA,
+        property: windows::Win32::Devices::DeviceAndDriverInstallation::SETUP_DI_REGISTRY_PROPERTY,
+    ) -> Option<String> {
+        use windows::Win32::Devices::DeviceAndDriverInstallation::SetupDiGetDeviceRegistryPropertyW;
+
+        unsafe {
+            let mut buf = [0u16; 256];
+            let mut bytes = std::slice::from_raw_parts_mut(
+                buf.as_mut_ptr().cast::<u8>(),
+                buf.len() * std::mem::size_of::<u16>(),
+            );
+            let mut needed = 0u32;
+            SetupDiGetDeviceRegistryPropertyW(
+                set,
+                info,
+                property,
+                None,
+                Some(&mut bytes),
+                Some(&mut needed),
+            )
+            .ok()?;
+            let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+            Some(String::from_utf16_lossy(&buf[..end]))
+        }
     }
 
     /// 解析 fake-ip 网关（"198.18.0.1/16" → (IPv4, /30 掩码)）。
@@ -496,7 +586,7 @@ mod imp {
 }
 
 #[cfg(target_os = "windows")]
-pub use imp::{open, remove_adapter, remove_adapters};
+pub use imp::{open, remove_adapter, remove_leftover_adapters};
 
 #[cfg(not(target_os = "windows"))]
 mod imp {
@@ -511,13 +601,13 @@ mod imp {
     pub fn remove_adapter(_name: &str) {}
 
     /// 非 Windows 无 TUN 设备可卸载。
-    pub fn remove_adapters(_names: &[String]) -> usize {
+    pub fn remove_leftover_adapters(_base: &str) -> usize {
         0
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-pub use imp::{open, remove_adapter, remove_adapters};
+pub use imp::{open, remove_adapter, remove_leftover_adapters};
 
 #[cfg(test)]
 mod tests {
@@ -555,14 +645,42 @@ mod tests {
         );
     }
 
-    /// 启动清理必须覆盖历次轮转出来的所有名称，否则 `-N` 设备会永久残留。
+    /// 启动清理必须识别历次轮转（`-N`）、Windows 后缀（` N`）以及
+    /// 早期把隧道类型拼进名字的形态。
     #[test]
-    fn stale_adapter_names_cover_all_candidates() {
-        let names = super::stale_adapter_names("SSLProxy");
-        assert_eq!(names.len(), 5);
-        assert!(names.contains(&"SSLProxy".to_string()));
-        for n in 1..5 {
-            assert!(names.contains(&format!("SSLProxy-{n}")));
+    fn leftover_names_cover_rotated_and_suffixed() {
+        let base = "SSLProxy";
+        for name in [
+            "SSLProxy",
+            "SSLProxy-1",
+            "SSLProxy-4",
+            "SSLProxy 2",
+            "SSLProxy 42",
+            "SSLProxy Tunnel Tunnel",
+        ] {
+            assert!(super::is_leftover_adapter_name(name, base), "{name}");
         }
+        for name in [
+            "SSLProxyX",
+            "SSLProxy-",
+            "SSLProxy-Tunnel",
+            "OtherAdapter",
+            "SSLProxy-123",
+            "SSLProxy ",
+        ] {
+            assert!(!super::is_leftover_adapter_name(name, base), "{name}");
+        }
+    }
+
+    /// GUID 必须由名称稳定派生：随机 GUID 会让每次开关都新建一张网卡。
+    #[test]
+    fn adapter_guid_is_stable_and_name_scoped() {
+        let a = super::adapter_guid("SSLProxy");
+        assert_eq!(a, super::adapter_guid("SSLProxy"));
+        assert_ne!(a, super::adapter_guid("SSLProxy-1"));
+        // UUID v5 形式：第 13 位 hex 为 5，variant 位为 10xx。
+        let bytes = a.to_be_bytes();
+        assert_eq!(bytes[6] >> 4, 0x5);
+        assert_eq!(bytes[8] >> 6, 0b10);
     }
 }

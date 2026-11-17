@@ -95,11 +95,37 @@ impl StackShared {
         self.stop.load(Ordering::Relaxed)
     }
 
+    /// 停止信号句柄：后台任务据此退出，避免它们各自持有 `StackShared`
+    /// 把协议栈状态（以及心跳日志）永远留在内存里。
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
+    }
+
     /// 关闭网卡会话。必须在协议栈线程 join 之后调用：
     /// 取出 keepalive 即析构，其 Drop 会先 join 网卡读写线程，
     /// 再按 session → adapter 的顺序关闭（之后才能从系统卸载设备）。
     pub fn close_device(&self) {
-        let keepalive = self.lock().keepalive.take();
+        let keepalive = {
+            let mut core = self.lock();
+            let keepalive = core.keepalive.take();
+            // 让所有阻塞中的流立刻感知协议栈已停止：失效 handle 并唤醒 waker。
+            // 否则这些任务会永久等待，各自持有 StackShared，状态（以及心跳
+            // 之类的后台任务）都无法释放。
+            let handles: Vec<SocketHandle> = core.kinds.keys().copied().collect();
+            for handle in handles {
+                core.removed_sockets.insert(handle);
+            }
+            core.kinds.clear();
+            core.sockets = SocketSet::new(vec![]);
+            core.queue.clear();
+            core.tcp_pending.clear();
+            core.pending_at.clear();
+            core.tcp_flows.clear();
+            core.udp_flows.clear();
+            core.udp_at.clear();
+            core.wake_all();
+            keepalive
+        };
         drop(keepalive);
     }
 }

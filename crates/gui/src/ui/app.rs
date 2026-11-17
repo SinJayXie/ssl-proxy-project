@@ -13,6 +13,7 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::chart::BarChart;
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, ThemeMode, TitleBar,
 };
@@ -943,6 +944,8 @@ struct DashboardPage {
     core: Arc<Core>,
     info: ApiAppInfo,
     checking_update: bool,
+    /// TUN 开关状态（与 setting.yaml 同步，切换后立即生效）。
+    tun_enabled: bool,
     stats: StatsStore,
     last_flow: DataFlow,
     last_udp_flow: DataFlow,
@@ -953,6 +956,10 @@ struct DashboardPage {
 impl DashboardPage {
     fn new(core: Arc<Core>, cx: &mut Context<Self>) -> Self {
         let info = core.snapshot_app_info().unwrap_or_default();
+        let tun_enabled = core
+            .snapshot_config()
+            .map(|cfg| cfg.tun.enable)
+            .unwrap_or(false);
         let stats = StatsStore::load(&core.state.config_dir);
         let last_flow = info.dataflow.clone();
         let last_udp_flow = core.snapshot_udp_dataflow().unwrap_or_default();
@@ -963,6 +970,8 @@ impl DashboardPage {
             smol::Timer::after(Duration::from_secs(2)).await;
 
             let snapshot = poll_core.snapshot_app_info();
+            // 设置页也能改 TUN：这里跟随配置刷新，避免两处状态不一致。
+            let tun_enabled = poll_core.snapshot_config().map(|cfg| cfg.tun.enable);
             let udp_flow = poll_core.snapshot_udp_dataflow();
             let updated = this.update(cx, |page, cx| {
                 let Some(info) = snapshot else {
@@ -993,12 +1002,20 @@ impl DashboardPage {
                 let changed = page.info != info;
                 page.info = info;
 
+                let mut tun_changed = false;
+                if let Some(enabled) = tun_enabled {
+                    if page.tun_enabled != enabled {
+                        page.tun_enabled = enabled;
+                        tun_changed = true;
+                    }
+                }
+
                 if page.last_saved.elapsed() >= Duration::from_secs(30) {
                     page.stats.save(&config_dir);
                     page.last_saved = Instant::now();
                 }
 
-                if changed || udp_notify || up > 0 || down > 0 {
+                if changed || udp_notify || tun_changed || up > 0 || down > 0 {
                     cx.notify();
                 }
             });
@@ -1012,12 +1029,27 @@ impl DashboardPage {
             core,
             info,
             checking_update: false,
+            tun_enabled,
             stats,
             last_flow,
             last_udp_flow,
             last_saved: Instant::now(),
             _poll: poll,
         }
+    }
+
+    /// 首页 TUN 开关：写回配置并立即生效（save_config 内部会调用 runner::apply）。
+    fn toggle_tun(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let Some(mut config) = self.core.snapshot_config() else {
+            return;
+        };
+        if config.tun.enable == enabled {
+            return;
+        }
+        config.tun.enable = enabled;
+        self.tun_enabled = enabled;
+        drop(self.core.save_config(config));
+        cx.notify();
     }
 
     fn check_update(&mut self, cx: &mut Context<Self>) {
@@ -1049,6 +1081,22 @@ impl Render for DashboardPage {
             .saturating_add(self.stats.total_down_udp);
         let days = self.stats.recent(&stats::today_key(), 7);
         let today = days.last().cloned().unwrap_or_default();
+
+        // TUN 仅 Windows 提供；其他平台不渲染该卡片。
+        let tun_card_element = if crate::core::tun::TUN_SUPPORTED {
+            Some(tun_card(
+                self.tun_enabled,
+                cx,
+                Switch::new("dashboard-tun")
+                    .checked(self.tun_enabled)
+                    .on_change(cx.listener(|this, checked, _, cx| {
+                        this.toggle_tun(*checked, cx)
+                    }))
+                    .into_any_element(),
+            ))
+        } else {
+            None
+        };
 
         v_flex()
             .size_full()
@@ -1123,7 +1171,8 @@ impl Render for DashboardPage {
                                 purple,
                                 None,
                                 cx,
-                            )),
+                            ))
+                            .when_some(tun_card_element, |row, card| row.child(card)),
                     )
                     .child(
                         h_flex()
@@ -1163,6 +1212,72 @@ impl Render for DashboardPage {
                     .child(dataflow_card(self.info.dataflow.clone(), cx)),
             )
     }
+}
+
+/// 首页 TUN 卡片：状态 + 开关（切换后立即生效，与设置页共用同一份配置）。
+fn tun_card(enabled: bool, cx: &App, switch: AnyElement) -> AnyElement {
+    let hover_bg = theme::card_hover(cx);
+    let hover_border = cx.theme().border;
+    let (icon, fg) = if enabled {
+        ("lan-connect", cx.theme().success)
+    } else {
+        ("lan-disconnect", theme::text_muted(cx))
+    };
+
+    h_flex()
+        .flex_1()
+        .items_center()
+        .gap_3()
+        .py_3()
+        .px_4()
+        .rounded(px(10.))
+        .bg(theme::card(cx))
+        .border_1()
+        .border_color(theme::border_light(cx))
+        .shadow_xs()
+        .hover(move |style| style.bg(hover_bg).border_color(hover_border))
+        .child(
+            div()
+                .w(px(40.))
+                .h(px(40.))
+                .flex_shrink_0()
+                .rounded(px(10.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(fg.opacity(0.14))
+                .child(
+                    Icon::default()
+                        .path(mdi(icon))
+                        .w(px(22.))
+                        .h(px(22.))
+                        .text_color(fg),
+                ),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(px(3.))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme::text_muted(cx))
+                        .child(i18n::t("TUN_ENABLE").to_uppercase()),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.))
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(if enabled {
+                            i18n::t("TUN_GENERIC_ON")
+                        } else {
+                            i18n::t("TUN_GENERIC_OFF")
+                        }),
+                ),
+        )
+        .child(switch)
+        .into_any_element()
 }
 
 fn stat_card(
