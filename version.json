@@ -7,6 +7,6 @@
                       "TUN: leftover adapters (SSLProxy, -1 ... -4, suffixed SSLProxy 2, 3 ... and SSLProxy Tunnel Tunnel) are removed on startup (wintun devices only)"
                   ],
     "downloadUrl":  "https://hk.dishuyl.cn/ssl-proxy/win/SSLProxyClient_2.7.2_x64-setup.exe",
-    "sha256":  "ee5c683e5ff136618c3e871c7c24441cdf121fce39bdaf0f30df59c652384ebd",
-    "signature":  "4a0b4c5780eebec4e109cf0b8d9972cb830efd4fa407db6dc5b3f8e270ac403397c18bd7f8ff70011e4d73c848d89c06cd6536c9f9d2f120ba7ac8ab2809b00a"
+    "sha256":  "ed0d7e19d32d99023e26dc941eccd22765e0254b1c3d6096619dbd28f6f2fa40",
+    "signature":  "4f38e4d9c786a25cfbec09a8cde8990c4a3931fad1bb8e3891470a83aaf8134f8e9acb0d68206fe50f08f8a30bbf480ee5ea82e6b088e766b5875117aa703400"
 }
